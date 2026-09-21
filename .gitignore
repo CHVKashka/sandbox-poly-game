@@ -1,0 +1,26 @@
+# Godot: кэш импорта и временные файлы (пересоздаются редактором)
+.godot/
+*.translation
+
+# Godot .NET
+.mono/
+bin/
+obj/
+mono_crash.*.json
+*.user
+
+# IDE
+.vs/
+.vscode/
+.idea/
+
+# Локальные файлы Claude Code (лок-файлы сессий и т.п.)
+.claude/
+
+# Экспорт: результат сборки и пресет (генерируется Tools/export-windows.ps1, содержит пути конкретной машины)
+Builds/
+export_presets.cfg
+export_credentials.cfg
+
+# Скриншоты/дампы диагностики
+*.dmp

@@ -1,0 +1,9 @@
+# Единые окончания строк на всех устройствах (Windows/Linux/macOS)
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.svg text
+*.ico binary
+*.dll binary
+*.exe binary
