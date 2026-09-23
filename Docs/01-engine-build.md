@@ -4,11 +4,14 @@
 («large world coordinates»). Официальных сборок с double precision **не существует** — движок нужно
 собирать из исходников на каждом устройстве, где ведётся разработка.
 
-Версия: **Godot 4.7.2-stable** (проверено также на 4.6.3 — поведение то же).
+Версия: **Godot 4.6.3-stable** (проверено также на 4.7.2 — поведение то же; раньше проект был зафиксирован
+на 4.7.2, затем переключён на 4.6.3).
 Целевая ОС в этом документе: **Windows 11** (MSVC).
 
-> Плейсхолдер `<GODOT_SRC>` ниже — папка с исходниками движка на вашем устройстве
-> (на основной машине разработки: `C:\Godot\godot-src`). В репозиторий проекта исходники движка **не входят**.
+> Плейсхолдер `<GODOT_SRC>` ниже — папка с исходниками движка на вашем устройстве.
+> На основной машине разработки: `D:\Programs\Godot-4.6.3-double` (компилятор — VS Build Tools 2022,
+> установлен туда же, в `D:\Programs\VSBuildTools`, чтобы не занимать системный диск C:).
+> В репозиторий проекта исходники движка **не входят**.
 
 ## 1. Что нужно установить
 
@@ -23,7 +26,7 @@
 ## 2. Исходники
 
 ```powershell
-git clone --branch 4.7.2-stable --depth 1 https://github.com/godotengine/godot.git <GODOT_SRC>
+git clone --branch 4.6.3-stable --depth 1 https://github.com/godotengine/godot.git <GODOT_SRC>
 cd <GODOT_SRC>
 ```
 
@@ -51,7 +54,7 @@ py -3.12 -m SCons platform=windows target=template_release precision=double modu
 - `godot.windows.template_{debug,release}.double.x86_64.mono.exe` — шаблоны экспорта;
 - `GodotSharp\Api\...`, `GodotSharp\Tools\...` — C#-сборки движка, `GodotSharp\Tools\nupkgs` — NuGet-пакеты.
 
-Проверка: баннер при запуске должен содержать `v4.7.2.stable.mono.double.custom_build`.
+Проверка: баннер при запуске должен содержать `v4.6.3.stable.mono.double.custom_build`.
 
 ### Про флаги `accesskit=no d3d12=no`
 Без них SCons печатает `ERROR: ... requires dependencies to be installed`, **но завершается с кодом 0 и
@@ -74,7 +77,7 @@ C#-плагина редактора (GodotTools): в логе последни�
 
 ## 5. Локальный NuGet-источник (один раз на устройство)
 
-`Godot.NET.Sdk`, `GodotSharp` и `Godot.SourceGenerators` версии `4.7.2` существуют и на nuget.org
+`Godot.NET.Sdk`, `GodotSharp` и `Godot.SourceGenerators` версии `4.6.3` существуют и на nuget.org
 (официальные, **float**). Проект обязан использовать **свои** пакеты, поэтому:
 
 ```powershell
@@ -86,9 +89,9 @@ dotnet nuget add source <GODOT_SRC>\bin\GodotSharp\Tools\nupkgs --name GodotDoub
 подмены на float-пакеты).
 
 Проверка, что подтянулись верные пакеты: SHA256 файла
-`%USERPROFILE%\.nuget\packages\godotsharp\4.7.2\lib\net8.0\GodotSharp.dll` должен совпадать с
+`%USERPROFILE%\.nuget\packages\godotsharp\4.6.3\lib\net8.0\GodotSharp.dll` должен совпадать с
 `<GODOT_SRC>\bin\GodotSharp\Api\Release\GodotSharp.dll`. Если ранее на машине собирались проекты
-официальным Godot 4.7.2, в кэше `%USERPROFILE%\.nuget\packages\godot*` может лежать float-версия —
+официальным Godot 4.6.3, в кэше `%USERPROFILE%\.nuget\packages\godot*` может лежать float-версия —
 удалите эти папки, чтобы restore взял локальные пакеты.
 
 ## 6. Запуск и правила работы
@@ -104,9 +107,19 @@ dotnet nuget add source <GODOT_SRC>\bin\GodotSharp\Tools\nupkgs --name GodotDoub
 ## 7. Что уже было проверено (для истории)
 
 - Собирается и MSVC 2022, и MinGW-w64 (GCC 16.2) — результат одинаковый; MSVC достаточно.
-  На основной машине разработки текущий `godot.windows.editor.double.x86_64.mono.exe` фактически собран MinGW
-  (диагностическая MinGW-сборка перезаписала MSVC-файл в том же дереве; шаблоны экспорта — MSVC). Это ни на что не влияет;
-  при плановой пересборке использовать MSVC по инструкции выше.
-- Godot 4.6.3 и 4.7.2 ведут себя идентично; проект зафиксирован на 4.7.2.
+- Godot 4.6.3 и 4.7.2 ведут себя идентично; проект **переключён на 4.6.3** (был зафиксирован на 4.7.2).
 - Чисто GDScript-редактор с double precision (без `module_mono_enabled`) всегда работал — проблема была
   исключительно в C#-части (см. п. 4).
+
+## 8. Вторая машина разработки (для истории)
+
+Собрано по этой инструкции целиком, включая шаблоны экспорта, на машине с Windows 11 без предустановленных
+инструментов сборки. Что ставилось (везде на диск `D:`, чтобы не занимать системный `C:`, там было мало места):
+`winget install Microsoft.DotNet.SDK.8`; `winget install Microsoft.VisualStudio.2022.BuildTools --override
+"--installPath D:\Programs\VSBuildTools --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended
+--add Microsoft.VisualStudio.Component.Windows11SDK.22621"`; SCons — `py -3.10 -m pip install scons`
+(на этой машине `py -3.12` не было, использован уже стоявший Python 3.10). Исходники клонированы в
+`D:\Programs\Godot-4.6.3-double`. Все 4 шага (editor, glue, build_assemblies --precision=double,
+template_debug, template_release) прошли без ошибок с первого раза; баннер `--headless --version`
+подтвердил `4.6.3.stable.mono.double.custom_build`. NuGet-источник `GodotDouble` зарегистрирован,
+проект пересобран (`dotnet build`), SHA256 `GodotSharp.dll` совпал, самотесты — 55 passed, 0 failed.

@@ -1,8 +1,9 @@
 using System;
 using System.Collections.Generic;
 using Godot;
+using SandboxPolyGame.Blocks;
 
-namespace SwV2.Core;
+namespace SandboxPolyGame.Core;
 
 /// <summary>Результат меширования одного чанка. Координаты вершин — в метрах, относительно угла чанка.</summary>
 public sealed class ChunkMeshData
@@ -57,18 +58,21 @@ public sealed class ChunkMeshData
 ///
 /// Поверхность: рисуются только грани, у которых по нормали нет соседнего блока (внутренние грани между блоками
 /// не создаются), затем смежные грани одного цвета в одной плоскости склеиваются в прямоугольники (greedy meshing).
+/// Это относится только к кубическим блокам (<see cref="BlockShape.Cube"/>) — клетки не-кубических форм
+/// (Wedge/Pyramid/InvertedPyramid) по-прежнему числятся «занятыми» (участвуют в отсечении граней соседей и в
+/// рейкасте), но своих собственных граней тут не рисуют: их визуал — отдельный меш на экземпляр, см.
+/// <c>ShapeMeshBuilder</c>/<c>Editor.ShapeInstanceView</c>.
 ///
-/// Каркас (wireframe): отрезок ребра сетки показывается, только если он является «настоящим» ребром формы.
-/// Ребро окружено четырьмя клетками; оно НЕ показывается, когда заполнено 0, 4 или две соседние клетки
-/// (тогда это шов внутри плоской поверхности или пустота). Каркас не зависит ни от цвета, ни от типа блоков,
-/// ни от границ чанков — поэтому он «единый» для всей постройки.
+/// Каркас (wireframe): полное отображение полигонов — у каждого нарисованного (уже склеенного) прямоугольника
+/// рисуется весь его контур плюс диагональ, разбивающая его на 2 треугольника (как встроенный wireframe-режим
+/// движка: видно каждое ребро каждого треугольника, включая диагонали и швы между соседними прямоугольниками).
 /// </summary>
 public static class ChunkMesher
 {
     private const int S = BuildSpace.ChunkSize;
     private const int P = S + 2; // с рамкой в 1 клетку с каждой стороны
 
-    /// <summary>Смещение линий каркаса наружу (метры), чтобы они не мерцали (z-fighting) на самих гранях.</summary>
+    /// <summary>Смещение линий каркаса наружу от грани (метры), чтобы они не мерцали (z-fighting) на самой грани.</summary>
     public const float WireOffsetMeters = 0.004f;
 
     private static readonly int[] PaddedStride = { 1, P, P * P };
@@ -79,16 +83,16 @@ public static class ChunkMesher
     {
         var data = new ChunkMeshData();
         var solid = new bool[P * P * P];
+        var ownFace = new bool[P * P * P];
         var colors = new uint[S * S * S];
 
-        if (!Fill(grid, chunk, solid, colors)) return data;
+        if (!Fill(grid, chunk, solid, ownFace, colors)) return data;
 
-        BuildFaces(data, solid, colors);
-        BuildEdges(data, solid);
+        BuildFaces(data, solid, ownFace, colors);
         return data;
     }
 
-    private static bool Fill(VoxelGrid grid, Vector3I chunk, bool[] solid, uint[] colors)
+    private static bool Fill(VoxelGrid grid, Vector3I chunk, bool[] solid, bool[] ownFace, uint[] colors)
     {
         var neighborhood = grid.GetNeighborhood(chunk);
         bool any = false;
@@ -108,9 +112,12 @@ public static class ChunkMesher
                     int li = (x & BuildSpace.ChunkMask)
                              | ((y & BuildSpace.ChunkMask) << BuildSpace.ChunkShift)
                              | ((z & BuildSpace.ChunkMask) << (BuildSpace.ChunkShift * 2));
-                    if (source.Ids[li] == 0) continue;
+                    ushort id = source.Ids[li];
+                    if (id == 0) continue;
 
-                    solid[PaddedBase + x + y * P + z * P * P] = true;
+                    int idx = PaddedBase + x + y * P + z * P * P;
+                    solid[idx] = true;
+                    ownFace[idx] = IsCubeShaped(id);
                     any = true;
                     if (ox == 1 && oy == 1 && oz == 1) colors[li] = source.Colors[li];
                 }
@@ -120,9 +127,16 @@ public static class ChunkMesher
         return any;
     }
 
-    // ---------------------------------------------------------------- поверхность
+    private static bool IsCubeShaped(ushort runtimeId)
+    {
+        if (!BlockCatalog.Instance.TryGetByRuntimeId(runtimeId, out var definition)) return true; // неизвестный id (напр. самотесты) — по умолчанию куб
+        var building = definition.GetComponent<BuildingBlockComponent>();
+        return building == null || building.Shape == BlockShape.Cube;
+    }
 
-    private static void BuildFaces(ChunkMeshData data, bool[] solid, uint[] colors)
+    // ---------------------------------------------------------------- поверхность + каркас
+
+    private static void BuildFaces(ChunkMeshData data, bool[] solid, bool[] ownFace, uint[] colors)
     {
         var mask = new uint[S * S];
 
@@ -145,7 +159,7 @@ public static class ChunkMesher
                     for (int i = 0; i < S; i++)
                     {
                         int idx = PaddedBase + slice * PaddedStride[axis] + i * PaddedStride[u] + j * PaddedStride[v];
-                        if (!solid[idx] || solid[idx + step * PaddedStride[axis]]) continue;
+                        if (!solid[idx] || solid[idx + step * PaddedStride[axis]] || !ownFace[idx]) continue;
 
                         mask[i + j * S] = colors[slice * ChunkStride[axis] + i * ChunkStride[u] + j * ChunkStride[v]];
                         anyFace = true;
@@ -203,18 +217,25 @@ public static class ChunkMesher
 
     /// <summary>
     /// Godot считает лицевой стороной треугольника ту, с которой вершины идут ПО часовой стрелке,
-    /// поэтому порядок вершин зависит от знака нормали (проверяется в самотесте).
+    /// поэтому порядок вершин зависит от знака нормали (проверяется в самотесте). Заодно рисует каркас этого
+    /// прямоугольника: контур (4 ребра) + диагональ, которая делит его на те же 2 треугольника, что и индексы ниже
+    /// (у обоих порядков обхода общая диагональ p00–p11) — сдвинутые наружу вдоль нормали на <see cref="WireOffsetMeters"/>.
     /// </summary>
     private static void EmitQuad(ChunkMeshData d, int axis, bool positive, int plane, int i, int j, int w, int h, uint packed)
     {
         int u = (axis + 1) % 3;
         int v = (axis + 2) % 3;
 
+        var p00 = Corner(axis, u, v, plane, i, j);
+        var p10 = Corner(axis, u, v, plane, i + w, j);
+        var p11 = Corner(axis, u, v, plane, i + w, j + h);
+        var p01 = Corner(axis, u, v, plane, i, j + h);
+
         int first = d.Vertices.Count;
-        d.Vertices.Add(Corner(axis, u, v, plane, i, j));         // p00
-        d.Vertices.Add(Corner(axis, u, v, plane, i + w, j));     // p10
-        d.Vertices.Add(Corner(axis, u, v, plane, i + w, j + h)); // p11
-        d.Vertices.Add(Corner(axis, u, v, plane, i, j + h));     // p01
+        d.Vertices.Add(p00);
+        d.Vertices.Add(p10);
+        d.Vertices.Add(p11);
+        d.Vertices.Add(p01);
 
         var normal = Vector3.Zero;
         normal[axis] = positive ? 1 : -1;
@@ -235,82 +256,18 @@ public static class ChunkMesher
             d.Indices.Add(first); d.Indices.Add(first + 1); d.Indices.Add(first + 2);
             d.Indices.Add(first); d.Indices.Add(first + 2); d.Indices.Add(first + 3);
         }
+
+        var offset = normal * WireOffsetMeters;
+        p00 += offset; p10 += offset; p11 += offset; p01 += offset;
+        AddLine(d, p00, p10);
+        AddLine(d, p10, p11);
+        AddLine(d, p11, p01);
+        AddLine(d, p01, p00);
+        AddLine(d, p00, p11); // диагональ
     }
 
-    // ---------------------------------------------------------------- каркас
-
-    private static void BuildEdges(ChunkMeshData data, bool[] solid)
+    private static void AddLine(ChunkMeshData d, Vector3 a, Vector3 b)
     {
-        for (int axis = 0; axis < 3; axis++)
-        {
-            int u = (axis + 1) % 3;
-            int v = (axis + 2) % 3;
-
-            for (int pv = 0; pv < S; pv++)
-            for (int pu = 0; pu < S; pu++)
-            {
-                // Идём вдоль оси и склеиваем подряд идущие одинаковые единичные рёбра в один отрезок.
-                int runStart = 0;
-                int runConfig = 0;
-                for (int pa = 0; pa <= S; pa++)
-                {
-                    int config = pa < S ? EdgeConfig(solid, axis, u, v, pa, pu, pv) : 0;
-                    if (config == runConfig) continue;
-
-                    if (runConfig != 0) AddEdge(data, axis, u, v, runStart, pa, pu, pv, runConfig);
-                    runStart = pa;
-                    runConfig = config;
-                }
-            }
-        }
-    }
-
-    /// <summary>
-    /// Ребро проходит вдоль <paramref name="axis"/> и начинается в узле (pa, pu, pv). Вокруг него 4 клетки:
-    /// бит0 = (u-1, v-1), бит1 = (u, v-1), бит2 = (u-1, v), бит3 = (u, v).
-    /// Возвращает маску заполненных клеток, если ребро «настоящее», иначе 0.
-    /// </summary>
-    private static int EdgeConfig(bool[] solid, int axis, int u, int v, int pa, int pu, int pv)
-    {
-        bool s0 = solid[Padded(axis, u, v, pa, pu - 1, pv - 1)];
-        bool s1 = solid[Padded(axis, u, v, pa, pu, pv - 1)];
-        bool s2 = solid[Padded(axis, u, v, pa, pu - 1, pv)];
-        bool s3 = solid[Padded(axis, u, v, pa, pu, pv)];
-
-        int count = (s0 ? 1 : 0) + (s1 ? 1 : 0) + (s2 ? 1 : 0) + (s3 ? 1 : 0);
-        bool feature = count == 1 || count == 3 || (count == 2 && s0 == s3);
-        if (!feature) return 0;
-
-        return (s0 ? 1 : 0) | (s1 ? 2 : 0) | (s2 ? 4 : 0) | (s3 ? 8 : 0);
-    }
-
-    private static int Padded(int axis, int u, int v, int a, int b, int c) =>
-        PaddedBase + a * PaddedStride[axis] + b * PaddedStride[u] + c * PaddedStride[v];
-
-    private static void AddEdge(ChunkMeshData d, int axis, int u, int v, int start, int end, int pu, int pv, int config)
-    {
-        // Направление «наружу» = сумма центров пустых клеток вокруг ребра; для плоского шва (0) сдвиг не нужен.
-        float du = 0f, dv = 0f;
-        if ((config & 1) == 0) { du -= 0.5f; dv -= 0.5f; }
-        if ((config & 2) == 0) { du += 0.5f; dv -= 0.5f; }
-        if ((config & 4) == 0) { du -= 0.5f; dv += 0.5f; }
-        if ((config & 8) == 0) { du += 0.5f; dv += 0.5f; }
-
-        float offU = 0f, offV = 0f;
-        float length = MathF.Sqrt(du * du + dv * dv);
-        if (length > 1e-4f)
-        {
-            float k = WireOffsetMeters / length;
-            offU = du * k;
-            offV = dv * k;
-        }
-
-        var a = Vector3.Zero;
-        var b = Vector3.Zero;
-        a[axis] = start * BuildSpace.CellSize;
-        b[axis] = end * BuildSpace.CellSize;
-        a[u] = b[u] = pu * BuildSpace.CellSize + offU;
-        a[v] = b[v] = pv * BuildSpace.CellSize + offV;
         d.LineVertices.Add(a);
         d.LineVertices.Add(b);
     }

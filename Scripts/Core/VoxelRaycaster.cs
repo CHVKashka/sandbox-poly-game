@@ -1,7 +1,7 @@
 using System;
 using Godot;
 
-namespace SwV2.Core;
+namespace SandboxPolyGame.Core;
 
 /// <summary>
 /// Результат луча из камеры. Блок: <see cref="BlockCell"/> — попавший блок, <see cref="PlaceCell"/> — клетка рядом

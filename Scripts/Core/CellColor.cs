@@ -1,6 +1,6 @@
 using Godot;
 
-namespace SwV2.Core;
+namespace SandboxPolyGame.Core;
 
 /// <summary>Цвет клетки хранится упакованным в uint (RGBA8, альфа всегда 255, поэтому значение никогда не равно 0).</summary>
 public static class CellColor

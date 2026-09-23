@@ -1,7 +1,7 @@
 using Godot;
-using SwV2.Core;
+using SandboxPolyGame.Blocks;
 
-namespace SwV2.Editor.Ui;
+namespace SandboxPolyGame.Editor.Ui;
 
 /// <summary>Хотбар на 9 слотов внизу по центру. Клик по слоту (или клавиши 1–9 / колесо) выбирает слот.</summary>
 internal sealed class HotbarUi
@@ -91,9 +91,9 @@ internal sealed class HotbarUi
         {
             var slot = _slots[i];
             bool selected = i == _state.SelectedSlot;
-            ushort id = _state.GetSlot(i);
+            string slug = _state.GetSlot(i);
 
-            if (BlockRegistry.TryGet(id, out var def))
+            if (BlockCatalog.Instance.TryGetBySlug(slug, out var def))
             {
                 slot.Swatch.Color = def.DefaultColor;
                 slot.Name.Text = def.Name;

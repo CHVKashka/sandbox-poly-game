@@ -2,7 +2,7 @@ using System;
 using System.Collections.Generic;
 using Godot;
 
-namespace SwV2.Core;
+namespace SandboxPolyGame.Core;
 
 /// <summary>Блок данных 16x16x16 клеток: id блока (0 = пусто) и упакованный цвет каждой клетки.</summary>
 public sealed class VoxelChunk

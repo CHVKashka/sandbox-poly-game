@@ -1,8 +1,8 @@
 using System.Collections.Generic;
 using Godot;
-using SwV2.Core;
+using SandboxPolyGame.Core;
 
-namespace SwV2.Editor;
+namespace SandboxPolyGame.Editor;
 
 /// <summary>
 /// Сцена-представление постройки: держит воксельную сетку и по одному «сплошному» и «каркасному» MeshInstance3D
@@ -30,8 +30,14 @@ public partial class VoxelWorld : Node3D
     private StandardMaterial3D _solidMaterial = null!;
     private StandardMaterial3D _wireMaterial = null!;
     private WireMode _wireMode = WireMode.Off;
+    private ShapeInstanceView _shapes = null!;
 
     public VoxelGrid Grid { get; } = new();
+
+    /// <summary>Слой размещённых блоков (позиция/размер/тип) поверх <see cref="Grid"/> — см. <see cref="Construction"/>.</summary>
+    public Construction Construction { get; }
+
+    public VoxelWorld() => Construction = new Construction(Grid);
 
     public int ChunkCount => _views.Count;
     public int Quads { get; private set; }
@@ -45,6 +51,7 @@ public partial class VoxelWorld : Node3D
         {
             _wireMode = value;
             ApplyWireMode();
+            _shapes.WireMode = value;
         }
     }
 
@@ -62,6 +69,10 @@ public partial class VoxelWorld : Node3D
             ShadingMode = BaseMaterial3D.ShadingModeEnum.Unshaded,
             AlbedoColor = OverlayWireColor,
         };
+
+        _shapes = new ShapeInstanceView { Name = "Shapes" };
+        AddChild(_shapes);
+        Construction.Changed += () => _shapes.Sync(Construction);
 
         Grid.CellChanged += OnCellChanged;
         ApplyWireMode();

@@ -10,9 +10,9 @@ config_version=5
 
 [application]
 
-config/name="SW_V2"
+config/name="sandbox-poly-game"
 run/main_scene="res://Scenes/BuildEditor.tscn"
-config/features=PackedStringArray("4.7", "C#", "Double Precision", "Forward Plus")
+config/features=PackedStringArray("4.6", "C#", "Double Precision", "Forward Plus")
 config/icon="res://icon.svg"
 
 [display]
@@ -22,7 +22,7 @@ window/size/viewport_height=900
 
 [dotnet]
 
-project/assembly_name="SW_V2"
+project/assembly_name="sandbox-poly-game"
 
 [rendering]
 

@@ -1,6 +1,6 @@
 using Godot;
 
-namespace SwV2.Core;
+namespace SandboxPolyGame.Core;
 
 /// <summary>Параметры сетки построек. Одна клетка = один блок = <see cref="CellSize"/> метров.</summary>
 public static class BuildSpace

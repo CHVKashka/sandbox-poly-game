@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Block id="block" name="Block">
+  <Color>#9a9a9a</Color>
+  <Component type="BaseComponent">{ "mass": 10, "durability": 100, "damageResistance": 0.1 }</Component>
+  <Component type="BuildingBlock">{ "shape": "Cube", "minSize": [1,1,1], "maxSize": [8,8,8] }</Component>
+</Block>

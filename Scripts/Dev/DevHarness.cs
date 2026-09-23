@@ -3,16 +3,16 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.Threading.Tasks;
 using Godot;
-using SwV2.Editor;
+using SandboxPolyGame.Editor;
 
-namespace SwV2.Dev;
+namespace SandboxPolyGame.Dev;
 
 /// <summary>
 /// Инструменты разработчика, включаются аргументами после <c>--</c> в командной строке (для игроков ничего не меняют):
 /// <code>
 /// godot --path . -- --selftest                       самотесты (можно с --headless), код выхода 0 = успех
-/// godot --path . --resolution 1600x900 -- --demo=house --screenshot=out.png [--cam=px,py,pz,tx,ty,tz]
-///                                        [--wire=0|1|2] [--tool=paint|delete] [--picker] [--hover=x,y] [--frames=N]
+/// godot --path . --resolution 1600x900 -- --demo=house|stress|shapes --screenshot=out.png [--cam=px,py,pz,tx,ty,tz]
+///                                        [--wire=0|1|2] [--tool=paint|delete|resize] [--picker] [--hover=x,y] [--frames=N]
 /// </code>
 /// </summary>
 public static class DevHarness
@@ -52,7 +52,8 @@ public static class DevHarness
             if (args.TryGetValue("demo", out var demo))
             {
                 ulong started = Time.GetTicksMsec();
-                DemoBuilds.Build(demo, editor.World.Grid);
+                if (demo == "shapes") DemoBuilds.Shapes(editor.World.Construction);
+                else DemoBuilds.Build(demo, editor.World.Grid);
                 editor.World.RebuildDirty();
                 GD.Print($"[dev] demo '{demo}': {editor.World.Grid.BlockCount} blocks built+meshed in {Time.GetTicksMsec() - started} ms, " +
                          $"quads {editor.World.Quads} (faces before merge {editor.World.FacesBeforeMerge}), wire segments {editor.World.LineSegments}");
@@ -65,7 +66,10 @@ public static class DevHarness
             }
 
             if (args.TryGetValue("wire", out var wire)) editor.State.Wire = (WireMode)int.Parse(wire, CultureInfo.InvariantCulture);
-            if (args.TryGetValue("tool", out var tool)) editor.State.Tool = tool == "delete" ? ToolMode.Delete : ToolMode.Paint;
+            if (args.TryGetValue("tool", out var tool))
+            {
+                editor.State.Tool = tool switch { "delete" => ToolMode.Delete, "resize" => ToolMode.Resize, _ => ToolMode.Paint };
+            }
             if (args.ContainsKey("picker")) editor.Ui.TogglePicker();
 
             if (args.TryGetValue("hover", out var hover))

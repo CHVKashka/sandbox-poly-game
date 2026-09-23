@@ -1,6 +1,6 @@
 using Godot;
 
-namespace SwV2.Editor;
+namespace SandboxPolyGame.Editor;
 
 /// <summary>
 /// Свободная камера редактора. WASD — движение вдоль взгляда/вбок, Q/E — вниз/вверх, Shift — ускорение.

@@ -9,10 +9,10 @@
     powershell -ExecutionPolicy Bypass -File Tools\export-windows.ps1
     powershell -ExecutionPolicy Bypass -File Tools\export-windows.ps1 -GodotSrc D:\Godot\godot-src -Config debug
 
-  Result: Builds\Windows\SW_V2.exe (+ SW_V2.pck and the data_SW_V2_windows_x86_64 folder - keep them together).
+  Result: Builds\Windows\sandbox-poly-game.exe (+ sandbox-poly-game.pck and the data_sandbox-poly-game_windows_x86_64 folder - keep them together).
 #>
 param(
-    [string]$GodotSrc = $(if ($env:GODOT_SRC) { $env:GODOT_SRC } else { "C:\Godot\godot-src" }),
+    [string]$GodotSrc = $(if ($env:GODOT_SRC) { $env:GODOT_SRC } else { "D:\Programs\Godot-4.6.3-double" }),
     [ValidateSet("release", "debug")]
     [string]$Config = "release"
 )
@@ -30,7 +30,7 @@ foreach ($path in @($editor, $templateRelease, $templateDebug)) {
 
 $outDir = Join-Path $repo "Builds\Windows"
 New-Item -ItemType Directory -Force -Path $outDir | Out-Null
-$outExe = Join-Path $outDir "SW_V2.exe"
+$outExe = Join-Path $outDir "sandbox-poly-game.exe"
 
 function ToGodotPath([string]$p) { return $p.Replace("\", "/") }
 
@@ -46,7 +46,7 @@ custom_features=""
 export_filter="all_resources"
 include_filter=""
 exclude_filter="Docs/*, Tools/*, Builds/*"
-export_path="Builds/Windows/SW_V2.exe"
+export_path="Builds/Windows/sandbox-poly-game.exe"
 patches=PackedStringArray()
 encryption_include_filters=""
 encryption_exclude_filters=""
@@ -66,8 +66,8 @@ texture_format/etc2_astc=false
 binary_format/architecture="x86_64"
 codesign/enable=false
 application/modify_resources=false
-application/product_name="SW_V2"
-application/file_description="SW_V2"
+application/product_name="sandbox-poly-game"
+application/file_description="sandbox-poly-game"
 dotnet/include_scripts_content=false
 dotnet/include_debug_symbols=true
 dotnet/embed_build_outputs=false

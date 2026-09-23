@@ -1,7 +1,7 @@
 using Godot;
-using SwV2.Core;
+using SandboxPolyGame.Blocks;
 
-namespace SwV2.Editor.Ui;
+namespace SandboxPolyGame.Editor.Ui;
 
 /// <summary>Окно со списком всех доступных блоков (Tab). Клик по блоку кладёт его в выбранный слот хотбара.</summary>
 internal sealed class BlockPickerUi
@@ -48,7 +48,7 @@ internal sealed class BlockPickerUi
         grid.AddThemeConstantOverride("v_separation", 8);
         column.AddChild(grid);
 
-        foreach (var def in BlockRegistry.All) grid.AddChild(CreateCard(def));
+        foreach (var def in BlockCatalog.Instance.All) grid.AddChild(CreateCard(def));
 
         column.AddChild(UiStyle.MakeLabel("Tab / Esc - close", 12, UiStyle.TextDim));
 
@@ -79,7 +79,7 @@ internal sealed class BlockPickerUi
     {
         var button = UiStyle.MakeButton("", new Vector2(190, 58));
         button.TooltipText = def.Name;
-        button.Pressed += () => _state.SetSlot(_state.SelectedSlot, def.Id);
+        button.Pressed += () => _state.SetSlot(_state.SelectedSlot, def.Slug);
 
         var margin = UiStyle.Transparent(new MarginContainer());
         margin.SetAnchorsAndOffsetsPreset(Control.LayoutPreset.FullRect);

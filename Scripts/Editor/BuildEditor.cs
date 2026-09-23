@@ -1,16 +1,18 @@
 using System.Collections.Generic;
 using Godot;
-using SwV2.Core;
-using SwV2.Dev;
-using SwV2.Editor.Ui;
+using SandboxPolyGame.Blocks;
+using SandboxPolyGame.Core;
+using SandboxPolyGame.Dev;
+using SandboxPolyGame.Editor.Ui;
 
-namespace SwV2.Editor;
+namespace SandboxPolyGame.Editor;
 
 /// <summary>
 /// Корневой узел редактора построек. Всё создаётся кодом: окружение, сетка, мир блоков, камера, курсор, интерфейс.
 ///
-/// Управление: WASD/Q/E/Shift — камера; зажатая СКМ — поворот; ПКМ — поставить блок из выбранного слота хотбара;
-/// ЛКМ — применить инструмент тулбара (покраска/удаление); 1–9 и колесо — слот хотбара; Tab — список блоков.
+/// Управление: WASD/Q/E/Shift — камера; зажатая СКМ — поворот; ЛКМ — поставить блок из выбранного слота хотбара;
+/// ПКМ — применить инструмент тулбара (покраска/удаление/растягивание); 1–9 и колесо — слот хотбара; Tab — список блоков;
+/// J/K/I — повернуть блок, который встанет следующим, вокруг X/Y/Z.
 /// </summary>
 public partial class BuildEditor : Node3D
 {
@@ -28,11 +30,15 @@ public partial class BuildEditor : Node3D
 
     private Vector2 _mousePosition;
     private bool _looking;
-    private bool _leftDown;
+    private bool _toolButtonDown;
     private RayHit _hover = RayHit.None;
     private Vector3I? _lastToolCell;
     private Vector2 _lastToolMouse;
     private double _infoTimer;
+
+    // Кэш последней собранной формы призрака — чтобы не пересобирать меш каждый кадр без нужды.
+    private string? _ghostSlug;
+    private Vector3I _ghostRotation;
 
     public EditorState State => _state;
     public VoxelWorld World => _world;
@@ -194,8 +200,8 @@ public partial class BuildEditor : Node3D
                 StopLook();
                 break;
 
-            case InputEventMouseButton { ButtonIndex: MouseButton.Left, Pressed: false }:
-                _leftDown = false;
+            case InputEventMouseButton { ButtonIndex: MouseButton.Right, Pressed: false }:
+                _toolButtonDown = false;
                 break;
 
             case InputEventKey { Pressed: true, Echo: false } key:
@@ -218,15 +224,34 @@ public partial class BuildEditor : Node3D
                 GetViewport().SetInputAsHandled();
                 break;
 
+            case Key.Escape when _ui.ResizeDialogOpen:
+                _ui.CloseResizeDialog();
+                GetViewport().SetInputAsHandled();
+                break;
+
             case >= Key.Key1 and <= Key.Key9:
                 _state.SelectedSlot = (int)(key.PhysicalKeycode - Key.Key1);
+                break;
+
+            // Вращение блока, который встанет следующим (см. EditorState.PendingRotationSteps): J — вокруг X,
+            // K — вокруг Y, I — вокруг Z, на 90° за нажатие.
+            case Key.J:
+                _state.RotatePendingX();
+                break;
+
+            case Key.K:
+                _state.RotatePendingY();
+                break;
+
+            case Key.I:
+                _state.RotatePendingZ();
                 break;
         }
     }
 
     public override void _UnhandledInput(InputEvent e)
     {
-        if (e is not InputEventMouseButton button || _ui.PickerOpen) return;
+        if (e is not InputEventMouseButton button || _ui.PickerOpen || _ui.ResizeDialogOpen) return;
 
         switch (button.ButtonIndex)
         {
@@ -234,12 +259,12 @@ public partial class BuildEditor : Node3D
                 StartLook();
                 break;
 
-            case MouseButton.Right when button.Pressed:
+            case MouseButton.Left when button.Pressed:
                 PlaceAtHover();
                 break;
 
-            case MouseButton.Left when button.Pressed:
-                _leftDown = true;
+            case MouseButton.Right when button.Pressed:
+                _toolButtonDown = true;
                 _lastToolCell = null;
                 UseToolAtHover();
                 break;
@@ -262,7 +287,7 @@ public partial class BuildEditor : Node3D
     private void StartLook()
     {
         _looking = true;
-        _leftDown = false;
+        _toolButtonDown = false;
         Input.MouseMode = Input.MouseModeEnum.Captured;
     }
 
@@ -278,14 +303,21 @@ public partial class BuildEditor : Node3D
     {
         if (!_hover.Found) return;
 
-        ushort id = _state.SelectedBlockId;
+        string slug = _state.SelectedBlockSlug;
         var cell = _hover.PlaceCell;
-        if (id == BlockRegistry.None || !BuildSpace.InBounds(cell) || _world.Grid.IsSolid(cell)) return;
+        if (string.IsNullOrEmpty(slug) || !BlockCatalog.Instance.TryGetBySlug(slug, out var definition)) return;
+        if (!BuildSpace.InBounds(cell) || _world.Grid.IsSolid(cell)) return;
 
-        _world.Grid.TrySet(cell, id, CellColor.Pack(BlockRegistry.Get(id).DefaultColor));
+        _world.Construction.Place(cell, definition, definition.DefaultColor, _state.PendingRotationSteps);
         UpdateHover();
     }
 
+    /// <summary>
+    /// Paint/Delete действуют на весь экземпляр блока, которому принадлежит клетка под курсором (если клетка не
+    /// принадлежит ни одному экземпляру — например, залита инструментом разработчика в обход Construction —
+    /// откатываются на поклеточную операцию, как раньше). Resize открывает диалог с размерами блока
+    /// (см. <see cref="Ui.ResizeDialogUi"/>) вместо немедленного действия.
+    /// </summary>
     private void UseToolAtHover()
     {
         if (_state.Tool == ToolMode.None || !_hover.IsBlock) return;
@@ -293,13 +325,26 @@ public partial class BuildEditor : Node3D
         var cell = _hover.BlockCell;
         _lastToolCell = cell;
         _lastToolMouse = _mousePosition;
+        var instance = _world.Construction.GetOwner(cell);
+
         switch (_state.Tool)
         {
             case ToolMode.Paint:
-                _world.Grid.TryPaint(cell, CellColor.Pack(_state.PaintColor));
+                if (instance != null) _world.Construction.Paint(instance, _state.PaintColor);
+                else _world.Grid.TryPaint(cell, CellColor.Pack(_state.PaintColor));
                 break;
+
             case ToolMode.Delete:
-                _world.Grid.TryRemove(cell);
+                if (instance != null) _world.Construction.Remove(instance);
+                else _world.Grid.TryRemove(cell);
+                break;
+
+            case ToolMode.Resize:
+                if (instance != null && BlockCatalog.Instance.TryGetBySlug(instance.BlockSlug, out var definition))
+                {
+                    _ui.OpenResizeDialog(_world.Construction, instance, definition);
+                }
+
                 break;
         }
 
@@ -310,12 +355,13 @@ public partial class BuildEditor : Node3D
 
     public override void _Process(double delta)
     {
-        _camera.MovementEnabled = !_ui.PickerOpen;
+        _camera.MovementEnabled = !_ui.PickerOpen && !_ui.ResizeDialogOpen;
         UpdateHover();
 
-        // Удержание ЛКМ: инструмент применяется к каждому новому блоку под курсором, но только если мышь сдвинулась —
+        // Удержание ПКМ: инструмент применяется к каждому новому блоку под курсором, но только если мышь сдвинулась —
         // иначе после удаления цель сразу «перескакивает» на следующий блок и удаление проедает постройку насквозь.
-        if (_leftDown && _hover.IsBlock && _state.Tool != ToolMode.None
+        // Resize сам по себе не повторяется (открытие диалога — разовое действие на нажатие).
+        if (_toolButtonDown && _hover.IsBlock && _state.Tool != ToolMode.None && _state.Tool != ToolMode.Resize
             && _lastToolCell != _hover.BlockCell && _mousePosition != _lastToolMouse)
         {
             UseToolAtHover();
@@ -344,16 +390,16 @@ public partial class BuildEditor : Node3D
 
     private void UpdateCursorVisuals()
     {
-        ushort id = _state.SelectedBlockId;
-        bool canPlace = _hover.Found
-                        && id != BlockRegistry.None
+        string slug = _state.SelectedBlockSlug;
+        BlockCatalog.Instance.TryGetBySlug(slug, out var definition);
+        bool canPlace = _hover.Found && definition != null
                         && BuildSpace.InBounds(_hover.PlaceCell)
                         && !_world.Grid.IsSolid(_hover.PlaceCell);
         _ghost.Visible = canPlace;
         if (canPlace)
         {
-            _ghost.Position = BuildSpace.CellCenter(_hover.PlaceCell);
-            var color = BlockRegistry.Get(id).DefaultColor;
+            UpdateGhostMesh(definition!, slug);
+            var color = definition!.DefaultColor;
             _ghostMaterial.AlbedoColor = new Color(color.R, color.G, color.B, 0.55f);
         }
 
@@ -362,8 +408,43 @@ public partial class BuildEditor : Node3D
         if (showOutline)
         {
             _outline.Position = BuildSpace.CellCenter(_hover.BlockCell);
-            _outlineMaterial.AlbedoColor = _state.Tool == ToolMode.Delete ? new Color(1f, 0.25f, 0.2f) : _state.PaintColor;
+            _outlineMaterial.AlbedoColor = _state.Tool switch
+            {
+                ToolMode.Delete => new Color(1f, 0.25f, 0.2f),
+                ToolMode.Resize => new Color(0.3f, 0.9f, 0.45f),
+                _ => _state.PaintColor,
+            };
         }
+    }
+
+    /// <summary>
+    /// Призрак отражает настоящую форму выбранного блока (не только куб) и текущий <see cref="EditorState.PendingRotationSteps"/>.
+    /// Меш кубов — центрированный стандартный <see cref="BoxMesh"/> (позиция — центр клетки); меш остальных форм
+    /// строится <c>ShapeMeshBuilder</c> тем же способом, что и уже поставленные блоки (координаты — от угла клетки,
+    /// см. <see cref="Ui.ResizeDialogUi"/> и <see cref="ShapeInstanceView"/>), только всегда размером 1×1×1 —
+    /// установка всегда создаёт блок такого размера, растягивается он уже потом инструментом Resize.
+    /// </summary>
+    private void UpdateGhostMesh(BlockDefinition definition, string slug)
+    {
+        var building = definition.GetComponent<BuildingBlockComponent>();
+        var rotation = _state.PendingRotationSteps;
+
+        if (building == null || building.Shape == BlockShape.Cube)
+        {
+            _ghost.Position = BuildSpace.CellCenter(_hover.PlaceCell);
+            if (_ghostSlug == slug && _ghostRotation == rotation) return;
+            _ghost.Mesh = new BoxMesh { Size = Vector3.One * (BuildSpace.CellSize * 0.98f) };
+        }
+        else
+        {
+            _ghost.Position = BuildSpace.CellMin(_hover.PlaceCell);
+            if (_ghostSlug == slug && _ghostRotation == rotation) return;
+            var (solid, _) = ShapeMeshBuilder.Build(building.Shape, Vector3I.One, rotation, Colors.White);
+            _ghost.Mesh = (Mesh?)solid ?? new BoxMesh { Size = Vector3.One * (BuildSpace.CellSize * 0.98f) };
+        }
+
+        _ghostSlug = slug;
+        _ghostRotation = rotation;
     }
 
     private void OnStateChanged()
@@ -387,7 +468,8 @@ public partial class BuildEditor : Node3D
         }
 
         _ui.SetInfo(
-            "WASD move | Q/E down/up | Shift fast | hold MMB - look | RMB place | LMB tool | 1-9 / wheel hotbar | Tab blocks\n" +
+            "WASD move | Q/E down/up | Shift fast | hold MMB - look | LMB place | RMB tool | 1-9 / wheel hotbar | Tab blocks\n" +
+            "J/K/I rotate the next placed block around X/Y/Z | Resize tool: RMB on a block opens a size dialog (X/Y/Z, +/-)\n" +
             $"Blocks: {_world.Grid.BlockCount}   Quads: {_world.Quads} (faces before merge: {_world.FacesBeforeMerge})   " +
             $"Wire segments: {_world.LineSegments}   Chunks: {_world.ChunkCount}   Cursor: {cursor}   FPS: {Engine.GetFramesPerSecond()}");
     }

@@ -1,6 +1,6 @@
-# SW_V2 — документация
+# sandbox-poly-game — документация
 
-**SW_V2** — игра-аналог Stormworks на Godot 4.7.2 (кастомная сборка с **double precision** и **C#**).
+**sandbox-poly-game** — игра-аналог Stormworks на Godot 4.6.3 (кастомная сборка с **double precision** и **C#**).
 Документация лежит в git вместе с кодом: по ней можно поднять проект на другом устройстве и продолжить работу.
 
 ## Оглавление
@@ -18,9 +18,11 @@
 
 1. Собрать движок по [01-engine-build.md](01-engine-build.md) (на каждом устройстве отдельно, в репозитории его нет).
 2. Один раз зарегистрировать локальный NuGet-источник `GodotDouble` (команда — там же, п. 5).
-3. Клонировать репозиторий, открыть **double-редактором** (`godot.windows.editor.double.x86_64.mono.exe`)
-   или собрать/запустить из командной строки (см. [02-project-setup.md](02-project-setup.md)).
-4. Проверить, что всё работает: `godot ... --headless --path . -- --selftest` (см. [04-testing.md](04-testing.md)) — должно быть `0 failed`.
+3. Клонировать репозиторий. Дальше — `build.bat`/`run.bat`/`edit.bat`/`test.bat` из корня репозитория (см. «Быстрый
+   старт» в [02-project-setup.md](02-project-setup.md)); движок по умолчанию ищут в `D:\Programs\Godot-4.6.3-double`,
+   другой путь — через переменную окружения `GODOT_SRC`.
+4. Проверить, что всё работает: `test.bat` (или вручную `godot ... --headless --path . -- --selftest`, см.
+   [04-testing.md](04-testing.md)) — должно быть `0 failed`.
 
 ## Правила ведения документации
 

@@ -1,6 +1,6 @@
 using Godot;
 
-namespace SwV2.Editor.Ui;
+namespace SandboxPolyGame.Editor.Ui;
 
 internal static class UiStyle
 {

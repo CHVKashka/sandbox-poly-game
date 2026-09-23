@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Block id="pyramid" name="Pyramid">
+  <Color>#5f86b8</Color>
+  <Component type="BaseComponent">{ "mass": 5, "durability": 60, "damageResistance": 0.1 }</Component>
+  <Component type="BuildingBlock">{ "shape": "Pyramid", "minSize": [1,1,1], "maxSize": [8,8,8] }</Component>
+</Block>

@@ -1,9 +1,9 @@
-<Project Sdk="Godot.NET.Sdk/4.7.2">
+<Project Sdk="Godot.NET.Sdk/4.6.3">
   <PropertyGroup>
     <TargetFramework>net8.0</TargetFramework>
     <EnableDynamicLoading>true</EnableDynamicLoading>
-    <RootNamespace>SwV2</RootNamespace>
-    <AssemblyName>SW_V2</AssemblyName>
+    <RootNamespace>SandboxPolyGame</RootNamespace>
+    <AssemblyName>sandbox-poly-game</AssemblyName>
     <Nullable>enable</Nullable>
     <!-- Проект рассчитан ТОЛЬКО на кастомный Godot с precision=double (см. Docs/01-engine-build.md). -->
     <GodotFloat64>true</GodotFloat64>
