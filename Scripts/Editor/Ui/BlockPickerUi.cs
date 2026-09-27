@@ -91,12 +91,7 @@ internal sealed class BlockPickerUi
         var row = UiStyle.Transparent(new HBoxContainer());
         row.AddThemeConstantOverride("separation", 10);
 
-        row.AddChild(new ColorRect
-        {
-            Color = def.DefaultColor,
-            CustomMinimumSize = new Vector2(38, 38),
-            MouseFilter = Control.MouseFilterEnum.Ignore,
-        });
+        row.AddChild(BlockIconView.Create(def, 44));
 
         var name = UiStyle.MakeLabel(def.Name, 15);
         name.SizeFlagsVertical = Control.SizeFlags.ShrinkCenter;

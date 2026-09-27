@@ -19,6 +19,10 @@ public static class ConstructionIO
         /// <summary>Три четверть-поворота вокруг X/Y/Z (см. <see cref="BlockInstance.RotationSteps"/>). Поле не
         /// обязательно — отсутствует в файлах, сохранённых до появления вращения, тогда считается [0,0,0].</summary>
         [JsonPropertyName("rotation")] public int[]? Rotation { get; set; }
+
+        /// <summary>Отражение по X/Y/Z, 0 или 1 на компоненту (см. <see cref="BlockInstance.Mirror"/>). Поле не
+        /// обязательно — отсутствует в файлах, сохранённых до появления отражения, тогда считается [0,0,0].</summary>
+        [JsonPropertyName("mirror")] public int[]? Mirror { get; set; }
     }
 
     /// <summary>
@@ -27,12 +31,12 @@ public static class ConstructionIO
     /// {
     ///   "version": 1,
     ///   "blocks": [
-    ///     { "id": "wedge", "origin": [0, 0, 0], "size": [1, 1, 1], "color": "#808890", "rotation": [0, 1, 0] }
+    ///     { "id": "wedge", "origin": [0, 0, 0], "size": [1, 1, 1], "color": "#808890", "rotation": [0, 1, 0], "mirror": [1, 0, 0] }
     ///   ]
     /// }
     /// </code>
     /// <c>id</c> — слаг блока (<see cref="BlockDefinition.Slug"/>), не числовой рантайм-id (он не стабилен между запусками).
-    /// <c>rotation</c> опционален (по умолчанию [0,0,0]).
+    /// <c>rotation</c>/<c>mirror</c> опциональны (по умолчанию [0,0,0]).
     /// </summary>
     private sealed class Document
     {
@@ -54,6 +58,7 @@ public static class ConstructionIO
                 Size = new[] { instance.Size.X, instance.Size.Y, instance.Size.Z },
                 Color = "#" + CellColor.Unpack(instance.Color).ToHtml(false),
                 Rotation = new[] { instance.RotationSteps.X, instance.RotationSteps.Y, instance.RotationSteps.Z },
+                Mirror = new[] { instance.Mirror.X, instance.Mirror.Y, instance.Mirror.Z },
             });
         }
 
@@ -84,8 +89,9 @@ public static class ConstructionIO
             catch { color = definition.DefaultColor; }
 
             var rotation = entry.Rotation is { Length: 3 } r ? new Vector3I(r[0], r[1], r[2]) : Vector3I.Zero;
+            var mirror = entry.Mirror is { Length: 3 } m ? new Vector3I(m[0], m[1], m[2]) : Vector3I.Zero;
 
-            if (construction.PlaceBlock(origin, size, definition, color, rotation) == null) { skipped++; continue; }
+            if (construction.PlaceBlock(origin, size, definition, color, rotation, mirror) == null) { skipped++; continue; }
             loaded++;
         }
 

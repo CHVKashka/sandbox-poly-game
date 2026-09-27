@@ -31,6 +31,13 @@ public sealed class BlockInstance
     /// </summary>
     public Vector3I RotationSteps { get; set; } = Vector3I.Zero;
 
+    /// <summary>
+    /// Отражение по X/Y/Z (каждая компонента 0 — как есть, 1 — отражена), применяется до вращения (см.
+    /// <see cref="ShapeMeshBuilder.BuildData"/>). Влияет только на визуальную форму не-кубических блоков; задаётся
+    /// один раз при установке блока (см. <c>Editor.EditorState.PendingMirror</c>), после установки не меняется.
+    /// </summary>
+    public Vector3I Mirror { get; set; } = Vector3I.Zero;
+
     /// <summary>Включительный максимальный угол занимаемой области.</summary>
     public Vector3I MaxCell => Origin + Size - Vector3I.One;
 }

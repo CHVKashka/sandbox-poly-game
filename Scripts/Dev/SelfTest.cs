@@ -13,7 +13,7 @@ namespace SandboxPolyGame.Dev;
 /// Самотесты редактора. Запуск: <c>godot --headless --path . -- --selftest</c> (код выхода 0 = все тесты прошли).
 /// Часть 1 — чистая логика (меширование, каркас, рейкаст, границы чанков, каталог блоков, Construction/Resize/JSON),
 /// часть 2 — интеграционные проверки через имитацию реального ввода (Input.ParseInputEvent): ЛКМ/ПКМ, Tab, 1–9,
-/// колесо, WASD, СКМ, блокировка UI, диалог Resize.
+/// колесо, WASD, СКМ, блокировка UI, панель Resize на тулбаре.
 /// </summary>
 public sealed class SelfTest
 {
@@ -47,6 +47,7 @@ public sealed class SelfTest
         test.RunNonCubeMeshingTests();
         test.RunRotationStateTests();
         test.RunConstructionTests();
+        test.RunUndoHistoryTests();
         await test.RunEditorTests(editor);
 
         GD.Print($"=== self-test finished: {test._passed} passed, {test._failed} failed ===");
@@ -373,7 +374,7 @@ public sealed class SelfTest
 
         foreach (var shape in new[] { BlockShape.Slope, BlockShape.Pyramid, BlockShape.InvertedPyramid })
         {
-            var data = ShapeMeshBuilder.BuildData(shape, Vector3I.One, Vector3I.Zero, Colors.White);
+            var data = ShapeMeshBuilder.BuildData(shape, Vector3I.One, Vector3I.Zero, Vector3I.Zero, Colors.White);
             Check(data != null && data.Indices.Count > 0, $"{shape}: mesh has triangles");
             if (data == null) continue;
 
@@ -403,19 +404,21 @@ public sealed class SelfTest
             Check(inBounds, $"{shape}: all vertices stay within the block's 1x1x1 bounding box");
         }
 
-        // Пирамида — тетраэдр (4 треугольные грани); Скос — 3 прямоугольника + 2 треугольных борта (8 треугольников);
-        // Инвертированная пирамида — 3 прямоугольника + 4 треугольника (10 треугольников).
-        Check(ShapeMeshBuilder.BuildData(BlockShape.Pyramid, Vector3I.One, Vector3I.Zero, Colors.White)!.Indices.Count / 3 == 4,
+        // Пирамида — тетраэдр (4 треугольные грани, ни одна не FullCoverage - см. BlockGeometry). У Скоса и
+        // Инвертированной пирамиды FullCoverage-грани (низ+задняя стенка у Скоса; x=0/y=0/z=0 у InvertedPyramid)
+        // теперь рисует ChunkMesher вместе с кубами (см. ShapeMeshBuilder.FullCoverageMask) - ShapeMeshBuilder их
+        // больше не строит, поэтому у обеих форм остались только их наклонные/треугольные (не FullCoverage) грани.
+        Check(ShapeMeshBuilder.BuildData(BlockShape.Pyramid, Vector3I.One, Vector3I.Zero, Vector3I.Zero, Colors.White)!.Indices.Count / 3 == 4,
             "Pyramid: 4 triangles (tetrahedron, matches the 4 given vertices)");
-        Check(ShapeMeshBuilder.BuildData(BlockShape.Slope, Vector3I.One, Vector3I.Zero, Colors.White)!.Indices.Count / 3 == 8,
-            "Wedge: 8 triangles (3 rectangular faces + 2 triangular sides)");
-        Check(ShapeMeshBuilder.BuildData(BlockShape.InvertedPyramid, Vector3I.One, Vector3I.Zero, Colors.White)!.Indices.Count / 3 == 10,
-            "InvertedPyramid: 10 triangles (3 rectangular faces + 4 triangular faces)");
-        Check(ShapeMeshBuilder.BuildData(BlockShape.Cube, Vector3I.One, Vector3I.Zero, Colors.White) == null,
+        Check(ShapeMeshBuilder.BuildData(BlockShape.Slope, Vector3I.One, Vector3I.Zero, Vector3I.Zero, Colors.White)!.Indices.Count / 3 == 4,
+            "Wedge: 4 triangles left (ramp + 2 triangular sides) - bottom/back are FullCoverage, drawn by ChunkMesher instead");
+        Check(ShapeMeshBuilder.BuildData(BlockShape.InvertedPyramid, Vector3I.One, Vector3I.Zero, Vector3I.Zero, Colors.White)!.Indices.Count / 3 == 4,
+            "InvertedPyramid: 4 triangles left (the 3 truncated corners + the slice) - x=0/y=0/z=0 are FullCoverage, drawn by ChunkMesher instead");
+        Check(ShapeMeshBuilder.BuildData(BlockShape.Cube, Vector3I.One, Vector3I.Zero, Vector3I.Zero, Colors.White) == null,
             "Cube: ShapeMeshBuilder returns null (cubes are meshed by ChunkMesher instead)");
 
         // Resize «двигает вершины»: bounding box формы масштабируется вместе с размером экземпляра.
-        var scaled = ShapeMeshBuilder.BuildData(BlockShape.Pyramid, new Vector3I(2, 3, 4), Vector3I.Zero, Colors.White)!;
+        var scaled = ShapeMeshBuilder.BuildData(BlockShape.Pyramid, new Vector3I(2, 3, 4), Vector3I.Zero, Vector3I.Zero, Colors.White)!;
         double maxX = 0, maxY = 0, maxZ = 0;
         foreach (var v in scaled.Vertices)
         {
@@ -429,8 +432,8 @@ public sealed class SelfTest
         Check(boundsScaled, "resize moves the shape's vertices: bounding box scales with instance size", $"max=({maxX},{maxY},{maxZ})");
 
         // Вращение: 4 четверти вокруг одной оси = полный оборот = исходная форма; 90° меняет нормали граней.
-        var baseData = ShapeMeshBuilder.BuildData(BlockShape.Pyramid, Vector3I.One, Vector3I.Zero, Colors.White)!;
-        var fullTurn = ShapeMeshBuilder.BuildData(BlockShape.Pyramid, Vector3I.One, new Vector3I(4, 0, 0), Colors.White)!;
+        var baseData = ShapeMeshBuilder.BuildData(BlockShape.Pyramid, Vector3I.One, Vector3I.Zero, Vector3I.Zero, Colors.White)!;
+        var fullTurn = ShapeMeshBuilder.BuildData(BlockShape.Pyramid, Vector3I.One, new Vector3I(4, 0, 0), Vector3I.Zero, Colors.White)!;
         bool sameAfterFullTurn = true;
         for (int i = 0; i < baseData.Vertices.Count; i++)
         {
@@ -439,7 +442,7 @@ public sealed class SelfTest
 
         Check(sameAfterFullTurn, "rotating 4 quarter-turns around one axis returns to the original orientation");
 
-        var rotated90 = ShapeMeshBuilder.BuildData(BlockShape.Pyramid, Vector3I.One, new Vector3I(0, 1, 0), Colors.White)!;
+        var rotated90 = ShapeMeshBuilder.BuildData(BlockShape.Pyramid, Vector3I.One, new Vector3I(0, 1, 0), Vector3I.Zero, Colors.White)!;
         bool normalsChanged = false;
         for (int i = 0; i < baseData.Normals.Count; i++)
         {
@@ -447,37 +450,132 @@ public sealed class SelfTest
         }
 
         Check(normalsChanged, "rotating 90 degrees around Y visibly changes the shape's face normals");
+
+        // Отражение (Mirror): координата унитарного пространства заменяется на 1-c для отмеченных осей ДО поворота
+        // (см. ShapeMeshBuilder.BuildData) - меняет форму (не просто сдвигает её), и, как и поворот, не ломает
+        // обход треугольников (EmitFace сам чинит винд под пересчитанную нормаль).
+        var mirroredX = ShapeMeshBuilder.BuildData(BlockShape.Pyramid, Vector3I.One, Vector3I.Zero, new Vector3I(1, 0, 0), Colors.White)!;
+        bool verticesChanged = false;
+        for (int i = 0; i < baseData.Vertices.Count; i++)
+        {
+            if (baseData.Vertices[i].DistanceTo(mirroredX.Vertices[i]) > 1e-3f) verticesChanged = true;
+        }
+
+        Check(verticesChanged, "mirroring around X visibly changes the shape's vertex positions");
+
+        int mirrorBad = 0;
+        for (int t = 0; t < mirroredX.Indices.Count; t += 3)
+        {
+            var a = mirroredX.Vertices[mirroredX.Indices[t]];
+            var b = mirroredX.Vertices[mirroredX.Indices[t + 1]];
+            var c = mirroredX.Vertices[mirroredX.Indices[t + 2]];
+            if ((b - a).Cross(c - a).Dot(mirroredX.Normals[mirroredX.Indices[t]]) >= 0) mirrorBad++;
+        }
+
+        Check(mirrorBad == 0, "mirrored triangles still have correct front-face winding", $"{mirrorBad} bad of {mirroredX.Indices.Count / 3}");
+
+        // Регрессия: поворот несимметрично растянутого (Resize) блока должен укладываться РОВНО в занятые клетки
+        // (Construction.Size, зафиксированный в осях СЕТКИ), а не поворачиваться вместе с формой. Раньше вращение
+        // применялось К УЖЕ растянутой фигуре, поэтому при повороте на 90°/270° вокруг оси, меняющей местами две
+        // разные по размеру грани, bounding box съезжал с границ клеток ("плавал по середине сетки" в редакторе).
+        var asymmetricSize = new Vector3I(3, 1, 1);
+        var expectedExtent = new Vector3(asymmetricSize.X, asymmetricSize.Y, asymmetricSize.Z) * BuildSpace.CellSize;
+        foreach (var rot in new[] { Vector3I.Zero, new Vector3I(0, 1, 0), new Vector3I(0, 2, 0), new Vector3I(0, 3, 0), new Vector3I(1, 0, 0) })
+        {
+            var rotatedResized = ShapeMeshBuilder.BuildData(BlockShape.Slope, asymmetricSize, rot, Vector3I.Zero, Colors.White)!;
+            Vector3 min = rotatedResized.Vertices[0], max = rotatedResized.Vertices[0];
+            foreach (var v in rotatedResized.Vertices)
+            {
+                min = new Vector3(Mathf.Min(min.X, v.X), Mathf.Min(min.Y, v.Y), Mathf.Min(min.Z, v.Z));
+                max = new Vector3(Mathf.Max(max.X, v.X), Mathf.Max(max.Y, v.Y), Mathf.Max(max.Z, v.Z));
+            }
+
+            bool fitsFootprint = min.DistanceTo(Vector3.Zero) < 1e-4f && max.DistanceTo(expectedExtent) < 1e-4f;
+            Check(fitsFootprint, $"rotated ({rot.X},{rot.Y},{rot.Z}) 3x1x1 wedge still bounds exactly to its grid footprint (0..{expectedExtent})",
+                $"min={min} max={max}");
+        }
     }
 
     // ================================================================== не-кубические блоки в ChunkMesher
 
     private void RunNonCubeMeshingTests()
     {
-        GD.Print("-- non-cube blocks: ChunkMesher skips their own faces but still culls neighbors");
+        GD.Print("-- non-cube blocks: their full-coverage sides join the same ChunkMesher pass as cubes (merge/cull), partial sides never do");
 
+        // Тесты ниже пишут прямо в VoxelGrid (в обход Construction), поэтому маску полного покрытия граней
+        // (VoxelChunk.FaceMask) нужно посчитать и передать явно - обычно это делает Construction.PlaceBlock при
+        // установке блока игроком (см. Construction.FullCoverageMask).
         var wedge = BlockCatalog.Instance.Get("wedge");
+        var block = BlockCatalog.Instance.Get("block");
+        byte wedgeMask = ShapeMeshBuilder.FullCoverageMask(BlockShape.Slope, Vector3I.Zero, Vector3I.Zero);
+        Check(wedgeMask == 0b010100, "Wedge (no rotation) fully covers exactly Y- (bottom) and Z- (back)", $"got {Convert.ToString(wedgeMask, 2)}");
+
+        // Одинокий скос: рисует ChunkMesher только те 2 грани из 6, что покрывает ЦЕЛИКОМ (низ+задняя стенка) -
+        // остальное (рампа, 2 треугольных борта) по-прежнему рисует его собственный меш (ShapeMeshBuilder), не этот.
         var solo = new VoxelGrid();
-        solo.TrySet(new Vector3I(0, 0, 0), wedge.RuntimeId, CellColor.Pack(Colors.Gray));
+        solo.TrySet(new Vector3I(0, 0, 0), wedge.RuntimeId, CellColor.Pack(Colors.Gray), wedgeMask);
         var soloStats = Measure(solo);
-        Check(soloStats.Faces == 0 && soloStats.Quads == 0,
-            "a lone non-cube cell contributes no faces/quads to ChunkMesher (its own mesh is drawn separately)",
+        Check(soloStats.Faces == 2 && soloStats.Quads == 2,
+            "a lone non-cube cell contributes only its full-coverage sides to ChunkMesher (2 for Wedge: bottom + back)",
             $"faces={soloStats.Faces} quads={soloStats.Quads}");
 
-        var block = BlockCatalog.Instance.Get("block");
+        // Раньше грань куба, обращённая к любому занятому соседу (кубу ИЛИ форме), всегда скрывалась - но форма не
+        // обязательно покрывает всю грань клетки целиком (Wedge не покрывает свои X-стороны - треугольные борта),
+        // поэтому такое скрытие оставляло настоящую дыру в стыке. Теперь грань куба скрывается, только если сосед
+        // тоже покрывает СВОЮ обращённую сюда сторону целиком (маска) - Wedge справа не покрывает X-, так что куб
+        // не культится там. Зато обе фигуры одного цвета ДЕЛЯТ низ (Y-) и заднюю стенку (Z-) - раньше эти стороны
+        // не сливались (Wedge их вообще не рисовал через ChunkMesher), теперь они склеиваются в общие полигоны
+        // (пункт 1 из ROADMAP.md - "прямые плоскости не-кубических блоков между собой/с кубами не склеивались").
         var mixed = new VoxelGrid();
         mixed.TrySet(new Vector3I(0, 0, 0), block.RuntimeId, CellColor.Pack(Colors.Gray));
-        mixed.TrySet(new Vector3I(1, 0, 0), wedge.RuntimeId, CellColor.Pack(Colors.Gray));
+        mixed.TrySet(new Vector3I(1, 0, 0), wedge.RuntimeId, CellColor.Pack(Colors.Gray), wedgeMask);
         var mixedStats = Measure(mixed);
-        Check(mixedStats.Faces == 5 && mixedStats.Quads == 5,
-            "a cube next to a non-cube block still culls the touching face (non-cube cells still count as solid)",
+        Check(mixedStats.Faces == 8 && mixedStats.Quads == 6,
+            "a cube next to a non-cube block does not cull their touching (partially covered) side, but their shared " +
+            "bottom/back planes (both fully covered, same color) merge into single quads across the seam",
             $"faces={mixedStats.Faces} quads={mixedStats.Quads}");
+
+        // Два одинаковых скоса впритык вдоль X: оба открытых низа (Y-) сливаются в один прямоугольник, и обе задние
+        // стенки (Z-) - в другой. 4 отдельные грани -> 2 склеенных полигона (снова пункт 1 из ROADMAP.md, теперь
+        // между двумя не-кубическими формами, а не формой и кубом).
+        var merging = new VoxelGrid();
+        merging.TrySet(new Vector3I(0, 0, 0), wedge.RuntimeId, CellColor.Pack(Colors.Gray), wedgeMask);
+        merging.TrySet(new Vector3I(1, 0, 0), wedge.RuntimeId, CellColor.Pack(Colors.Gray), wedgeMask);
+        var mergingStats = Measure(merging);
+        Check(mergingStats.Faces == 4 && mergingStats.Quads == 2,
+            "two adjacent same-colored shapes merge their touching full-coverage sides into a single quad each",
+            $"faces={mergingStats.Faces} quads={mergingStats.Quads}");
+
+        // Два скоса, повёрнутые так, что их полные грани обращены друг к другу (A: Y-/Z- смотрят "вниз/назад";
+        // B повёрнут на 180° вокруг X, поэтому его полные грани смотрят Y+/Z+ - "вверх/вперёд", то есть НА A) -
+        // взаимно культят стык, вместо того чтобы обе рисовать невидимую снаружи внутреннюю грань (пункт 2 из
+        // ROADMAP.md - "поверхности блоков, стоящие вплотную и недоступные для взгляда игроку, всё равно
+        // отрисовываются"). Остаются только внешние стороны каждого (Z- у A, Z+ у B).
+        byte wedgeMaskFlipped = ShapeMeshBuilder.FullCoverageMask(BlockShape.Slope, new Vector3I(2, 0, 0), Vector3I.Zero);
+        Check(wedgeMaskFlipped == 0b101000, "Wedge rotated 180 around X fully covers Y+ and Z+ instead", $"got {Convert.ToString(wedgeMaskFlipped, 2)}");
+        var touching = new VoxelGrid();
+        touching.TrySet(new Vector3I(0, 0, 0), wedge.RuntimeId, CellColor.Pack(Colors.Gray), wedgeMask);
+        touching.TrySet(new Vector3I(0, -1, 0), wedge.RuntimeId, CellColor.Pack(Colors.Gray), wedgeMaskFlipped);
+        var touchingStats = Measure(touching);
+        Check(touchingStats.Faces == 2 && touchingStats.Quads == 2,
+            "two shapes whose full-coverage sides face each other mutually cull that shared, invisible-from-outside face",
+            $"faces={touchingStats.Faces} quads={touchingStats.Quads}");
+
+        // Куб рядом с кубом по-прежнему культится нормально (сосед гарантированно закрывает всю грань).
+        var cubes = new VoxelGrid();
+        cubes.TrySet(new Vector3I(0, 0, 0), block.RuntimeId, CellColor.Pack(Colors.Gray));
+        cubes.TrySet(new Vector3I(1, 0, 0), block.RuntimeId, CellColor.Pack(Colors.Gray));
+        var cubesStats = Measure(cubes);
+        Check(cubesStats.Faces == 10 && cubesStats.Quads == 6,
+            "two adjacent cubes still cull their shared touching faces (both count as full coverage)",
+            $"faces={cubesStats.Faces} quads={cubesStats.Quads}");
     }
 
-    // ================================================================== вращение перед установкой (J/K/I)
+    // ================================================================== вращение перед установкой (J/K/L)
 
     private void RunRotationStateTests()
     {
-        GD.Print("-- pending rotation: J/K/I increment X/Y/Z mod 4");
+        GD.Print("-- pending rotation: J/K/L increment X/Y/Z mod 4");
 
         var state = new EditorState();
         Check(state.PendingRotationSteps == Vector3I.Zero, "EditorState starts with no rotation");
@@ -566,6 +664,12 @@ public sealed class SelfTest
         var h = construction.Place(new Vector3I(65, 0, 0), wedge, wedge.DefaultColor, new Vector3I(0, 1, 2));
         Check(h != null && h!.RotationSteps == new Vector3I(0, 1, 2), "Place: stores the given rotation steps on the new instance");
 
+        // Отражение: Place/PlaceBlock принимают и хранят Mirror (по умолчанию — [0,0,0]), независимо от RotationSteps.
+        var m = construction.Place(new Vector3I(70, 0, 0), wedge, wedge.DefaultColor);
+        Check(m != null && m!.Mirror == Vector3I.Zero, "Place: defaults to no mirror when omitted");
+        var n = construction.Place(new Vector3I(75, 0, 0), wedge, wedge.DefaultColor, mirror: new Vector3I(1, 0, 1));
+        Check(n != null && n!.Mirror == new Vector3I(1, 0, 1), "Place: stores the given mirror flags on the new instance");
+
         RunSaveLoadTests(catalog, block, wedge, pyramid);
     }
 
@@ -573,7 +677,7 @@ public sealed class SelfTest
     {
         var saved = new Construction(new VoxelGrid());
         saved.Place(new Vector3I(0, 0, 0), block, Colors.Red);
-        saved.PlaceBlock(new Vector3I(5, 0, 0), new Vector3I(2, 1, 3), wedge, Colors.Green, new Vector3I(1, 2, 3));
+        saved.PlaceBlock(new Vector3I(5, 0, 0), new Vector3I(2, 1, 3), wedge, Colors.Green, new Vector3I(1, 2, 3), new Vector3I(1, 0, 1));
         string json = ConstructionIO.Serialize(saved);
 
         var loaded = new Construction(new VoxelGrid());
@@ -584,8 +688,8 @@ public sealed class SelfTest
             i.BlockSlug == "block" && i.Origin == new Vector3I(0, 0, 0) && i.Size == Vector3I.One && i.Color == CellColor.Pack(Colors.Red));
         bool wedgeOk = loaded.Instances.Any(i =>
             i.BlockSlug == "wedge" && i.Origin == new Vector3I(5, 0, 0) && i.Size == new Vector3I(2, 1, 3)
-            && i.Color == CellColor.Pack(Colors.Green) && i.RotationSteps == new Vector3I(1, 2, 3));
-        Check(blockOk && wedgeOk, "Save/Load: slug, origin, size, color and rotation survive the round-trip");
+            && i.Color == CellColor.Pack(Colors.Green) && i.RotationSteps == new Vector3I(1, 2, 3) && i.Mirror == new Vector3I(1, 0, 1));
+        Check(blockOk && wedgeOk, "Save/Load: slug, origin, size, color, rotation and mirror survive the round-trip");
 
         const string badJson = "{\"version\":1,\"blocks\":[{\"id\":\"__unknown__\",\"origin\":[0,0,0],\"size\":[1,1,1],\"color\":\"#ffffff\"}]}";
         var skipTarget = new Construction(new VoxelGrid());
@@ -605,6 +709,67 @@ public sealed class SelfTest
             "Save/Load: round-trips through an actual file (user://)", $"saveError={saveError} loadError={loadError}");
 
         DirAccess.RemoveAbsolute(path);
+    }
+
+    // ================================================================== история отмены/повтора (Ctrl+Z/Ctrl+Y)
+
+    private void RunUndoHistoryTests()
+    {
+        GD.Print("-- undo history: snapshot-based Ctrl+Z/Ctrl+Y over Construction");
+
+        var catalog = BlockCatalog.Instance;
+        var block = catalog.Get("block");
+        var construction = new Construction(new VoxelGrid());
+        var history = new UndoHistory();
+
+        Check(!history.CanUndo && !history.CanRedo, "UndoHistory starts empty");
+
+        // Действие, которое ничего не меняет (клетка уже занята), не должно создавать запись в истории.
+        construction.Place(new Vector3I(0, 0, 0), block, block.DefaultColor);
+        var beforeNoop = history.Capture(construction);
+        Check(construction.PlaceBlock(new Vector3I(0, 0, 0), Vector3I.One, block, block.DefaultColor) == null,
+            "undo setup: placing on an occupied cell fails");
+        history.RecordIfChanged(beforeNoop, construction);
+        Check(!history.CanUndo, "a no-op action (nothing actually changed) is not recorded");
+        construction.Clear();
+
+        // Основной цикл: место -> Undo -> Redo.
+        var empty = history.Capture(construction);
+        construction.Place(new Vector3I(2, 0, 0), block, Colors.Red);
+        history.RecordIfChanged(empty, construction);
+        Check(history.CanUndo && !history.CanRedo, "placing a block records one undo entry");
+
+        Check(history.Undo(construction, catalog), "Undo succeeds");
+        Check(construction.Instances.Count == 0 && history.CanRedo, "Undo removes the placed block and enables Redo");
+
+        Check(history.Redo(construction, catalog), "Redo succeeds");
+        Check(construction.Instances.Count == 1 && construction.Instances.First().Color == CellColor.Pack(Colors.Red),
+            "Redo restores the block (with its color)");
+
+        // Новое действие после Undo обрывает redo-ветку (стандартное поведение истории в любом редакторе).
+        Check(history.Undo(construction, catalog) && history.CanRedo, "undo again to set up a redo branch");
+        var beforeNewAction = history.Capture(construction);
+        construction.Place(new Vector3I(9, 0, 0), block, block.DefaultColor);
+        history.RecordIfChanged(beforeNewAction, construction);
+        Check(!history.CanRedo, "a new action after Undo clears the redo stack");
+
+        Check(!history.Redo(construction, catalog), "Redo on an empty redo stack does nothing and returns false");
+
+        // Точечная покраска ГРАНИ переживает Undo/Redo не хуже установки/удаления - раньше снэпшот истории был
+        // просто ConstructionIO.Serialize (только per-instance представительный цвет), который точечных перекрасок
+        // граней вообще не видел (см. class doc UndoHistory) - Undo "терял" бы такую покраску.
+        construction.Clear();
+        construction.Place(new Vector3I(20, 0, 0), block, block.DefaultColor);
+        var beforeFacePaint = history.Capture(construction);
+        uint faceRed = CellColor.Pack(Colors.Red);
+        construction.Grid.TryPaintFace(new Vector3I(20, 0, 0), 1, true, faceRed);
+        history.RecordIfChanged(beforeFacePaint, construction);
+        Check(history.CanUndo, "painting a single face records an undo entry even though no instance changed");
+
+        Check(history.Undo(construction, catalog) && construction.Grid.GetFaceColor(new Vector3I(20, 0, 0), 1, true) != faceRed,
+            "Undo restores the face's previous color");
+        Check(history.Redo(construction, catalog) && construction.Grid.GetFaceColor(new Vector3I(20, 0, 0), 1, true) == faceRed,
+            "Redo re-applies the face paint");
     }
 
     // ================================================================== интеграция: реальный ввод
@@ -671,7 +836,8 @@ public sealed class SelfTest
         GD.Print($"  info  viewport={editor.GetViewport().GetVisibleRect().Size} display={DisplayServer.GetName()} window={DisplayServer.WindowGetSize()}");
         grid.Clear();
         state.Tool = ToolMode.None;
-        state.Wire = WireMode.Off;
+        state.Wireframe = false;
+        state.Borders = true;
 
         int blockCount = BlockCatalog.Instance.All.Count;
         Check(blockCount == 4, "catalog has 4 shape blocks (block, wedge, pyramid, inverse_pyramid)", $"got {blockCount}");
@@ -695,6 +861,11 @@ public sealed class SelfTest
         await Move(editor, ground);
         Check(editor.Hover.Found && !editor.Hover.IsBlock && editor.Hover.PlaceCell == new Vector3I(0, 0, 0), "cursor over ground targets cell (0,0,0)", $"{editor.Hover} ground={ground} overUi={editor.Ui.IsPointOverUi(ground)} cam={camera.GlobalPosition}");
 
+        var ghostMaterial = (StandardMaterial3D)editor.Ghost.MaterialOverride;
+        Check(editor.Ghost.Visible && ghostMaterial.Transparency == BaseMaterial3D.TransparencyEnum.Disabled && ghostMaterial.AlbedoColor.A >= 0.999f,
+            "placement ghost is opaque, not a translucent preview (looks like an installed block)",
+            $"visible={editor.Ghost.Visible} transparency={ghostMaterial.Transparency} alpha={ghostMaterial.AlbedoColor.A}");
+
         await Click(editor, ground, MouseButton.Left);
         Check(grid.GetId(new Vector3I(0, 0, 0)) == BlockCatalog.Instance.Get(state.SelectedBlockSlug).RuntimeId, "LMB places the selected hotbar block on the ground");
 
@@ -708,37 +879,77 @@ public sealed class SelfTest
         await Click(editor, Screen(TopOf(new Vector3I(0, 2, 0))), MouseButton.Right);
         Check(grid.BlockCount == 3, "RMB with no tool selected does nothing");
 
-        // 3. Инструменты тулбара на ПКМ.
+        // 3. Инструменты тулбара: Paint на ПКМ, Delete на ЛКМ (см. BuildEditor.ButtonFor).
         state.PaintColor = Colors.Red;
         state.Tool = ToolMode.Paint;
         var target = new Vector3I(0, 2, 0);
+        await Move(editor, Screen(TopOf(target)));
+        Check(!editor.Ghost.Visible, "paint tool active: placement ghost is hidden even over a free cell");
+        int blocksBeforePaintLmb = grid.BlockCount;
+        await Click(editor, Screen(TopOf(target)), MouseButton.Left);
+        Check(grid.BlockCount == blocksBeforePaintLmb && grid.GetId(new Vector3I(0, 3, 0)) == 0,
+            "paint tool active: LMB does not place a block (Paint owns RMB, not LMB)");
         await Click(editor, Screen(TopOf(target)), MouseButton.Right);
-        Check(grid.GetColor(target) == CellColor.Pack(Colors.Red) && grid.GetId(target) != 0, "paint tool recolors the block under the cursor");
+        // По грани, а не по всему блоку: TopOf наводит на верхнюю (Y+) грань - красится ровно она, остальные
+        // 5 граней клетки (в т.ч. "представительная" грань X-, которую отдаёт GetColor) остаются как были.
+        Check(grid.GetFaceColor(target, 1, true) == CellColor.Pack(Colors.Red) && grid.GetId(target) != 0,
+            "paint tool recolors exactly the face under the cursor (top, Y+), not the whole block");
+        Check(grid.GetColor(target) != CellColor.Pack(Colors.Red),
+            "paint tool leaves the other faces of the same cell untouched (representative X- face still the block's default color)");
 
         state.Tool = ToolMode.Delete;
+        await Move(editor, Screen(TopOf(target)));
+        Check(!editor.Ghost.Visible, "delete tool active: placement ghost is hidden too");
         await Click(editor, Screen(TopOf(target)), MouseButton.Right);
-        Check(grid.GetId(target) == 0 && grid.BlockCount == 2, "delete tool removes the block under the cursor");
+        Check(grid.GetId(target) != 0, "delete tool active: RMB does nothing (Delete moved to LMB, RMB is Paint's button)");
+        await Click(editor, Screen(TopOf(target)), MouseButton.Left);
+        Check(grid.GetId(target) == 0 && grid.BlockCount == 2, "delete tool removes the block under the cursor (LMB)");
         state.Tool = ToolMode.None;
+        await Move(editor, Screen(TopOf(new Vector3I(0, 1, 0)))); // (0,2,0) только что удалена - точно свободна
+        Check(editor.Ghost.Visible, "no tool active: placement ghost is visible again");
 
-        // wireframe-инструмент: три режима
+        // `X` — горячая клавиша Delete, эквивалент клика по кнопке на тулбаре (повторное нажатие выключает).
+        await PressKey(editor, Godot.Key.X);
+        Check(state.Tool == ToolMode.Delete, "X activates the Delete tool");
+        await PressKey(editor, Godot.Key.X);
+        Check(state.Tool == ToolMode.None, "X again deactivates it");
+
+        // Wireframe и Borders — независимые переключатели (не цикл): Wireframe скрывает сплошные грани, Borders
+        // не зависит ни от Wireframe, ни от сплошных граней.
         editor.World.RebuildDirty();
-        var seen = new List<string>();
-        for (int i = 0; i < 3; i++)
+
+        (int solid, int wire, int border) CountVisible()
         {
-            int solidVisible = 0, wireVisible = 0;
+            int solidVisible = 0, wireVisible = 0, borderVisible = 0;
             foreach (var child in editor.World.GetChildren())
             {
                 if (child is not MeshInstance3D mesh) continue;
                 if (mesh.Name.ToString().StartsWith("Solid_") && mesh.Visible) solidVisible++;
                 if (mesh.Name.ToString().StartsWith("Wire_") && mesh.Visible) wireVisible++;
+                if (mesh.Name.ToString().StartsWith("Border_") && mesh.Visible) borderVisible++;
             }
 
-            seen.Add($"{state.Wire}:solid={solidVisible},wire={wireVisible}");
-            state.CycleWire();
+            return (solidVisible, wireVisible, borderVisible);
         }
 
-        Check(seen[0].EndsWith("solid=1,wire=0") && seen[1].EndsWith("solid=1,wire=1") && seen[2].EndsWith("solid=0,wire=1") && state.Wire == WireMode.Off,
-            "wireframe tool cycles solid -> solid+wire -> wire only -> solid", string.Join(" | ", seen));
+        state.Wireframe = false;
+        state.Borders = true;
+        var v1 = CountVisible();
+        Check(v1.solid == 1 && v1.wire == 0 && v1.border == 1, "default: solid + borders, no wireframe", $"{v1}");
+
+        state.Wireframe = true;
+        var v2 = CountVisible();
+        Check(v2.solid == 0 && v2.wire == 1 && v2.border == 1, "wireframe on hides solid, borders stay independent", $"{v2}");
+
+        state.Borders = false;
+        var v3 = CountVisible();
+        Check(v3.solid == 0 && v3.wire == 1 && v3.border == 0, "borders off while wireframe stays on", $"{v3}");
+
+        state.Wireframe = false;
+        var v4 = CountVisible();
+        Check(v4.solid == 1 && v4.wire == 0 && v4.border == 0, "wireframe off restores solid, borders still off", $"{v4}");
+
+        state.Borders = true;
 
         // 2. Хотбар: клавиши 1-9, колесо, Tab.
         await PressKey(editor, Godot.Key.Key3);
@@ -776,11 +987,14 @@ public sealed class SelfTest
 
         Button? FindButton(string text) => FindButtons(editor).Find(b => b.Text == text || b.TooltipText == text);
         Vector2 CenterOf(Button b) => b.GetGlobalRect().GetCenter();
+        bool HasActiveIndicator(Button b) => b.GetChildren().OfType<Panel>().Any(p => p.Visible);
 
         await Click(editor, CenterOf(FindButton("Delete")!), MouseButton.Left);
         Check(state.Tool == ToolMode.Delete, "toolbar: Delete button activates the delete tool");
+        Check(HasActiveIndicator(FindButton("Delete")!), "toolbar: active tool button shows its indicator dot");
         await Click(editor, CenterOf(FindButton("Delete")!), MouseButton.Left);
         Check(state.Tool == ToolMode.None, "toolbar: pressing the active tool again deactivates it");
+        Check(!HasActiveIndicator(FindButton("Delete")!), "toolbar: indicator dot hides once the tool deactivates");
         await Click(editor, CenterOf(FindButton("Paint")!), MouseButton.Left);
         Check(state.Tool == ToolMode.Paint, "toolbar: Paint button activates the paint tool");
         Check(FindButton("+ Save color") != null, "toolbar: the paint panel (sliders/palette) is visible while Paint is active");
@@ -788,11 +1002,20 @@ public sealed class SelfTest
         Check(state.Tool == ToolMode.Delete, "toolbar: tools are mutually exclusive");
         Check(FindButton("+ Save color") == null, "toolbar: the paint panel hides again once Paint is no longer active");
         await Click(editor, CenterOf(FindButton("Resize")!), MouseButton.Left);
-        Check(state.Tool == ToolMode.Resize, "toolbar: Resize button activates the resize tool");
+        Check(state.ResizePanelOpen, "toolbar: Resize button opens the resize panel (does not touch state.Tool)");
+        Check(state.Tool == ToolMode.Delete, "toolbar: Resize does not affect the Paint/Delete tool selection");
+        await Click(editor, CenterOf(FindButton("Resize")!), MouseButton.Left);
+        Check(!state.ResizePanelOpen, "toolbar: pressing Resize again closes the panel");
         state.Tool = ToolMode.None;
-        await Click(editor, CenterOf(FindButton("Wireframe: off")!), MouseButton.Left);
-        Check(state.Wire == WireMode.Overlay, "toolbar: wireframe button switches the display mode");
-        state.Wire = WireMode.Off;
+        await Frames(editor, 1); // даём контейнеру пересчитать позиции после скрытия панели Resize
+
+        await Click(editor, CenterOf(FindButton("Wireframe")!), MouseButton.Left);
+        Check(state.Wireframe, "toolbar: Wireframe button toggles state.Wireframe");
+        await Click(editor, CenterOf(FindButton("Borders")!), MouseButton.Left);
+        Check(!state.Borders, "toolbar: Borders button toggles state.Borders (starts on, so this turns it off)");
+        await Click(editor, CenterOf(FindButton("Wireframe")!), MouseButton.Left);
+        await Click(editor, CenterOf(FindButton("Borders")!), MouseButton.Left);
+        Check(!state.Wireframe && state.Borders, "toolbar: Wireframe/Borders are independent toggles, not a shared cycle");
 
         await PressKey(editor, Godot.Key.Tab);
         await Click(editor, CenterOf(FindButton("Wedge")!), MouseButton.Left);
@@ -828,50 +1051,126 @@ public sealed class SelfTest
         Check(savedAfter == savedBefore + 1, "paint panel: 'Save color' adds a new swatch to Saved colors", $"{savedBefore} -> {savedAfter}");
         state.Tool = ToolMode.None;
 
-        // 5. Resize через реальный пайплайн: ЛКМ ставит блок, ПКМ с инструментом Resize открывает диалог X/Y/Z,
-        // кнопки "+"/"-" в диалоге меняют размер (растёт только от origin в положительную сторону).
+        // 5. Resize настраивает ПРИЗРАК (EditorState.PendingSize), а не уже поставленные блоки: панель на тулбаре
+        // всегда активна (не нужна цель/ПКМ), ЛКМ ставит блок сразу такого размера. Поле принимает только целые
+        // положительные значения.
         grid.Clear();
         camera.LookAtPoint(new Vector3(1.5f, 2f, 2.5f), new Vector3(0.125f, 0.0f, 0.125f));
         await Frames(editor, 2);
         state.SelectedSlot = 0;
-        await Click(editor, Screen(new Vector3(0.125f, 0f, 0.125f)), MouseButton.Left);
-        var resizeTarget = editor.World.Construction.GetOwner(new Vector3I(0, 0, 0));
-        Check(resizeTarget != null && resizeTarget.Size == Vector3I.One, "resize setup: LMB placed a fresh 1x1x1 instance");
 
-        state.Tool = ToolMode.Resize;
-        await Click(editor, Screen(TopOf(new Vector3I(0, 0, 0))), MouseButton.Right);
-        Check(editor.Ui.ResizeDialogOpen, "resize tool: RMB on a block opens the resize dialog");
+        List<LineEdit> ResizeFields() =>
+            editor.GetTree().Root.FindChildren("*", "LineEdit", true, false).OfType<LineEdit>().Where(f => f.IsVisibleInTree()).ToList();
+
+        Check(state.PendingSize == Vector3I.One, "resize: PendingSize starts at 1x1x1");
+        state.ResizePanelOpen = true;
+        await Frames(editor, 1);
+        var fields = ResizeFields();
+        Check(fields.Count == 3 && fields.All(f => f.Editable) && fields[0].Text == "1" && fields[1].Text == "1" && fields[2].Text == "1",
+            "resize panel: 3 editable fields, always active (no RMB target needed), show PendingSize",
+            string.Join(",", fields.Select(f => f.Text)));
 
         var plusButtons = FindButtons(editor).Where(b => b.Text == "+").ToList();
-        Check(plusButtons.Count == 3, "resize dialog: 3 '+' buttons (X/Y/Z)", $"found {plusButtons.Count}");
+        Check(plusButtons.Count == 3, "resize panel: 3 '+' buttons (X/Y/Z)", $"found {plusButtons.Count}");
         await Click(editor, plusButtons[0].GetGlobalRect().GetCenter(), MouseButton.Left);
-        Check(resizeTarget!.Size == new Vector3I(2, 1, 1) && grid.IsSolid(new Vector3I(1, 0, 0)) && resizeTarget!.Origin == Vector3I.Zero,
-            "resize dialog: '+' on X grows the block by 1 cell along X, origin unchanged", $"size={resizeTarget!.Size}");
+        Check(state.PendingSize == new Vector3I(2, 1, 1), "resize panel: '+' on X grows PendingSize.X", $"{state.PendingSize}");
 
         var minusButtons = FindButtons(editor).Where(b => b.Text == "-").ToList();
         await Click(editor, minusButtons[0].GetGlobalRect().GetCenter(), MouseButton.Left);
-        Check(resizeTarget!.Size == Vector3I.One && !grid.IsSolid(new Vector3I(1, 0, 0)),
-            "resize dialog: '-' on X shrinks the block back down", $"size={resizeTarget!.Size}");
+        Check(state.PendingSize == Vector3I.One, "resize panel: '-' on X shrinks PendingSize.X back down", $"{state.PendingSize}");
 
-        await PressKey(editor, Godot.Key.Escape);
-        Check(!editor.Ui.ResizeDialogOpen, "Esc closes the resize dialog");
-        state.Tool = ToolMode.None;
-        grid.Clear();
+        // Прямой ввод в текстовое поле: целое положительное значение применяется, всё остальное откатывается.
+        var fieldX = ResizeFields()[0];
+        fieldX.Text = "3";
+        fieldX.EmitSignal(LineEdit.SignalName.TextSubmitted, "3");
+        Check(state.PendingSize == new Vector3I(3, 1, 1), "resize field: typing a positive integer and submitting updates PendingSize", $"{state.PendingSize}");
 
-        // Вращение перед установкой (J/K/I): меняет ориентацию следующего блока, вращение сохраняется в поставленном
+        fieldX.Text = "0";
+        fieldX.EmitSignal(LineEdit.SignalName.TextSubmitted, "0");
+        Check(state.PendingSize == new Vector3I(3, 1, 1) && fieldX.Text == "3",
+            "resize field: 0 is rejected, the field reverts to the last valid size", $"{state.PendingSize} text={fieldX.Text}");
+
+        fieldX.Text = "-5";
+        fieldX.EmitSignal(LineEdit.SignalName.TextChanged, "-5");
+        Check(fieldX.Text == "5", "resize field: '-' is not a digit, filtered out as it's typed (values are never negative)", $"text={fieldX.Text}");
+        fieldX.Text = "3";
+        fieldX.EmitSignal(LineEdit.SignalName.TextSubmitted, "3"); // возвращаем валидный текст, PendingSize уже 3x1x1
+
+        state.ResizePanelOpen = false;
+        await Frames(editor, 1);
+        Check(ResizeFields().Count == 0, "resize panel: hides once closed");
+
+        // ЛКМ ставит блок СРАЗУ размером PendingSize (3x1x1, а не 1x1x1 + отдельный шаг растягивания).
+        await Click(editor, Screen(new Vector3(0.125f, 0f, 0.125f)), MouseButton.Left);
+        var placedAt3x1x1 = editor.World.Construction.GetOwner(new Vector3I(0, 0, 0));
+        Check(placedAt3x1x1 != null && placedAt3x1x1.Size == new Vector3I(3, 1, 1) && grid.IsSolid(new Vector3I(2, 0, 0)),
+            "LMB places a block directly at PendingSize - no separate resize-after-placing step needed", $"size={placedAt3x1x1?.Size}");
+
+        // Дальнейшие правки PendingSize НЕ меняют уже поставленный блок (это и был баг: Resize раньше действовал
+        // на блоки под курсором, а не на призрак следующей установки).
+        state.ResizePanelOpen = true;
+        await Frames(editor, 1);
+        await Click(editor, FindButtons(editor).Where(b => b.Text == "+").ToList()[1].GetGlobalRect().GetCenter(), MouseButton.Left);
+        Check(state.PendingSize == new Vector3I(3, 2, 1) && placedAt3x1x1!.Size == new Vector3I(3, 1, 1),
+            "resize: growing PendingSize.Y afterwards does not resize the block already placed", $"pending={state.PendingSize} placed={placedAt3x1x1!.Size}");
+
+        state.SetPendingSizeAxis(0, 1);
+        state.SetPendingSizeAxis(1, 1);
+        state.ResizePanelOpen = false;
+        // Construction.Clear(), не голый grid.Clear(): последний чистит только клетки, а не владение Construction —
+        // оставшаяся запись "клетка (1,0,0)/(2,0,0) принадлежит этому 3x1x1 экземпляру" пережила бы очистку сетки
+        // и позже, при удалении инструментом Delete чего-то совсем другого на этих же координатах, задела бы их тоже.
+        editor.World.Construction.Clear();
+
+        // Вращение перед установкой (J/K/L): меняет ориентацию следующего блока, вращение сохраняется в поставленном
         // экземпляре. 0=block, 1=inverse_pyramid, 2=pyramid, 3=wedge — алфавитный порядок каталога (см. блочные тесты).
         state.SelectedSlot = 3;
         Check(state.SelectedBlockSlug == "wedge", "rotation setup: hotbar slot 3 is 'wedge'", state.SelectedBlockSlug);
         await PressKey(editor, Godot.Key.J);
         await PressKey(editor, Godot.Key.K);
         await PressKey(editor, Godot.Key.K);
-        Check(state.PendingRotationSteps == new Vector3I(1, 2, 0), "J/K real key presses rotate the pending placement orientation");
+        await PressKey(editor, Godot.Key.L);
+        Check(state.PendingRotationSteps == new Vector3I(1, 2, 1), "J/K/L real key presses rotate the pending placement orientation around X/Y/Z");
 
         await Click(editor, ground, MouseButton.Left);
         var rotatedInstance = editor.World.Construction.GetOwner(new Vector3I(0, 0, 0));
-        Check(rotatedInstance != null && rotatedInstance.RotationSteps == new Vector3I(1, 2, 0),
+        Check(rotatedInstance != null && rotatedInstance.RotationSteps == new Vector3I(1, 2, 1),
             "the placed block bakes in the pending rotation steps");
-        grid.Clear();
+        editor.World.Construction.Clear();
+
+        // Отражение (U/I/O): переключает EditorState.PendingMirror для СЛЕДУЮЩЕГО ставящегося блока/призрака — как
+        // и вращение (J/K/L) выше, а не двигает уже поставленный блок под курсором. Раньше (баг) эти клавиши двигали
+        // наведённый блок на +1 клетку вместо отражения вершин — фикс проверяется явно ниже.
+        state.SelectedSlot = 3; // wedge
+        Check(state.PendingMirror == Vector3I.Zero, "mirror: PendingMirror starts at (0,0,0)");
+
+        await PressKey(editor, Godot.Key.U);
+        Check(state.PendingMirror == new Vector3I(1, 0, 0), "U toggles mirror around X");
+        await PressKey(editor, Godot.Key.I);
+        Check(state.PendingMirror == new Vector3I(1, 1, 0), "I toggles mirror around Y");
+        await PressKey(editor, Godot.Key.O);
+        Check(state.PendingMirror == new Vector3I(1, 1, 1), "O toggles mirror around Z");
+        await PressKey(editor, Godot.Key.U);
+        Check(state.PendingMirror == new Vector3I(0, 1, 1), "pressing U again toggles X back off");
+
+        await Click(editor, ground, MouseButton.Left);
+        var mirroredInstance = editor.World.Construction.GetOwner(new Vector3I(0, 0, 0));
+        Check(mirroredInstance != null && mirroredInstance.Mirror == new Vector3I(0, 1, 1),
+            "the placed block bakes in the pending mirror flags", $"mirror={mirroredInstance?.Mirror}");
+
+        // U/I/O не двигают и не меняют уже поставленный блок (это и была ошибка в прежней версии).
+        var originBeforeMirrorPress = mirroredInstance!.Origin;
+        var mirrorBeforeMirrorPress = mirroredInstance!.Mirror;
+        await Move(editor, Screen(TopOf(new Vector3I(0, 0, 0))));
+        await PressKey(editor, Godot.Key.U);
+        Check(mirroredInstance!.Origin == originBeforeMirrorPress && mirroredInstance!.Mirror == mirrorBeforeMirrorPress,
+            "U/I/O never move or reflect an already-placed block, even while hovering it - only the next placement's ghost");
+
+        if (state.PendingMirror.X != 0) state.ToggleMirrorX();
+        if (state.PendingMirror.Y != 0) state.ToggleMirrorY();
+        if (state.PendingMirror.Z != 0) state.ToggleMirrorZ();
+        state.SelectedSlot = 0;
+        editor.World.Construction.Clear();
 
         // Перетаскивание инструмента с зажатым ПКМ: три блока в ряд, «проедания насквозь» без движения мыши нет.
         DemoBuilds.Fill(grid, new Vector3I(0, 0, 0), new Vector3I(2, 0, 0), Block);
@@ -891,20 +1190,84 @@ public sealed class SelfTest
         Send(new InputEventMouseButton { ButtonIndex = MouseButton.Right, Pressed = false, Position = p2, GlobalPosition = p2 });
         await Frames(editor, 2);
         uint blue = CellColor.Pack(Colors.Blue);
-        Check(grid.GetColor(new Vector3I(0, 0, 0)) == blue && grid.GetColor(new Vector3I(1, 0, 0)) == blue && grid.GetColor(new Vector3I(2, 0, 0)) == blue,
-            "holding RMB and dragging paints every block passed over");
-        Check(grid.GetColor(new Vector3I(1, 0, 1)) != blue, "drag painting does not touch blocks that were not under the cursor");
+        // TopOf наводит на верхнюю (Y+) грань каждого блока - по грани красится именно она.
+        Check(grid.GetFaceColor(new Vector3I(0, 0, 0), 1, true) == blue && grid.GetFaceColor(new Vector3I(1, 0, 0), 1, true) == blue
+              && grid.GetFaceColor(new Vector3I(2, 0, 0), 1, true) == blue,
+            "holding RMB and dragging paints the top face of every block passed over");
+        Check(grid.GetFaceColor(new Vector3I(1, 0, 1), 1, true) != blue, "drag painting does not touch blocks that were not under the cursor");
 
         int before = grid.BlockCount;
         state.Tool = ToolMode.Delete;
         await Move(editor, p1);
-        Send(new InputEventMouseButton { ButtonIndex = MouseButton.Right, Pressed = true, Position = p1, GlobalPosition = p1 });
+        Send(new InputEventMouseButton { ButtonIndex = MouseButton.Left, Pressed = true, Position = p1, GlobalPosition = p1 });
         await Frames(editor, 30); // мышь неподвижна: должен удалиться ровно один блок
-        Send(new InputEventMouseButton { ButtonIndex = MouseButton.Right, Pressed = false, Position = p1, GlobalPosition = p1 });
+        Send(new InputEventMouseButton { ButtonIndex = MouseButton.Left, Pressed = false, Position = p1, GlobalPosition = p1 });
         await Frames(editor, 2);
         Check(grid.BlockCount == before - 1 && grid.GetId(new Vector3I(1, 0, 0)) == 0,
-            "holding RMB without moving deletes exactly one block (no tunnelling through the build)", $"blocks {before} -> {grid.BlockCount}");
+            "holding LMB without moving deletes exactly one block (no tunnelling through the build)", $"blocks {before} -> {grid.BlockCount}");
         state.Tool = ToolMode.None;
+
+        // Ctrl+Z/Ctrl+Y через реальные события клавиатуры. Полная очистка: Construction.Clear() (Undo снэпшотит
+        // именно Construction, см. ниже) И grid.Clear() (предыдущий тест выше заливал часть блоков напрямую в
+        // VoxelGrid в обход Construction, см. DemoBuilds.Fill — те клетки Construction.Clear() не видит).
+        editor.World.Construction.Clear();
+        grid.Clear();
+        state.SelectedSlot = 0;
+        await Click(editor, ground, MouseButton.Left);
+        Check(grid.BlockCount == 1, "undo setup: LMB placed one block");
+
+        Send(new InputEventKey { PhysicalKeycode = Godot.Key.Z, Keycode = Godot.Key.Z, CtrlPressed = true, Pressed = true });
+        await Frames(editor, 2);
+        Check(grid.BlockCount == 0, "Ctrl+Z undoes the last placement");
+
+        Send(new InputEventKey { PhysicalKeycode = Godot.Key.Y, Keycode = Godot.Key.Y, CtrlPressed = true, Pressed = true });
+        await Frames(editor, 2);
+        Check(grid.BlockCount == 1, "Ctrl+Y redoes it");
+
+        // Ctrl+Z не должен перехватываться, если фокус на текстовом поле (иначе конфликтовал бы с правкой текста
+        // в панели Resize вместо отмены последней постройки).
+        state.ResizePanelOpen = true;
+        await Frames(editor, 1);
+        var resizeField = editor.GetTree().Root.FindChildren("*", "LineEdit", true, false).OfType<LineEdit>().First(f => f.IsVisibleInTree());
+        resizeField.GrabFocus();
+        await Frames(editor, 1);
+        Send(new InputEventKey { PhysicalKeycode = Godot.Key.Z, Keycode = Godot.Key.Z, CtrlPressed = true, Pressed = true });
+        await Frames(editor, 2);
+        Check(grid.BlockCount == 1, "Ctrl+Z is ignored while a text field has focus (does not undo the placement)");
+        resizeField.ReleaseFocus();
+        state.ResizePanelOpen = false;
+
+        // Перетаскивание Paint/Delete отменяется ОДНИМ шагом Ctrl+Z, а не по клетке. Undo снэпшотит Construction
+        // (см. UndoHistory), поэтому блоки для этой проверки нужно ставить по-настоящему (ЛКМ), а не заливкой
+        // DemoBuilds.Fill в обход Construction, как соседние тесты перетаскивания выше — иначе отменять нечего:
+        // Construction их вообще не видит.
+        editor.World.Construction.Clear();
+        grid.Clear();
+        camera.LookAtPoint(new Vector3(0.4f, 2.5f, 2.0f), new Vector3(0.4f, 0.0f, 0.2f));
+        await Frames(editor, 2);
+        var u0 = Screen(TopOf(new Vector3I(0, 0, 0)));
+        var u1 = Screen(TopOf(new Vector3I(1, 0, 0)));
+        var u2 = Screen(TopOf(new Vector3I(2, 0, 0)));
+        await Click(editor, u0, MouseButton.Left);
+        await Click(editor, u1, MouseButton.Left);
+        await Click(editor, u2, MouseButton.Left);
+        Check(grid.BlockCount == 3, "undo setup: LMB placed 3 real (Construction-owned) blocks in a row", $"blocks={grid.BlockCount}");
+
+        state.Tool = ToolMode.Delete;
+        await Move(editor, u0);
+        Send(new InputEventMouseButton { ButtonIndex = MouseButton.Left, Pressed = true, Position = u0, GlobalPosition = u0 });
+        await Frames(editor, 1);
+        await Move(editor, u1);
+        await Move(editor, u2);
+        Send(new InputEventMouseButton { ButtonIndex = MouseButton.Left, Pressed = false, Position = u2, GlobalPosition = u2 });
+        await Frames(editor, 2);
+        Check(grid.BlockCount == 0, "undo setup: LMB drag deleted all 3 blocks");
+
+        Send(new InputEventKey { PhysicalKeycode = Godot.Key.Z, Keycode = Godot.Key.Z, CtrlPressed = true, Pressed = true });
+        await Frames(editor, 2);
+        Check(grid.BlockCount == 3, "Ctrl+Z undoes a whole LMB (Delete) drag stroke in one step, not per cell", $"blocks={grid.BlockCount}");
+        state.Tool = ToolMode.None;
+        editor.World.Construction.Clear();
 
         // 1. Камера: WASD и поворот по СКМ.
         camera.LookAtPoint(new Vector3(1.5f, 2f, 2.5f), new Vector3(0.125f, 0.0f, 0.125f));

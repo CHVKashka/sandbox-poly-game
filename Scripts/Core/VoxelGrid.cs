@@ -4,14 +4,36 @@ using Godot;
 
 namespace SandboxPolyGame.Core;
 
-/// <summary>Блок данных 16x16x16 клеток: id блока (0 = пусто) и упакованный цвет каждой клетки.</summary>
+/// <summary>
+/// Блок данных 16x16x16 клеток: id блока (0 = пусто), цвет КАЖДОЙ из 6 граней клетки по отдельности (не один цвет
+/// на клетку — см. <see cref="FaceColors"/>) и маска <see cref="FaceMask"/>, показывающая, какие из 6 осевых сторон
+/// клетки целиком закрыты геометрией (и поэтому могут отсечься/склеиться с соседями в <see cref="ChunkMesher"/>).
+/// </summary>
 public sealed class VoxelChunk
 {
     public readonly ushort[] Ids = new ushort[BuildSpace.ChunkVolume];
-    public readonly uint[] Colors = new uint[BuildSpace.ChunkVolume];
+
+    /// <summary>6 цветов на клетку: индекс = <c>cellIndex*6 + axis*2 + (positive?1:0)</c> (axis: 0=X,1=Y,2=Z) —
+    /// та же конвенция бит, что у <see cref="FaceMask"/> и <see cref="ChunkMesher"/>. При установке блока
+    /// (<see cref="VoxelGrid.TrySet"/>) все 6 инициализируются одним цветом; точечно меняются
+    /// <see cref="VoxelGrid.TryPaintFace"/> (одна грань) и <see cref="VoxelGrid.TryPaint"/> (все 6 разом, старое
+    /// поведение "покрасить всю клетку").</summary>
+    public readonly uint[] FaceColors = new uint[BuildSpace.ChunkVolume * 6];
+
+    /// <summary>Один байт на клетку: бит <c>axis*2 + (positive?1:0)</c> = эта осевая сторона клетки ПОЛНОСТЬЮ
+    /// закрыта геометрией (у куба — всегда <c>0b111111</c>; у Wedge/InvertedPyramid — только те стороны, что их
+    /// прямоугольные грани реально покрывают целиком, см. <see cref="ShapeMeshBuilder.FullCoverageMask"/>; у
+    /// Pyramid — 0, там таких граней нет вообще). <see cref="ChunkMesher"/> отсекает/склеивает грань клетки по этой
+    /// маске вместо старой проверки "это куб?" — не-кубическая клетка добавляет в общий проход ровно те стороны,
+    /// которые её форма покрывает целиком; остальное продолжает рисовать <see cref="ShapeMeshBuilder"/> отдельным
+    /// мешем на экземпляр (треугольные борта, рампа, весь Pyramid).</summary>
+    public readonly byte[] FaceMask = new byte[BuildSpace.ChunkVolume];
+
     public int SolidCount;
 
     public static int Index(int lx, int ly, int lz) => lx | (ly << BuildSpace.ChunkShift) | (lz << (BuildSpace.ChunkShift * 2));
+
+    public static int FaceSlot(int axis, bool positive) => axis * 2 + (positive ? 1 : 0);
 }
 
 /// <summary>Разреженное хранилище построек: словарь чанков. Не зависит от сцены и рендера.</summary>
@@ -34,16 +56,36 @@ public sealed class VoxelGrid
         return chunk.Ids[LocalIndex(cell)];
     }
 
+    /// <summary>"Представительный" цвет клетки (грань X-) — для UI/тестов, которым нужен один цвет на клетку, а не
+    /// per-face (см. <see cref="GetFaceColor"/> для точного цвета конкретной грани). Совпадает с реальным цветом,
+    /// пока клетку не перекрашивали по граням точечно (<see cref="TryPaintFace"/>) — обычный случай сразу после
+    /// установки или после поклеточного <see cref="TryPaint"/>, у которых все 6 граней равны.</summary>
     public uint GetColor(Vector3I cell)
     {
         if (!_chunks.TryGetValue(BuildSpace.ChunkOf(cell), out var chunk)) return 0;
-        return chunk.Colors[LocalIndex(cell)];
+        return chunk.FaceColors[LocalIndex(cell) * 6];
+    }
+
+    public uint GetFaceColor(Vector3I cell, int axis, bool positive)
+    {
+        if (!_chunks.TryGetValue(BuildSpace.ChunkOf(cell), out var chunk)) return 0;
+        return chunk.FaceColors[LocalIndex(cell) * 6 + VoxelChunk.FaceSlot(axis, positive)];
+    }
+
+    public byte GetFaceMask(Vector3I cell)
+    {
+        if (!_chunks.TryGetValue(BuildSpace.ChunkOf(cell), out var chunk)) return 0;
+        return chunk.FaceMask[LocalIndex(cell)];
     }
 
     public bool IsSolid(Vector3I cell) => GetId(cell) != 0;
 
-    /// <summary>Ставит блок (или заменяет существующий). false — если вне области или ничего не изменилось.</summary>
-    public bool TrySet(Vector3I cell, ushort id, uint color)
+    /// <summary>Ставит блок (или заменяет существующий), закрашивая все 6 граней клетки одним цветом. false — если
+    /// вне области или ничего не изменилось. <paramref name="faceMask"/> — какие из 6 осевых сторон клетки целиком
+    /// закрыты геометрией (см. <see cref="VoxelChunk.FaceMask"/>); по умолчанию — куб, закрыт целиком со всех
+    /// сторон. Не-кубические формы передают маску, посчитанную <see cref="ShapeMeshBuilder.FullCoverageMask"/>
+    /// (см. <see cref="Construction"/>).</summary>
+    public bool TrySet(Vector3I cell, ushort id, uint color, byte faceMask = 0b111111)
     {
         if (id == 0 || !BuildSpace.InBounds(cell)) return false;
 
@@ -55,16 +97,18 @@ public sealed class VoxelGrid
         }
 
         int i = LocalIndex(cell);
-        if (chunk.Ids[i] == id && chunk.Colors[i] == color) return false;
+        bool wasEmpty = chunk.Ids[i] == 0;
+        if (!wasEmpty && chunk.Ids[i] == id && chunk.FaceMask[i] == faceMask && chunk.FaceColors[i * 6] == color) return false;
 
-        if (chunk.Ids[i] == 0)
+        if (wasEmpty)
         {
             chunk.SolidCount++;
             BlockCount++;
         }
 
         chunk.Ids[i] = id;
-        chunk.Colors[i] = color;
+        chunk.FaceMask[i] = faceMask;
+        for (int f = 0; f < 6; f++) chunk.FaceColors[i * 6 + f] = color;
         CellChanged?.Invoke(cell);
         return true;
     }
@@ -78,7 +122,8 @@ public sealed class VoxelGrid
         if (chunk.Ids[i] == 0) return false;
 
         chunk.Ids[i] = 0;
-        chunk.Colors[i] = 0;
+        chunk.FaceMask[i] = 0;
+        for (int f = 0; f < 6; f++) chunk.FaceColors[i * 6 + f] = 0;
         chunk.SolidCount--;
         BlockCount--;
         if (chunk.SolidCount == 0) _chunks.Remove(coord);
@@ -87,15 +132,47 @@ public sealed class VoxelGrid
         return true;
     }
 
-    /// <summary>Перекрашивает существующий блок. Не создаёт блок в пустой клетке.</summary>
+    /// <summary>Перекрашивает ВСЕ 6 граней существующего блока разом (старое, поклеточное поведение — используется
+    /// инструментом Paint для клеток без владеющего экземпляра, и <see cref="Construction.Paint"/> для целого
+    /// многоклеточного блока). Не создаёт блок в пустой клетке. Точечная покраска одной грани — <see cref="TryPaintFace"/>.</summary>
     public bool TryPaint(Vector3I cell, uint color)
     {
         if (!_chunks.TryGetValue(BuildSpace.ChunkOf(cell), out var chunk)) return false;
 
         int i = LocalIndex(cell);
-        if (chunk.Ids[i] == 0 || chunk.Colors[i] == color) return false;
+        if (chunk.Ids[i] == 0) return false;
 
-        chunk.Colors[i] = color;
+        bool changed = false;
+        for (int f = 0; f < 6; f++)
+        {
+            int idx = i * 6 + f;
+            if (chunk.FaceColors[idx] == color) continue;
+            chunk.FaceColors[idx] = color;
+            changed = true;
+        }
+
+        if (!changed) return false;
+        CellChanged?.Invoke(cell);
+        return true;
+    }
+
+    /// <summary>Перекрашивает ровно ОДНУ грань существующего блока (инструмент Paint, "по грани" — см.
+    /// <c>Editor.BuildEditor</c>). <paramref name="axis"/>/<paramref name="positive"/> — та же конвенция, что у
+    /// <see cref="VoxelChunk.FaceMask"/> (обычно берётся прямо из <see cref="RayHit.Normal"/>). Не создаёт блок в
+    /// пустой клетке; работает для любой клетки независимо от того, покрыта ли эта сторона целиком
+    /// (<see cref="VoxelChunk.FaceMask"/>) — красит per-face хранилище всегда, даже если сейчас эту грань рисует не
+    /// <see cref="ChunkMesher"/>, а собственный меш формы (на будущее/для UV-независимости данных).</summary>
+    public bool TryPaintFace(Vector3I cell, int axis, bool positive, uint color)
+    {
+        if (!_chunks.TryGetValue(BuildSpace.ChunkOf(cell), out var chunk)) return false;
+
+        int i = LocalIndex(cell);
+        if (chunk.Ids[i] == 0) return false;
+
+        int idx = i * 6 + VoxelChunk.FaceSlot(axis, positive);
+        if (chunk.FaceColors[idx] == color) return false;
+
+        chunk.FaceColors[idx] = color;
         CellChanged?.Invoke(cell);
         return true;
     }

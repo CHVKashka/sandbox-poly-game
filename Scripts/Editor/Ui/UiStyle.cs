@@ -45,4 +45,23 @@ internal static class UiStyle
             FocusMode = Control.FocusModeEnum.None, // иначе Tab/стрелки уходят в навигацию по UI
         };
     }
+
+    /// <summary>
+    /// Маленький кружок-индикатор в правом верхнем углу кнопки инструмента — включён/выключен инструмент видно
+    /// сразу, не дожидаясь наведения (в отличие от одного лишь стандартного стиля "нажатой" кнопки).
+    /// </summary>
+    public static Panel AddActiveIndicator(Button button)
+    {
+        var dot = new Panel
+        {
+            CustomMinimumSize = new Vector2(10, 10),
+            MouseFilter = Control.MouseFilterEnum.Ignore,
+            Visible = false,
+        };
+        dot.AddThemeStyleboxOverride("panel", Box(Accent, new Color(0f, 0f, 0f, 0.4f), 1, 5, 0f));
+        dot.SetAnchorsPreset(Control.LayoutPreset.TopRight);
+        dot.Position = new Vector2(-14, 4);
+        button.AddChild(dot);
+        return dot;
+    }
 }

@@ -12,7 +12,8 @@ namespace SandboxPolyGame.Dev;
 /// <code>
 /// godot --path . -- --selftest                       самотесты (можно с --headless), код выхода 0 = успех
 /// godot --path . --resolution 1600x900 -- --demo=house|stress|shapes --screenshot=out.png [--cam=px,py,pz,tx,ty,tz]
-///                                        [--wire=0|1|2] [--tool=paint|delete|resize] [--picker] [--hover=x,y] [--frames=N]
+///                                        [--wireframe=0|1] [--borders=0|1] [--tool=paint|delete] [--resize] [--slot=N]
+///                                        [--size=x,y,z] [--mirror=x,y,z] [--picker] [--hover=x,y] [--frames=N]
 /// </code>
 /// </summary>
 public static class DevHarness
@@ -65,11 +66,28 @@ public static class DevHarness
                 editor.EditorCamera.LookAtPoint(new Vector3(v[0], v[1], v[2]), new Vector3(v[3], v[4], v[5]));
             }
 
-            if (args.TryGetValue("wire", out var wire)) editor.State.Wire = (WireMode)int.Parse(wire, CultureInfo.InvariantCulture);
+            if (args.TryGetValue("wireframe", out var wireframe)) editor.State.Wireframe = wireframe != "0";
+            if (args.TryGetValue("borders", out var borders)) editor.State.Borders = borders != "0";
             if (args.TryGetValue("tool", out var tool))
             {
-                editor.State.Tool = tool switch { "delete" => ToolMode.Delete, "resize" => ToolMode.Resize, _ => ToolMode.Paint };
+                editor.State.Tool = tool switch { "delete" => ToolMode.Delete, _ => ToolMode.Paint };
             }
+            if (args.ContainsKey("resize")) editor.State.ResizePanelOpen = true;
+            if (args.TryGetValue("slot", out var slot)) editor.State.SelectedSlot = int.Parse(slot, CultureInfo.InvariantCulture);
+            if (args.TryGetValue("size", out var size))
+            {
+                var v = ParseFloats(size);
+                for (int axis = 0; axis < 3; axis++) editor.State.SetPendingSizeAxis(axis, (int)v[axis]);
+            }
+
+            if (args.TryGetValue("mirror", out var mirror))
+            {
+                var v = ParseFloats(mirror);
+                if (v[0] != 0) editor.State.ToggleMirrorX();
+                if (v[1] != 0) editor.State.ToggleMirrorY();
+                if (v[2] != 0) editor.State.ToggleMirrorZ();
+            }
+
             if (args.ContainsKey("picker")) editor.Ui.TogglePicker();
 
             if (args.TryGetValue("hover", out var hover))

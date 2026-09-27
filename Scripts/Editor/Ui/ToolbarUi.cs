@@ -1,16 +1,23 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using Godot;
 
 namespace SandboxPolyGame.Editor.Ui;
 
 /// <summary>
-/// Тулбар справа: перекраска (с палитрой, см. ниже), удаление, растягивание (Resize), режим wireframe,
-/// сохранение/загрузка постройки. Paint/Delete/Resize действуют на ПКМ (взаимоисключающие инструменты).
+/// Тулбар справа: перекраска (с палитрой, см. ниже), удаление, размер следующего ставящегося блока (Resize, панель
+/// с полями X/Y/Z), каркас (Wireframe) и границы блоков (Borders), сохранение/загрузка постройки. Paint/Delete —
+/// взаимоисключающие инструменты; какая кнопка мыши их применяет, см. <c>BuildEditor.ButtonFor</c> (Delete — ЛКМ,
+/// Paint — ПКМ; пока активен любой из них, ЛКМ не ставит блок и призрак скрыт). Resize/Wireframe/Borders —
+/// независимые переключатели, не занимают ни одну кнопку мыши (Resize настраивает ПРИЗРАК —
+/// <see cref="EditorState.PendingSize"/> — а не уже поставленные блоки). У каждой кнопки-переключателя есть
+/// кружок-индикатор в углу, показывающий, что она включена.
 /// </summary>
 internal sealed class ToolbarUi
 {
     private const string CustomPalettePath = "user://custom_palette.cfg";
+    private static readonly string[] AxisNames = { "X", "Y", "Z" };
 
     private static readonly string[] BasePaletteHex =
     {
@@ -23,7 +30,13 @@ internal sealed class ToolbarUi
     private readonly Button _paint;
     private readonly Button _delete;
     private readonly Button _resize;
-    private readonly Button _wire;
+    private readonly Button _wireframe;
+    private readonly Button _borders;
+    private readonly Panel _paintDot;
+    private readonly Panel _deleteDot;
+    private readonly Panel _resizeDot;
+    private readonly Panel _wireframeDot;
+    private readonly Panel _bordersDot;
     private readonly Control _paintPanel;
     private readonly ColorPickerButton _colorPicker;
     private readonly HSlider _sliderR;
@@ -31,6 +44,12 @@ internal sealed class ToolbarUi
     private readonly HSlider _sliderB;
     private readonly List<Color> _customColors;
     private bool _syncingSliders;
+
+    // Панель Resize: раскрывается под кнопкой "Resize", как и палитра под "Paint". Редактирует EditorState.PendingSize
+    // напрямую (размер СЛЕДУЮЩЕГО ставящегося блока/призрака) — в отличие от старой версии, тут не нужна цель
+    // (ПКМ по блоку), панель всегда активна и отражает текущий PendingSize.
+    private readonly Control _resizePanel;
+    private readonly LineEdit[] _resizeFields = new LineEdit[3];
 
     /// <summary>Нажата кнопка Save — открыть диалог выбора файла (см. <see cref="EditorUi"/>).</summary>
     public event Action? SaveRequested;
@@ -68,6 +87,7 @@ internal sealed class ToolbarUi
 
         _paint = UiStyle.MakeButton("Paint", new Vector2(168, 38), toggle: true);
         _paint.TooltipText = "RMB: paint the block under the cursor with the selected color";
+        _paintDot = UiStyle.AddActiveIndicator(_paint);
         _paint.Toggled += on =>
         {
             _state.Tool = on ? ToolMode.Paint : ToolMode.None;
@@ -79,21 +99,38 @@ internal sealed class ToolbarUi
         column.AddChild(new HSeparator());
 
         _delete = UiStyle.MakeButton("Delete", new Vector2(168, 38), toggle: true);
-        _delete.TooltipText = "RMB: remove the block under the cursor";
+        _delete.TooltipText = "LMB (or X to toggle this tool): remove the block under the cursor";
+        _deleteDot = UiStyle.AddActiveIndicator(_delete);
         _delete.Toggled += on => _state.Tool = on ? ToolMode.Delete : ToolMode.None;
         column.AddChild(_delete);
 
+        _resizePanel = BuildResizePanel(out _resizeFields[0], out _resizeFields[1], out _resizeFields[2]);
+        _resizePanel.Visible = false;
+
         _resize = UiStyle.MakeButton("Resize", new Vector2(168, 38), toggle: true);
-        _resize.TooltipText = "RMB on a block opens a size dialog (X/Y/Z, +/-)";
-        _resize.Toggled += on => _state.Tool = on ? ToolMode.Resize : ToolMode.None;
+        _resize.TooltipText = "Set the size (X/Y/Z) of the next block placed with LMB";
+        _resizeDot = UiStyle.AddActiveIndicator(_resize);
+        _resize.Toggled += on =>
+        {
+            _state.ResizePanelOpen = on;
+            _resizePanel.Visible = on;
+        };
         column.AddChild(_resize);
+        column.AddChild(_resizePanel);
 
         column.AddChild(new HSeparator());
 
-        _wire = UiStyle.MakeButton("", new Vector2(168, 38));
-        _wire.TooltipText = "Cycle: solid / solid + wireframe / wireframe only";
-        _wire.Pressed += _state.CycleWire;
-        column.AddChild(_wire);
+        _wireframe = UiStyle.MakeButton("Wireframe", new Vector2(168, 34), toggle: true);
+        _wireframe.TooltipText = "Show only polygons and their diagonals, hide solid blocks";
+        _wireframeDot = UiStyle.AddActiveIndicator(_wireframe);
+        _wireframe.Toggled += on => _state.Wireframe = on;
+        column.AddChild(_wireframe);
+
+        _borders = UiStyle.MakeButton("Borders", new Vector2(168, 34), toggle: true);
+        _borders.TooltipText = "Show individual block borders (black), independent of Wireframe";
+        _bordersDot = UiStyle.AddActiveIndicator(_borders);
+        _borders.Toggled += on => _state.Borders = on;
+        column.AddChild(_borders);
 
         column.AddChild(new HSeparator());
 
@@ -108,7 +145,7 @@ internal sealed class ToolbarUi
         column.AddChild(load);
 
         column.AddChild(new HSeparator());
-        column.AddChild(UiStyle.MakeLabel("LMB - place block\nRMB - use tool", 12, UiStyle.TextDim));
+        column.AddChild(UiStyle.MakeLabel("LMB - place block (or Delete)\nRMB - paint", 12, UiStyle.TextDim));
 
         layerRoot.AddChild(margin);
         Refresh();
@@ -159,6 +196,90 @@ internal sealed class ToolbarUi
         panel.AddChild(saveColor);
 
         return panel;
+    }
+
+    /// <summary>Панель Resize: подсказка сверху, три ряда X/Y/Z (кнопка "-", текстовое поле, кнопка "+") — всегда
+    /// активны, редактируют <see cref="EditorState.PendingSize"/> напрямую.</summary>
+    private Control BuildResizePanel(out LineEdit fieldX, out LineEdit fieldY, out LineEdit fieldZ)
+    {
+        var panel = new VBoxContainer();
+        panel.AddThemeConstantOverride("separation", 6);
+
+        panel.AddChild(UiStyle.MakeLabel("Size of the next placed block", 12, UiStyle.TextDim));
+
+        var fields = new LineEdit[3];
+        for (int axis = 0; axis < 3; axis++)
+        {
+            panel.AddChild(CreateResizeRow(axis, out fields[axis]));
+        }
+
+        fieldX = fields[0];
+        fieldY = fields[1];
+        fieldZ = fields[2];
+        return panel;
+    }
+
+    private Control CreateResizeRow(int axis, out LineEdit field)
+    {
+        var row = new HBoxContainer();
+        row.AddThemeConstantOverride("separation", 6);
+
+        var label = UiStyle.MakeLabel(AxisNames[axis], 14);
+        label.CustomMinimumSize = new Vector2(14, 0);
+        row.AddChild(label);
+
+        var minus = UiStyle.MakeButton("-", new Vector2(30, 30));
+        minus.Pressed += () => AdjustResize(axis, -1);
+        row.AddChild(minus);
+
+        var capturedField = new LineEdit
+        {
+            Text = "1",
+            Editable = true,
+            Alignment = HorizontalAlignment.Center,
+            CustomMinimumSize = new Vector2(52, 30),
+            MaxLength = 2,
+            FocusMode = Control.FocusModeEnum.Click,
+        };
+        capturedField.TextChanged += text => FilterDigits(capturedField, text);
+        capturedField.TextSubmitted += _ => CommitResizeField(axis, capturedField);
+        capturedField.FocusExited += () => CommitResizeField(axis, capturedField);
+        row.AddChild(capturedField);
+        field = capturedField;
+
+        var plus = UiStyle.MakeButton("+", new Vector2(30, 30));
+        plus.Pressed += () => AdjustResize(axis, 1);
+        row.AddChild(plus);
+
+        return row;
+    }
+
+    private static void FilterDigits(LineEdit field, string text)
+    {
+        // Значения размера всегда целые и положительные (>= 1) - непечатаемо-цифровые символы отсекаются на лету.
+        string digitsOnly = new(text.Where(char.IsDigit).ToArray());
+        if (digitsOnly == text) return;
+
+        int caret = field.CaretColumn;
+        field.Text = digitsOnly;
+        field.CaretColumn = Math.Min(caret, digitsOnly.Length);
+    }
+
+    private void CommitResizeField(int axis, LineEdit field)
+    {
+        if (int.TryParse(field.Text, out int value) && value > 0) _state.SetPendingSizeAxis(axis, value);
+        RefreshResizeFields();
+    }
+
+    private void AdjustResize(int axis, int delta)
+    {
+        _state.AdjustPendingSize(axis, delta);
+        RefreshResizeFields();
+    }
+
+    private void RefreshResizeFields()
+    {
+        for (int axis = 0; axis < 3; axis++) _resizeFields[axis].Text = _state.PendingSize[axis].ToString();
     }
 
     private static Control WrapSliderRow(string label, HSlider slider)
@@ -223,8 +344,14 @@ internal sealed class ToolbarUi
     {
         _paint.SetPressedNoSignal(_state.Tool == ToolMode.Paint);
         _delete.SetPressedNoSignal(_state.Tool == ToolMode.Delete);
-        _resize.SetPressedNoSignal(_state.Tool == ToolMode.Resize);
+        _resize.SetPressedNoSignal(_state.ResizePanelOpen);
         _paintPanel.Visible = _state.Tool == ToolMode.Paint;
+        _resizePanel.Visible = _state.ResizePanelOpen;
+        RefreshResizeFields();
+
+        _paintDot.Visible = _state.Tool == ToolMode.Paint;
+        _deleteDot.Visible = _state.Tool == ToolMode.Delete;
+        _resizeDot.Visible = _state.ResizePanelOpen;
 
         if (_colorPicker.Color != _state.PaintColor) _colorPicker.Color = _state.PaintColor;
 
@@ -234,11 +361,9 @@ internal sealed class ToolbarUi
         _sliderB.SetValueNoSignal(Mathf.Round(_state.PaintColor.B * 255f));
         _syncingSliders = false;
 
-        _wire.Text = _state.Wire switch
-        {
-            WireMode.Off => "Wireframe: off",
-            WireMode.Overlay => "Wireframe: overlay",
-            _ => "Wireframe: only",
-        };
+        _wireframe.SetPressedNoSignal(_state.Wireframe);
+        _wireframeDot.Visible = _state.Wireframe;
+        _borders.SetPressedNoSignal(_state.Borders);
+        _bordersDot.Visible = _state.Borders;
     }
 }

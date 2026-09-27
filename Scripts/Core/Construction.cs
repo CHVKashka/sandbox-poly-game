@@ -38,15 +38,15 @@ public sealed class Construction
     public BlockInstance? GetOwner(Vector3I cell) => _owner.TryGetValue(cell, out int id) ? _instances[id] : null;
 
     /// <summary>Ставит новый блок 1x1x1 в клетку. null, если клетка занята или вне области.</summary>
-    public BlockInstance? Place(Vector3I cell, BlockDefinition definition, Color color, Vector3I rotationSteps = default) =>
-        PlaceBlock(cell, Vector3I.One, definition, color, rotationSteps);
+    public BlockInstance? Place(Vector3I cell, BlockDefinition definition, Color color, Vector3I rotationSteps = default, Vector3I mirror = default) =>
+        PlaceBlock(cell, Vector3I.One, definition, color, rotationSteps, mirror);
 
     /// <summary>
-    /// Ставит блок сразу заданного размера (используется загрузкой построек — <see cref="TrySetSize"/> мутирует
-    /// уже существующий экземпляр, а не создаёт новый). null, если хотя бы одна из клеток области занята или
-    /// вне области построек.
+    /// Ставит блок сразу заданного размера (используется как установкой блока игроком — размер/поворот/отражение
+    /// берутся из ожидающих настроек призрака, см. <c>Editor.EditorState</c>, — так и загрузкой построек). null,
+    /// если хотя бы одна из клеток области занята или вне области построек.
     /// </summary>
-    public BlockInstance? PlaceBlock(Vector3I origin, Vector3I size, BlockDefinition definition, Color color, Vector3I rotationSteps = default)
+    public BlockInstance? PlaceBlock(Vector3I origin, Vector3I size, BlockDefinition definition, Color color, Vector3I rotationSteps = default, Vector3I mirror = default)
     {
         var instance = new BlockInstance
         {
@@ -56,6 +56,7 @@ public sealed class Construction
             Size = size,
             Color = CellColor.Pack(color),
             RotationSteps = rotationSteps,
+            Mirror = mirror,
         };
 
         var cells = new List<Vector3I>(CellsOf(instance));
@@ -64,16 +65,30 @@ public sealed class Construction
             if (!BuildSpace.InBounds(cell) || Grid.IsSolid(cell)) return null;
         }
 
+        byte faceMask = FullCoverageMask(definition, rotationSteps, mirror);
         _nextId++;
         _instances[instance.InstanceId] = instance;
         foreach (var cell in cells)
         {
             _owner[cell] = instance.InstanceId;
-            Grid.TrySet(cell, definition.RuntimeId, instance.Color);
+            Grid.TrySet(cell, definition.RuntimeId, instance.Color, faceMask);
         }
 
         Changed?.Invoke();
         return instance;
+    }
+
+    /// <summary>
+    /// Какие из 6 осевых сторон клетки этот блок закрывает ЦЕЛИКОМ, с учётом его поворота/отражения — передаётся
+    /// в <see cref="VoxelGrid.TrySet"/>, чтобы <see cref="ChunkMesher"/> мог отсекать/склеивать эти стороны с
+    /// соседями наравне с кубами (см. <see cref="ShapeMeshBuilder.FullCoverageMask"/>). Куб (или блок без
+    /// <see cref="BuildingBlockComponent"/>) закрыт целиком со всех 6 сторон.
+    /// </summary>
+    private static byte FullCoverageMask(BlockDefinition definition, Vector3I rotationSteps, Vector3I mirror)
+    {
+        var building = definition.GetComponent<BuildingBlockComponent>();
+        if (building == null || building.Shape == BlockShape.Cube) return 0b111111;
+        return ShapeMeshBuilder.FullCoverageMask(building.Shape, rotationSteps, mirror);
     }
 
     public bool Remove(BlockInstance instance)
@@ -137,12 +152,13 @@ public sealed class Construction
             Grid.TryRemove(cell);
         }
 
+        byte faceMask = FullCoverageMask(definition, instance.RotationSteps, instance.Mirror);
         instance.Size = newSize;
         foreach (var cell in newCells)
         {
             if (oldCells.Contains(cell)) continue;
             _owner[cell] = instance.InstanceId;
-            Grid.TrySet(cell, definition.RuntimeId, instance.Color);
+            Grid.TrySet(cell, definition.RuntimeId, instance.Color, faceMask);
         }
 
         Changed?.Invoke();

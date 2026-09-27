@@ -62,6 +62,21 @@ public static class DemoBuilds
 
         var stretched = construction.Place(new Vector3I(20, 0, 0), wedge, Color.FromHtml("#b5924f"));
         if (stretched != null) construction.TrySetSize(stretched, wedge, new Vector3I(3, 2, 4));
+
+        // Отражённый скос рядом с обычным (см. Scripts/Core/ShapeMeshBuilder.cs) — Wedge симметричен по X (это
+        // призма, вытянутая вдоль X), поэтому наглядно отражение видно по Z: рампа поднимается в противоположную
+        // сторону, а не просто сдвигается.
+        construction.Place(new Vector3I(26, 0, 0), wedge, Color.FromHtml("#b5924f"), mirror: new Vector3I(0, 0, 1));
+
+        // Куб + скос впритык (как крыша на доме) — регрессия на дыру в стыке: Wedge не покрывает свою x=0 (левый
+        // треугольный борт) и x=1 (правый) грани целиком, а z=1 у него вообще нулевой высоты (ramp сходит на нет).
+        // Раньше ChunkMesher слепо culл'ил грань куба у ЛЮБОГО занятого соседа, включая такие частично закрытые —
+        // в стыке образовывалась настоящая дыра (см. ChunkMesher.BuildFaces). Три куба ниже проверяют все три
+        // "тонких" стороны скоса разом.
+        construction.Place(new Vector3I(32, 0, 0), block, Color.FromHtml("#9a9a9a"));
+        construction.Place(new Vector3I(33, 0, 0), wedge, Color.FromHtml("#b5924f")); // куб слева от x=0 борта скоса
+        construction.Place(new Vector3I(34, 0, 0), block, Color.FromHtml("#9a9a9a")); // куб справа от x=1 борта скоса
+        construction.Place(new Vector3I(33, 0, 1), block, Color.FromHtml("#9a9a9a")); // куб у нулевой-высоты грани z=1
     }
 
     public static void Fill(VoxelGrid grid, Vector3I min, Vector3I max, ushort id, Color? color = null)

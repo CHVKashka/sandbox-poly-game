@@ -18,20 +18,35 @@ public partial class ShapeInstanceView : Node3D
     {
         public MeshInstance3D Solid = null!;
         public MeshInstance3D Wire = null!;
+        public MeshInstance3D Border = null!;
     }
 
     private readonly Dictionary<int, View> _views = new();
     private StandardMaterial3D _solidMaterial = null!;
     private StandardMaterial3D _wireMaterial = null!;
-    private WireMode _wireMode = WireMode.Off;
+    private StandardMaterial3D _borderMaterial = null!;
+    private bool _wireframe;
+    private bool _borders = true;
 
-    public WireMode WireMode
+    /// <summary>Инструмент Wireframe: только полигоны и их диагонали, без сплошных граней.</summary>
+    public bool Wireframe
     {
-        get => _wireMode;
+        get => _wireframe;
         set
         {
-            _wireMode = value;
-            ApplyWireMode();
+            _wireframe = value;
+            ApplyVisibility();
+        }
+    }
+
+    /// <summary>Инструмент Borders: чёрные границы отдельных блоков, независимо от Wireframe.</summary>
+    public bool Borders
+    {
+        get => _borders;
+        set
+        {
+            _borders = value;
+            ApplyVisibility();
         }
     }
 
@@ -44,12 +59,20 @@ public partial class ShapeInstanceView : Node3D
             Roughness = 0.8f,
             Metallic = 0.0f,
         };
+        // RenderPriority выше, чем у _solidMaterial — см. VoxelWorld._Ready.
         _wireMaterial = new StandardMaterial3D
         {
             ShadingMode = BaseMaterial3D.ShadingModeEnum.Unshaded,
             AlbedoColor = new Color(0.55f, 0.88f, 1.0f),
+            RenderPriority = 1,
         };
-        ApplyWireMode();
+        _borderMaterial = new StandardMaterial3D
+        {
+            ShadingMode = BaseMaterial3D.ShadingModeEnum.Unshaded,
+            AlbedoColor = Colors.Black,
+            RenderPriority = 1,
+        };
+        ApplyVisibility();
     }
 
     public void Sync(Construction construction)
@@ -69,12 +92,14 @@ public partial class ShapeInstanceView : Node3D
                 _views[instance.InstanceId] = view;
             }
 
-            var (solid, wire) = ShapeMeshBuilder.Build(building.Shape, instance.Size, instance.RotationSteps, CellColor.Unpack(instance.Color));
+            var (solid, wire, border) = ShapeMeshBuilder.Build(building.Shape, instance.Size, instance.RotationSteps, instance.Mirror, CellColor.Unpack(instance.Color));
             var origin = BuildSpace.CellMin(instance.Origin);
             view.Solid.Mesh = solid;
             view.Solid.Position = origin;
             view.Wire.Mesh = wire;
             view.Wire.Position = origin;
+            view.Border.Mesh = border;
+            view.Border.Position = origin;
         }
 
         foreach (var id in new List<int>(_views.Keys))
@@ -82,6 +107,7 @@ public partial class ShapeInstanceView : Node3D
             if (alive.Contains(id)) continue;
             _views[id].Solid.QueueFree();
             _views[id].Wire.QueueFree();
+            _views[id].Border.QueueFree();
             _views.Remove(id);
         }
     }
@@ -97,22 +123,31 @@ public partial class ShapeInstanceView : Node3D
                 MaterialOverride = _wireMaterial,
                 CastShadow = GeometryInstance3D.ShadowCastingSetting.Off,
             },
+            Border = new MeshInstance3D
+            {
+                Name = $"ShapeBorder_{instanceId}",
+                MaterialOverride = _borderMaterial,
+                CastShadow = GeometryInstance3D.ShadowCastingSetting.Off,
+            },
         };
-        view.Solid.Visible = _wireMode != WireMode.WireOnly;
-        view.Wire.Visible = _wireMode != WireMode.Off;
+        view.Solid.Visible = !_wireframe;
+        view.Wire.Visible = _wireframe;
+        view.Border.Visible = _borders;
         AddChild(view.Solid);
         AddChild(view.Wire);
+        AddChild(view.Border);
         return view;
     }
 
-    private void ApplyWireMode()
+    private void ApplyVisibility()
     {
         if (_wireMaterial == null) return;
 
         foreach (var view in _views.Values)
         {
-            view.Solid.Visible = _wireMode != WireMode.WireOnly;
-            view.Wire.Visible = _wireMode != WireMode.Off;
+            view.Solid.Visible = !_wireframe;
+            view.Wire.Visible = _wireframe;
+            view.Border.Visible = _borders;
         }
     }
 }

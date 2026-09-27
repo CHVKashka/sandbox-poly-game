@@ -9,8 +9,9 @@ internal sealed class HotbarUi
     private sealed class Slot
     {
         public PanelContainer Panel = null!;
-        public ColorRect Swatch = null!;
+        public Control IconHost = null!;
         public Label Name = null!;
+        public string CurrentSlug = "";
     }
 
     private readonly EditorState _state;
@@ -60,13 +61,12 @@ internal sealed class HotbarUi
 
         column.AddChild(UiStyle.MakeLabel((index + 1).ToString(), 12, UiStyle.TextDim));
 
-        slot.Swatch = new ColorRect
+        slot.IconHost = UiStyle.Transparent(new CenterContainer
         {
-            CustomMinimumSize = new Vector2(0, 30),
+            CustomMinimumSize = new Vector2(0, 34),
             SizeFlagsHorizontal = Control.SizeFlags.ExpandFill,
-            MouseFilter = Control.MouseFilterEnum.Ignore,
-        };
-        column.AddChild(slot.Swatch);
+        });
+        column.AddChild(slot.IconHost);
 
         slot.Name = UiStyle.MakeLabel("", 11);
         slot.Name.HorizontalAlignment = HorizontalAlignment.Center;
@@ -93,14 +93,25 @@ internal sealed class HotbarUi
             bool selected = i == _state.SelectedSlot;
             string slug = _state.GetSlot(i);
 
+            // Иконка — мини 3D-сцена (см. BlockIconView), а не просто цвет: пересобираем только когда слаг слота
+            // реально изменился (Refresh вызывается на каждое EditorState.Changed, в т.ч. не связанное с хотбаром).
+            if (slot.CurrentSlug != slug)
+            {
+                slot.CurrentSlug = slug;
+                foreach (var child in slot.IconHost.GetChildren()) child.QueueFree();
+
+                if (BlockCatalog.Instance.TryGetBySlug(slug, out var iconDef))
+                {
+                    slot.IconHost.AddChild(BlockIconView.Create(iconDef, 40));
+                }
+            }
+
             if (BlockCatalog.Instance.TryGetBySlug(slug, out var def))
             {
-                slot.Swatch.Color = def.DefaultColor;
                 slot.Name.Text = def.Name;
             }
             else
             {
-                slot.Swatch.Color = new Color(0, 0, 0, 0.25f);
                 slot.Name.Text = "-";
             }
 

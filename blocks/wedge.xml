@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <Block id="wedge" name="Wedge">
-  <Color>#b5924f</Color>
+  <Color>#ffffff</Color>
   <Component type="BaseComponent">{ "mass": 7, "durability": 70, "damageResistance": 0.1 }</Component>
   <Component type="BuildingBlock">{ "shape": "Slope", "minSize": [1,1,1], "maxSize": [8,8,8] }</Component>
 </Block>
