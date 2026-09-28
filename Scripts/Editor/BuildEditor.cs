@@ -11,9 +11,9 @@ namespace SandboxPolyGame.Editor;
 /// Корневой узел редактора построек. Всё создаётся кодом: окружение, сетка, мир блоков, камера, курсор, интерфейс.
 ///
 /// Управление: WASD/Q/E/Shift — камера; зажатая СКМ — поворот; ЛКМ — поставить блок из выбранного слота хотбара,
-/// пока не активен ни один инструмент (см. <see cref="ButtonFor"/>); Delete — ЛКМ (`X` переключает инструмент,
-/// как и кнопка на тулбаре), Paint — ПКМ, красит ровно ту грань клетки, в которую попал луч (см.
-/// <see cref="UseToolAtHover"/>); 1–9 и колесо — слот хотбара; Tab — список блоков;
+/// пока не активен ни один инструмент (см. <see cref="ButtonFor"/>); Delete и Paint — тоже ЛКМ, каждый в своём
+/// режиме (`X` переключает Delete, как и кнопка на тулбаре; Paint красит ровно ту грань клетки, в которую попал луч,
+/// см. <see cref="UseToolAtHover"/>); 1–9 и колесо — слот хотбара; Tab — список блоков;
 /// J/K/L — повернуть блок, который встанет следующим, вокруг X/Y/Z; U/I/O — отразить его по X/Y/Z; панель Resize
 /// на тулбаре — его размер. Все три (поворот/отражение/размер) настраивают ПРИЗРАК, а не уже поставленные блоки —
 /// см. <see cref="EditorState"/>. Ctrl+Z/Ctrl+Y — отмена/повтор (см. <see cref="UndoHistory"/>).
@@ -42,8 +42,8 @@ public partial class BuildEditor : Node3D
     private Vector2 _lastToolMouse;
     private double _infoTimer;
 
-    // Снэпшот постройки на момент нажатия ПКМ (см. UndoHistory) - весь "мазок" перетаскивания Paint/Delete
-    // фиксируется в истории одним шагом, а не по клетке.
+    // Снэпшот постройки на момент нажатия кнопки инструмента (см. UndoHistory) - весь "мазок" перетаскивания
+    // Paint/Delete фиксируется в истории одним шагом, а не по клетке.
     private UndoHistory.Snapshot? _undoStrokeBefore;
 
     // Кэш последней собранной формы призрака — чтобы не пересобирать меш каждый кадр без нужды.
@@ -63,10 +63,11 @@ public partial class BuildEditor : Node3D
     public override void _Ready()
     {
         BuildEnvironment();
-        BuildGroundGrid();
+        BuildWorkAreaBoundary();
 
         _world = new VoxelWorld { Name = "World" };
         AddChild(_world);
+        PlaceRootBlock();
 
         _camera = new FlyCamera { Name = "Camera", Fov = 70f, Near = 0.05f, Far = 600f };
         AddChild(_camera);
@@ -87,14 +88,17 @@ public partial class BuildEditor : Node3D
 
     private void BuildEnvironment()
     {
+        // Один плоский цвет неба и земли (запрос пользователя) — без градиента "к горизонту", все 4 slot'а
+        // ProceduralSkyMaterial совпадают.
+        var skyGroundColor = Color.FromHtml("#6682FF");
         var sky = new Sky
         {
             SkyMaterial = new ProceduralSkyMaterial
             {
-                SkyTopColor = Color.FromHtml("#3b6fa8"),
-                SkyHorizonColor = Color.FromHtml("#a9c2d8"),
-                GroundHorizonColor = Color.FromHtml("#8a949c"),
-                GroundBottomColor = Color.FromHtml("#3c4148"),
+                SkyTopColor = skyGroundColor,
+                SkyHorizonColor = skyGroundColor,
+                GroundHorizonColor = skyGroundColor,
+                GroundBottomColor = skyGroundColor,
             },
         };
 
@@ -120,15 +124,88 @@ public partial class BuildEditor : Node3D
         });
     }
 
-    private void BuildGroundGrid()
+    /// <summary>
+    /// Ставит корневой блок 1x1x1 (обычный куб, слаг "block") в центральную клетку (0,0,0) при входе в редактор —
+    /// см. <see cref="BuildSpace.MinCell"/> doc-комментарий про то, почему именно эта клетка считается центром.
+    /// Пустой редактор без единого блока неудобен как точка отсчёта при построении — этот блок такую точку даёт
+    /// сразу, и его, как и любой другой, можно потом удалить инструментом Delete.
+    /// </summary>
+    private void PlaceRootBlock()
     {
-        var extent = -BuildSpace.MinCell.X * BuildSpace.CellSize; // 32 м
+        if (BlockCatalog.Instance.TryGetBySlug("block", out var definition))
+        {
+            _world.Construction.Place(Vector3I.Zero, definition, definition.DefaultColor);
+        }
+    }
+
+    /// <summary>
+    /// Пунктирная чёрная рамка (12 рёбер) по границе всей области построек (<see cref="BuildSpace.WorldMin"/>/
+    /// <see cref="BuildSpace.WorldMax"/>) — постоянная толщина 3 экранных пикселя независимо от расстояния до
+    /// камеры (см. <c>Shaders/work_area_boundary.gdshader</c>: каждое ребро — не линия, а вытянутый в CLIP-пространстве
+    /// прямоугольник, ширина которого пересчитывается из пикселей в NDC через <c>VIEWPORT_SIZE</c> прямо в вершинном
+    /// шейдере — обычная толщина линий через <see cref="Mesh.PrimitiveType.Lines"/>, как у каркаса/границ блоков
+    /// (см. <see cref="CreateWireCube"/>), не поддерживает произвольную ширину в пикселях). Пунктир — по фрагментному
+    /// шейдеру, по расстоянию вдоль ребра (UV.x), не по геометрии — одна и та же геометрия на любую длину сегмента.
+    /// </summary>
+    private void BuildWorkAreaBoundary()
+    {
+        var min = BuildSpace.WorldMin;
+        var max = BuildSpace.WorldMax;
+
+        Vector3[] corners =
+        {
+            new(min.X, min.Y, min.Z), new(max.X, min.Y, min.Z),
+            new(min.X, max.Y, min.Z), new(max.X, max.Y, min.Z),
+            new(min.X, min.Y, max.Z), new(max.X, min.Y, max.Z),
+            new(min.X, max.Y, max.Z), new(max.X, max.Y, max.Z),
+        };
+        // 12 рёбер коробки — пары индексов в corners; сгруппированы по оси, вдоль которой идёт ребро.
+        int[][] edges =
+        {
+            new[] { 0, 1 }, new[] { 2, 3 }, new[] { 4, 5 }, new[] { 6, 7 }, // вдоль X
+            new[] { 0, 2 }, new[] { 1, 3 }, new[] { 4, 6 }, new[] { 5, 7 }, // вдоль Y
+            new[] { 0, 4 }, new[] { 1, 5 }, new[] { 2, 6 }, new[] { 3, 7 }, // вдоль Z
+        };
+
+        var vertices = new List<Vector3>();
+        var directions = new List<Vector3>(); // -> NORMAL: единичное направление ребра (a -> b)
+        var sides = new List<Color>();         // -> COLOR.r: 0/1, какая из двух сторон "толщины" эта вершина
+        var uvs = new List<Vector2>();         // UV.x: расстояние вдоль ребра (для пунктира), UV.y: длина ребра
+        var indices = new List<int>();
+
+        foreach (var edge in edges)
+        {
+            var a = corners[edge[0]];
+            var b = corners[edge[1]];
+            var length = a.DistanceTo(b); // real_t (double в этой сборке движка, см. Docs/01-engine-build.md)
+            var direction = (b - a) / length;
+            int baseIndex = vertices.Count;
+
+            vertices.Add(a); directions.Add(direction); sides.Add(new Color(0, 0, 0)); uvs.Add(new Vector2(0, length));
+            vertices.Add(a); directions.Add(direction); sides.Add(new Color(1, 0, 0)); uvs.Add(new Vector2(0, length));
+            vertices.Add(b); directions.Add(direction); sides.Add(new Color(0, 0, 0)); uvs.Add(new Vector2(length, length));
+            vertices.Add(b); directions.Add(direction); sides.Add(new Color(1, 0, 0)); uvs.Add(new Vector2(length, length));
+
+            indices.Add(baseIndex); indices.Add(baseIndex + 1); indices.Add(baseIndex + 2);
+            indices.Add(baseIndex + 2); indices.Add(baseIndex + 1); indices.Add(baseIndex + 3);
+        }
+
+        var arrays = new Godot.Collections.Array();
+        arrays.Resize((int)Mesh.ArrayType.Max);
+        arrays[(int)Mesh.ArrayType.Vertex] = vertices.ToArray();
+        arrays[(int)Mesh.ArrayType.Normal] = directions.ToArray();
+        arrays[(int)Mesh.ArrayType.Color] = sides.ToArray();
+        arrays[(int)Mesh.ArrayType.TexUV] = uvs.ToArray();
+        arrays[(int)Mesh.ArrayType.Index] = indices.ToArray();
+
+        var mesh = new ArrayMesh();
+        mesh.AddSurfaceFromArrays(Mesh.PrimitiveType.Triangles, arrays);
+
         AddChild(new MeshInstance3D
         {
-            Name = "GroundGrid",
-            Mesh = new PlaneMesh { Size = new Vector2(extent * 2f + 0.5f, extent * 2f + 0.5f) },
-            MaterialOverride = new ShaderMaterial { Shader = GD.Load<Shader>("res://Shaders/build_grid.gdshader") },
-            Position = new Vector3(0, -0.002f, 0),
+            Name = "WorkAreaBoundary",
+            Mesh = mesh,
+            MaterialOverride = new ShaderMaterial { Shader = GD.Load<Shader>("res://Shaders/work_area_boundary.gdshader") },
             CastShadow = GeometryInstance3D.ShadowCastingSetting.Off,
         });
     }
@@ -321,13 +398,15 @@ public partial class BuildEditor : Node3D
         }
     }
 
-    /// <summary>Какая кнопка мыши применяет данный инструмент. Delete — ЛКМ (чтобы не путать с установкой,
-    /// пока инструмент активен — ЛКМ тогда ничего не ставит, см. <see cref="UpdateCursorVisuals"/>); Paint — ПКМ.
-    /// null для None (ЛКМ в этом случае как раз и ставит блок).</summary>
+    /// <summary>Какая кнопка мыши применяет данный инструмент. И Delete, и Paint — ЛКМ (не путают друг друга: это
+    /// взаимоисключающие режимы, см. <see cref="EditorState.Tool"/>/<see cref="ToolMode"/> — активен максимум один,
+    /// поэтому ЛКМ каждый раз однозначна); пока любой из них активен, ЛКМ ничего не ставит, см.
+    /// <see cref="UpdateCursorVisuals"/>. ПКМ инструментам не назначена вообще. null для None (ЛКМ в этом случае
+    /// как раз и ставит блок).</summary>
     private static MouseButton? ButtonFor(ToolMode tool) => tool switch
     {
         ToolMode.Delete => MouseButton.Left,
-        ToolMode.Paint => MouseButton.Right,
+        ToolMode.Paint => MouseButton.Left,
         _ => null,
     };
 
@@ -378,10 +457,21 @@ public partial class BuildEditor : Node3D
     /// Paint красит РОВНО ту грань клетки под курсором, в которую попал луч (<see cref="RayHit.Normal"/> — уже
     /// известно, какая это сторона, см. <see cref="VoxelRaycaster"/>), не всю клетку и не весь экземпляр — иначе
     /// склейка/культинг в <see cref="ChunkMesher"/> не дали бы покрасить одну поверхность из нескольких сросшихся
-    /// впритык блоков без расклейки остальных (см. ROADMAP.md). Delete по-прежнему действует на весь экземпляр
-    /// блока, которому принадлежит клетка (если клетка не принадлежит ни одному экземпляру — например, залита
-    /// инструментом разработчика в обход Construction — откатывается на поклеточное удаление, как раньше). Resize
-    /// сюда не входит — он не действует на уже поставленные блоки, см. <see cref="EditorState.PendingSize"/>.
+    /// впритык блоков без расклейки остальных (см. ROADMAP.md). Если попавшая грань — FullCoverage (её и правда
+    /// рисует ChunkMesher по <see cref="VoxelGrid.FaceColors"/>, см. <see cref="VoxelGrid.GetFaceMask"/>: у куба это
+    /// все 6 сторон, у форм вроде Wedge — только 2 из 6, низ/задняя стенка), красится именно она через
+    /// <see cref="VoxelGrid.TryPaintFace"/>. Иначе (рампа, срез, треугольный борт — рисует не ChunkMesher, а
+    /// <see cref="ShapeMeshBuilder"/> отдельным мешем экземпляра, см. <c>Editor.ShapeInstanceView</c>) красится РОВНО
+    /// та грань ФОРМЫ, которой принадлежит попадание, через <see cref="Construction.PaintRegion"/> — какую именно
+    /// определяет НАСТОЯЩЕЕ пересечение того же луча камеры с реальной геометрией формы
+    /// (<see cref="ShapeMeshBuilder.TryRaycastFace"/> — рейкастер клетки, в отличие от него, бьёт по ограничивающему
+    /// кубу, не по форме, см. класс-док <see cref="VoxelRaycaster"/>, поэтому нужен отдельный точный тест именно
+    /// здесь); если он ничего не пересёк (луч бьёт по кубу клетки мимо настоящей геометрии формы), откат на
+    /// приближение по направлению — <see cref="ShapeMeshBuilder.TryFindPaintRegion"/>. Delete по-прежнему действует
+    /// на весь экземпляр блока, которому принадлежит клетка (если клетка не принадлежит ни одному экземпляру —
+    /// например, залита инструментом разработчика в обход Construction — откатывается на поклеточное удаление/
+    /// покраску, как раньше). Resize сюда не входит — он не действует на уже поставленные блоки, см.
+    /// <see cref="EditorState.PendingSize"/>.
     /// </summary>
     private void UseToolAtHover()
     {
@@ -397,7 +487,44 @@ public partial class BuildEditor : Node3D
                 var normal = _hover.Normal;
                 int axis = normal.X != 0 ? 0 : normal.Y != 0 ? 1 : 2;
                 bool positive = normal[axis] > 0;
-                _world.Grid.TryPaintFace(cell, axis, positive, CellColor.Pack(_state.PaintColor));
+                byte hitBit = (byte)(1 << (axis * 2 + (positive ? 1 : 0)));
+                bool isFullCoverageSide = (_world.Grid.GetFaceMask(cell) & hitBit) != 0;
+                if (isFullCoverageSide)
+                {
+                    _world.Grid.TryPaintFace(cell, axis, positive, CellColor.Pack(_state.PaintColor));
+                }
+                else
+                {
+                    var owner = _world.Construction.GetOwner(cell);
+                    var building = owner != null && BlockCatalog.Instance.TryGetBySlug(owner.BlockSlug, out var def)
+                        ? def.GetComponent<BuildingBlockComponent>()
+                        : null;
+                    int region = -1;
+                    if (owner != null && building != null)
+                    {
+                        var rayOrigin = _camera.ProjectRayOrigin(_mousePosition);
+                        var rayDir = _camera.ProjectRayNormal(_mousePosition);
+                        var originWorld = BuildSpace.CellMin(owner.Origin);
+                        if (!ShapeMeshBuilder.TryRaycastFace(building.Shape, owner.Size, owner.RotationSteps, owner.Mirror, originWorld, rayOrigin, rayDir, out region))
+                        {
+                            ShapeMeshBuilder.TryFindPaintRegion(building.Shape, owner.RotationSteps, owner.Mirror, hitBit, out region);
+                        }
+                    }
+
+                    if (owner != null && region >= 0)
+                    {
+                        _world.Construction.PaintRegion(owner, region, _state.PaintColor);
+                    }
+                    else if (owner != null)
+                    {
+                        _world.Construction.Paint(owner, _state.PaintColor);
+                    }
+                    else
+                    {
+                        _world.Grid.TryPaint(cell, CellColor.Pack(_state.PaintColor));
+                    }
+                }
+
                 break;
 
             case ToolMode.Delete:
@@ -417,7 +544,7 @@ public partial class BuildEditor : Node3D
         _camera.MovementEnabled = !_ui.PickerOpen;
         UpdateHover();
 
-        // Удержание ПКМ: инструмент применяется к каждому новому блоку под курсором, но только если мышь сдвинулась —
+        // Удержание кнопки инструмента: он применяется к каждому новому блоку под курсором, но только если мышь сдвинулась —
         // иначе после удаления цель сразу «перескакивает» на следующий блок и удаление проедает постройку насквозь.
         if (_toolButtonDown && _hover.IsBlock && _state.Tool != ToolMode.None
             && _lastToolCell != _hover.BlockCell && _mousePosition != _lastToolMouse)
@@ -515,7 +642,10 @@ public partial class BuildEditor : Node3D
         }
         else
         {
-            var (solid, _, _) = ShapeMeshBuilder.Build(building!.Shape, size, rotation, mirror, Colors.White);
+            // includeFullCoverageFaces: true — призрак не стоит в VoxelGrid, поэтому ChunkMesher никогда не дорисует
+            // ему низ/заднюю стенку и т.п. (см. doc-комментарий ShapeMeshBuilder.BuildData); без этого флага у
+            // призрака Wedge/Pyramid/InvertedPyramid были видны только рампа/треугольные борта, силуэт был "дырявым".
+            var (solid, _, _) = ShapeMeshBuilder.Build(building!.Shape, size, rotation, mirror, Colors.White, includeFullCoverageFaces: true);
             _ghost.Mesh = (Mesh?)solid ?? new BoxMesh { Size = extent };
         }
 
@@ -546,10 +676,9 @@ public partial class BuildEditor : Node3D
             cursor = $"ground ({p.X}, {p.Y}, {p.Z})";
         }
 
+        // Только debug-статистика (запрос пользователя) — подсказки по управлению убраны из HUD; сами подсказки
+        // по-прежнему актуальны, см. class doc BuildEditor и таблицу управления в Docs/03-build-editor.md.
         _ui.SetInfo(
-            "WASD move | Q/E down/up | Shift fast | hold MMB - look | LMB place (or delete - X toggles Delete) | RMB paint (the face under the cursor) | 1-9 / wheel hotbar | Tab blocks\n" +
-            "Next placement (ghost): J/K/L rotate around X/Y/Z | U/I/O mirror across X/Y/Z | Resize panel sets its size\n" +
-            "Ctrl+Z undo | Ctrl+Y redo\n" +
             $"Blocks: {_world.Grid.BlockCount}   Quads: {_world.Quads} (faces before merge: {_world.FacesBeforeMerge})   " +
             $"Wire segments: {_world.LineSegments}   Chunks: {_world.ChunkCount}   Cursor: {cursor}   FPS: {Engine.GetFramesPerSecond()}");
     }

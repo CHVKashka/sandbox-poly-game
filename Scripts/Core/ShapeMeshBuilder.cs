@@ -1,3 +1,5 @@
+using System;
+using System.Collections.Generic;
 using Godot;
 using SandboxPolyGame.Blocks;
 
@@ -14,9 +16,9 @@ namespace SandboxPolyGame.Core;
 /// </summary>
 public static class ShapeMeshBuilder
 {
-    public static (ArrayMesh? Solid, ArrayMesh? Wire, ArrayMesh? Border) Build(BlockShape shape, Vector3I size, Vector3I rotationSteps, Vector3I mirror, Color color)
+    public static (ArrayMesh? Solid, ArrayMesh? Wire, ArrayMesh? Border) Build(BlockShape shape, Vector3I size, Vector3I rotationSteps, Vector3I mirror, Color color, byte occludedMask = 0, bool includeFullCoverageFaces = false, IReadOnlyDictionary<int, uint>? regionColors = null)
     {
-        var data = BuildData(shape, size, rotationSteps, mirror, color);
+        var data = BuildData(shape, size, rotationSteps, mirror, color, occludedMask, includeFullCoverageFaces, regionColors);
         return data == null ? (null, null, null) : (data.CreateSolidMesh(), data.CreateWireMesh(), data.CreateBorderMesh());
     }
 
@@ -26,8 +28,19 @@ public static class ShapeMeshBuilder
     /// <paramref name="mirror"/> — по компоненте на X/Y/Z, 0 = как есть, 1 = отражена (координата унитарного
     /// пространства заменяется на <c>1 - c</c> ДО масштабирования/поворота, то есть блок отражается в собственных
     /// границах, вокруг своей середины по этой оси). Нормали граней отражаются тем же способом — правильный обход
-    /// треугольников (винд) после этого чинит <see cref="EmitFace"/>, как и для поворота.</summary>
-    public static ChunkMeshData? BuildData(BlockShape shape, Vector3I size, Vector3I rotationSteps, Vector3I mirror, Color color)
+    /// треугольников (винд) после этого чинит <see cref="EmitFace"/>, как и для поворота.
+    /// <paramref name="includeFullCoverageFaces"/> — для превью размещения ("призрак", см. <c>Editor.BuildEditor</c>):
+    /// у настоящего поставленного блока полные грани рисует <see cref="ChunkMesher"/> (склейка/отсечение по соседям
+    /// из <see cref="VoxelGrid"/>), но призрак никогда не попадает в сетку, поэтому без этого флага у него не было
+    /// бы вообще никаких полных граней (низа/задней стенки у Wedge и т.п.) — только рампа и треугольные борта, то
+    /// есть визуально "дырявый" силуэт. true заставляет нарисовать их тут же, без склейки с соседями (превью
+    /// разово, соседей у него нет).
+    /// <paramref name="regionColors"/> — точечная покраска (см. <see cref="Construction.PaintRegion"/>/
+    /// <see cref="TryFindPaintRegion"/>): цвет отдельной грани формы (индекс — позиция в массиве <c>faces</c> у
+    /// <see cref="BlockGeometry"/>, СТАБИЛЬНА независимо от поворота/отражения/размера — это позиция В ДАННЫХ, а не
+    /// в мировых осях), переопределяющий <paramref name="color"/> только для этой грани. null или отсутствие ключа —
+    /// грань красится в общий <paramref name="color"/> экземпляра, как раньше.</summary>
+    public static ChunkMeshData? BuildData(BlockShape shape, Vector3I size, Vector3I rotationSteps, Vector3I mirror, Color color, byte occludedMask = 0, bool includeFullCoverageFaces = false, IReadOnlyDictionary<int, uint>? regionColors = null)
     {
         if (!BlockGeometry.TryGet(shape, out var localVertices, out var faces)) return null;
 
@@ -51,18 +64,155 @@ public static class ShapeMeshBuilder
 
         var data = new ChunkMeshData();
         var positions = new Vector3[8]; // максимум вершин в грани в наших формах — 4
-        foreach (var (ring, localNormal, fullCoverage) in faces)
+        for (int faceIndex = 0; faceIndex < faces.Length; faceIndex++)
         {
-            // Грани, целиком закрывающие одну из 6 осевых сторон клетки, рисует ChunkMesher (в том же проходе, что
-            // и кубы, со склейкой/отсечением по соседям) — см. FullCoverageMask и BlockGeometry class doc.
-            if (fullCoverage) continue;
+            var (ring, localNormal, fullCoverage) = faces[faceIndex];
+
+            // Грани, целиком закрывающие одну из 6 осевых сторон клетки, обычно рисует ChunkMesher (в том же
+            // проходе, что и кубы, со склейкой/отсечением по соседям) — см. FullCoverageMask и BlockGeometry class
+            // doc. Исключение — includeFullCoverageFaces (призрак, см. его doc-комментарий выше).
+            if (fullCoverage && !includeFullCoverageFaces) continue;
 
             var worldNormal = (rotation * MirroredNormal(localNormal, mirror)).Normalized();
+
+            // ЧАСТИЧНАЯ (не FullCoverage), но всё же осеориентированная грань (треугольные борта Wedge, боковые
+            // грани Pyramid/InvertedPyramid — в отличие от рампы/среза, которые всегда диагональны и сюда не
+            // попадают, см. TryAxisAlignedBit) не рисуется, если ПО ВСЕЙ границе экземпляра в эту сторону стоит
+            // сплошной сосед, целиком закрывающий СВОЮ обращённую сюда сторону (occludedMask — см.
+            // ComputeOcclusionMask) — тогда эта грань гарантированно спрятана внутри постройки, камера её увидеть
+            // не может ни при каком ракурсе (см. Docs/ROADMAP.md, п. 2). Само по себе устройство этой грани — плоский
+            // треугольник ровно в этой осевой плоскости, просто не покрывающий её целиком (BlockGeometry class doc) —
+            // отсюда безопасность: сосед, целиком закрывающий ту же плоскость, накрывает и её тоже. (fullCoverage
+            // грани сюда не попадают при обычном вызове — continue выше — поэтому occludedMask на них не влияет.)
+            if (!fullCoverage && TryAxisAlignedBit(worldNormal, out byte bit) && (occludedMask & bit) != 0) continue;
+
+            var faceColor = regionColors != null && regionColors.TryGetValue(faceIndex, out var packed)
+                ? CellColor.Unpack(packed)
+                : color;
+
             for (int i = 0; i < ring.Length; i++) positions[i] = ToWorld(localVertices[ring[i]]);
-            EmitFace(data, positions, ring.Length, worldNormal, color);
+            EmitFace(data, positions, ring.Length, worldNormal, faceColor);
         }
 
         return data;
+    }
+
+    /// <summary>
+    /// Точечная покраска наклонных/треугольных граней: НАСТОЯЩЕЕ пересечение луча камеры с реальной геометрией формы
+    /// (веерная триангуляция каждой не-<c>FullCoverage</c> грани, та же, что строит <see cref="BuildData"/>/
+    /// <see cref="EmitFace"/> — Мёллер–Трумбор per-треугольник, ближайшее по лучу пересечение выигрывает), а не
+    /// приближение по осевому направлению попадания в ограничивающий куб клетки (то было <see cref="TryFindPaintRegion"/>,
+    /// оставлен как запасной вариант ниже). Только так возможно попасть именно в диагональную грань (рампа Wedge,
+    /// срез Pyramid/InvertedPyramid) НАПРЯМУЮ, а не только откатом — например, срез InvertedPyramid раньше был
+    /// принципиально недостижим (все 6 осевых направлений её ограничивающего куба заняты другими гранями формы), а
+    /// с точным рейкастом виден и красится, если луч действительно попадает в его треугольник. <paramref name="originWorld"/> —
+    /// мировая позиция МИНИМАЛЬНОГО угла экземпляра (<see cref="BuildSpace.CellMin"/> от его <c>Origin</c>, то же
+    /// соглашение, что и у <see cref="BuildData"/>); <paramref name="rayOrigin"/>/<paramref name="rayDir"/> — луч
+    /// камеры в мировых координатах (метры). false — ни один треугольник не пересечён (например, ограничивающий куб
+    /// клетки "цельный" для рейкастера, но в этой конкретной точке настоящей геометрии формы физически нет — см.
+    /// <see cref="VoxelRaycaster"/> класс-док: он бьёт по кубу клетки, не по форме) — тогда вызывающая сторона
+    /// откатывается на <see cref="TryFindPaintRegion"/>.
+    /// </summary>
+    public static bool TryRaycastFace(BlockShape shape, Vector3I size, Vector3I rotationSteps, Vector3I mirror, Vector3 originWorld, Vector3 rayOrigin, Vector3 rayDir, out int regionIndex)
+    {
+        regionIndex = -1;
+        if (!BlockGeometry.TryGet(shape, out var localVertices, out var faces)) return false;
+
+        var extent = new Vector3(size.X, size.Y, size.Z) * BuildSpace.CellSize;
+        var rotation = ComposeRotation(rotationSteps);
+        var unitCenter = new Vector3(0.5f, 0.5f, 0.5f);
+        Vector3 ToWorld(Vector3 unit) => originWorld + (rotation * (Mirrored(unit, mirror) - unitCenter) + unitCenter) * extent;
+
+        double bestT = double.PositiveInfinity;
+        var positions = new Vector3[8];
+        for (int faceIndex = 0; faceIndex < faces.Length; faceIndex++)
+        {
+            var (ring, _, fullCoverage) = faces[faceIndex];
+            if (fullCoverage) continue; // эти красит VoxelGrid по клетке, сюда не входят вовсе
+
+            for (int i = 0; i < ring.Length; i++) positions[i] = ToWorld(localVertices[ring[i]]);
+
+            // Веерная триангуляция кольца — та же, что EmitFace использует для самого меша.
+            for (int i = 1; i < ring.Length - 1; i++)
+            {
+                if (TryIntersectTriangle(rayOrigin, rayDir, positions[0], positions[i], positions[i + 1], out double t) && t < bestT)
+                {
+                    bestT = t;
+                    regionIndex = faceIndex;
+                }
+            }
+        }
+
+        return regionIndex >= 0;
+    }
+
+    /// <summary>Пересечение луча с треугольником (алгоритм Мёллера–Трумбора); <paramref name="t"/> — расстояние
+    /// вдоль луча (только положительные, т.е. вперёд по направлению взгляда) в случае пересечения.</summary>
+    private static bool TryIntersectTriangle(Vector3 rayOrigin, Vector3 rayDir, Vector3 v0, Vector3 v1, Vector3 v2, out double t)
+    {
+        const double epsilon = 1e-9;
+        t = 0;
+
+        var edge1 = v1 - v0;
+        var edge2 = v2 - v0;
+        var pvec = rayDir.Cross(edge2);
+        double det = edge1.Dot(pvec);
+        if (Math.Abs(det) < epsilon) return false; // луч параллелен плоскости треугольника
+
+        double invDet = 1.0 / det;
+        var tvec = rayOrigin - v0;
+        double u = tvec.Dot(pvec) * invDet;
+        if (u < -1e-6 || u > 1.0 + 1e-6) return false;
+
+        var qvec = tvec.Cross(edge1);
+        double v = rayDir.Dot(qvec) * invDet;
+        if (v < -1e-6 || u + v > 1.0 + 1e-6) return false;
+
+        t = edge2.Dot(qvec) * invDet;
+        return t > epsilon;
+    }
+
+    /// <summary>
+    /// Точечная покраска наклонных/треугольных граней — ЗАПАСНОЙ вариант на случай, когда <see cref="TryRaycastFace"/>
+    /// не нашёл настоящего пересечения (луч бьёт по ограничивающему кубу клетки мимо реальной геометрии формы, см.
+    /// его doc-комментарий): для стороны клетки, куда попал луч (<paramref name="hitBit"/> —
+    /// <c>axis*2+(positive?1:0)</c>, конвенция <see cref="FullCoverageMask"/>/<see cref="VoxelGrid.GetFaceMask"/>),
+    /// но которая НЕ FullCoverage (иначе красить нужно грань КЛЕТКИ в <see cref="VoxelGrid"/>, а не сюда — см.
+    /// <c>Editor.BuildEditor.UseToolAtHover</c>), определяет, какую именно грань формы (индекс в массиве <c>faces</c>
+    /// у <see cref="BlockGeometry"/> — см. doc <paramref name="regionColors"/> у <see cref="BuildData"/>) красить
+    /// <see cref="Construction.PaintRegion"/>. Если по этому направлению у формы есть СВОЯ осеориентированная
+    /// частичная грань (треугольные борта Wedge, грани-основания Pyramid и т.п.) — возвращает именно её; иначе
+    /// (сторона, где у формы вообще нет геометрии в этом точном осевом направлении — например, верх/перед Wedge, где
+    /// на самом деле видна диагональная рампа) возвращает единственную диагональную грань формы (рампа/срез), если
+    /// она есть — приближение похуже точного рейкаста выше, но всё ещё лучше, чем красить весь экземпляр. false — у
+    /// формы вообще нет данных (Cube) или совсем нет граней вообще.
+    /// </summary>
+    public static bool TryFindPaintRegion(BlockShape shape, Vector3I rotationSteps, Vector3I mirror, byte hitBit, out int regionIndex)
+    {
+        regionIndex = -1;
+        if (!BlockGeometry.TryGet(shape, out _, out var faces)) return false;
+
+        var rotation = ComposeRotation(rotationSteps);
+        int diagonal = -1;
+        for (int i = 0; i < faces.Length; i++)
+        {
+            var (_, localNormal, fullCoverage) = faces[i];
+            if (fullCoverage) continue;
+
+            var worldNormal = (rotation * MirroredNormal(localNormal, mirror)).Normalized();
+            if (TryAxisAlignedBit(worldNormal, out byte bit))
+            {
+                if (bit != hitBit) continue;
+                regionIndex = i;
+                return true;
+            }
+
+            diagonal = i; // диагональная грань формы (рампа/срез) — их не больше одной на форму
+        }
+
+        if (diagonal < 0) return false;
+        regionIndex = diagonal;
+        return true;
     }
 
     private static Vector3 Mirrored(Vector3 unit, Vector3I mirror) => new(
@@ -109,6 +259,73 @@ public static class ShapeMeshBuilder
         if (n.Z < -0.5f) return 1 << 4;
         if (n.Z > 0.5f) return 1 << 5;
         return 0;
+    }
+
+    /// <summary>
+    /// Как <see cref="AxisBit"/>, но строго: true, только если нормаль ТОЧНО осеориентирована (после 90°-поворота
+    /// одна компонента ~±1, другие ~0) — в отличие от AxisBit (который трактует любую нормаль с доминирующей осью
+    /// как осевую и годится только там, где это заведомо гарантировано, т.е. для FullCoverage-граней), это нужно
+    /// для ЧАСТИЧНЫХ граней, среди которых есть настоящие диагональные (рампа Wedge, срез Pyramid/InvertedPyramid,
+    /// нормаль вида (1,1,1).Normalized()) — их отсечение по соседу невозможно (нет простого осевого соседа,
+    /// который мог бы их спрятать целиком) и не должно даже пытаться сработать.
+    /// </summary>
+    private static bool TryAxisAlignedBit(Vector3 n, out byte bit)
+    {
+        const float threshold = 1f - 0.001f;
+        if (n.X < -threshold) { bit = 1 << 0; return true; }
+        if (n.X > threshold) { bit = 1 << 1; return true; }
+        if (n.Y < -threshold) { bit = 1 << 2; return true; }
+        if (n.Y > threshold) { bit = 1 << 3; return true; }
+        if (n.Z < -threshold) { bit = 1 << 4; return true; }
+        if (n.Z > threshold) { bit = 1 << 5; return true; }
+        bit = 0;
+        return false;
+    }
+
+    /// <summary>
+    /// Для каждого из 6 осевых направлений: стоит ли ПО ВСЕЙ границе экземпляра (все клетки его bounding box вдоль
+    /// двух других осей, от <paramref name="origin"/> до <paramref name="maxCell"/> включительно) сплошной сосед,
+    /// целиком закрывающий СВОЮ обращённую сюда сторону (<see cref="VoxelGrid.GetFaceMask"/>) — если да, соответствующий
+    /// бит взводится в результате, и <see cref="BuildData"/> не рисует частичную (не FullCoverage, но осеориентированную)
+    /// грань экземпляра в эту сторону, см. её комментарий. Консервативно: не хватает соседа хотя бы у одной клетки
+    /// границы — направление считается ОТКРЫТЫМ (грань рисуется как раньше); лучше лишний невидимый полигон, чем
+    /// настоящая дыра. Не пытается распознать совпадение частичной геометрии двух соседних форм (например, два
+    /// зеркальных скоса, формирующих общий конёк крыши, где обе стороны сами по себе НЕ FullCoverage) — см.
+    /// Docs/ROADMAP.md, п. 2, оставшийся scoped-гэп.
+    /// </summary>
+    public static byte ComputeOcclusionMask(VoxelGrid grid, Vector3I origin, Vector3I maxCell)
+    {
+        byte mask = 0;
+        for (int axis = 0; axis < 3; axis++)
+        {
+            if (IsBoundaryBacked(grid, origin, maxCell, axis, false)) mask |= (byte)(1 << (axis * 2 + 0));
+            if (IsBoundaryBacked(grid, origin, maxCell, axis, true)) mask |= (byte)(1 << (axis * 2 + 1));
+        }
+
+        return mask;
+    }
+
+    private static bool IsBoundaryBacked(VoxelGrid grid, Vector3I origin, Vector3I maxCell, int axis, bool positive)
+    {
+        int u = (axis + 1) % 3;
+        int v = (axis + 2) % 3;
+        int neighborLayer = (positive ? maxCell[axis] : origin[axis]) + (positive ? 1 : -1);
+        // Сосед по эту сторону закрывает нас, если он закрывает СВОЮ обращённую к нам сторону — она напротив нашей.
+        int neighborBit = 1 << (axis * 2 + (positive ? 0 : 1));
+
+        for (int b = origin[v]; b <= maxCell[v]; b++)
+        for (int a = origin[u]; a <= maxCell[u]; a++)
+        {
+            var neighbor = Vector3I.Zero;
+            neighbor[axis] = neighborLayer;
+            neighbor[u] = a;
+            neighbor[v] = b;
+
+            if (!BuildSpace.InBounds(neighbor) || !grid.IsSolid(neighbor)) return false;
+            if ((grid.GetFaceMask(neighbor) & neighborBit) == 0) return false;
+        }
+
+        return true;
     }
 
     /// <summary>Кольцо (2..4 точки, уже в мировых локальных координатах), веерная триангуляция + полный wireframe.</summary>

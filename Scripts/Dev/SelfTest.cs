@@ -42,10 +42,13 @@ public sealed class SelfTest
         test.RunMesherTests();
         test.RunIncrementalTests();
         test.RunRaycastTests();
+        test.RunBuildSpaceTests();
         test.RunBlockCatalogTests();
         test.RunShapeGeometryTests();
         test.RunNonCubeMeshingTests();
+        test.RunResizeMeshingTests();
         test.RunRotationStateTests();
+        test.RunPaintRegionTests();
         test.RunConstructionTests();
         test.RunUndoHistoryTests();
         await test.RunEditorTests(editor);
@@ -335,6 +338,35 @@ public sealed class SelfTest
         Check(hit.IsBlock && hit.BlockCell == new Vector3I(0, 1, 0), "ray hits the nearest block of a stack first", hit.ToString());
     }
 
+    // ================================================================== область построек (BuildSpace)
+
+    /// <summary>Границы области построек симметричны относительно центра (0,0,0): 25 м влево/вправо (X) и вверх/вниз
+    /// (Y), 50 м вперёд/назад (Z) - см. class doc <see cref="BuildSpace"/>.</summary>
+    private void RunBuildSpaceTests()
+    {
+        GD.Print("-- build space: symmetric bounds around the center (25 m sides/height, 50 m forward/back)");
+
+        Check(Mathf.Abs(-BuildSpace.MinCell.X * BuildSpace.CellSize - 25f) < 1e-4f
+              && Mathf.Abs((BuildSpace.MaxCell.X + 1) * BuildSpace.CellSize - 25f) < 1e-4f,
+            "X (left/right) spans exactly 25 m on each side of the center", $"{BuildSpace.MinCell.X}..{BuildSpace.MaxCell.X}");
+        Check(Mathf.Abs(-BuildSpace.MinCell.Y * BuildSpace.CellSize - 25f) < 1e-4f
+              && Mathf.Abs((BuildSpace.MaxCell.Y + 1) * BuildSpace.CellSize - 25f) < 1e-4f,
+            "Y (up/down) spans exactly 25 m on each side of the center", $"{BuildSpace.MinCell.Y}..{BuildSpace.MaxCell.Y}");
+        Check(Mathf.Abs(-BuildSpace.MinCell.Z * BuildSpace.CellSize - 50f) < 1e-4f
+              && Mathf.Abs((BuildSpace.MaxCell.Z + 1) * BuildSpace.CellSize - 50f) < 1e-4f,
+            "Z (forward/back) spans exactly 50 m on each side of the center", $"{BuildSpace.MinCell.Z}..{BuildSpace.MaxCell.Z}");
+
+        Check(BuildSpace.InBounds(BuildSpace.MinCell) && BuildSpace.InBounds(BuildSpace.MaxCell),
+            "the corner cells themselves are in bounds (inclusive range)");
+        Check(!BuildSpace.InBounds(BuildSpace.MinCell - Vector3I.One) && !BuildSpace.InBounds(BuildSpace.MaxCell + Vector3I.One),
+            "one cell past either corner is out of bounds");
+
+        Check(BuildSpace.WorldMin.DistanceTo(new Vector3(-25f, -25f, -50f)) < 1e-3f,
+            "WorldMin is the outer corner of the area in meters", $"{BuildSpace.WorldMin}");
+        Check(BuildSpace.WorldMax.DistanceTo(new Vector3(25f, 25f, 50f)) < 1e-3f,
+            "WorldMax is the outer corner of the area in meters", $"{BuildSpace.WorldMax}");
+    }
+
     // ================================================================== каталог блоков (data-driven, blocks/*.xml)
 
     private void RunBlockCatalogTests()
@@ -571,6 +603,109 @@ public sealed class SelfTest
             $"faces={cubesStats.Faces} quads={cubesStats.Quads}");
     }
 
+    // ================================================================== Resize многоклеточных форм: баг с ложными
+    // внутренними стенками (см. Construction.BoundaryFaceMask) и отсечение спрятанных частичных граней
+    // (см. ShapeMeshBuilder.ComputeOcclusionMask) — оба найдены на реальной постройке пользователя (растянутая
+    // InvertedPyramid у предела MaxSize давала торчащие "перпендикулярные стенки" по каждой внутренней границе
+    // клеток), см. Docs/WORKLOG.md.
+
+    private void RunResizeMeshingTests()
+    {
+        GD.Print("-- resize meshing: stretched non-cube instances must not draw spurious internal walls, and must hide partial faces fully backed by a neighbor");
+
+        var catalog = BlockCatalog.Instance;
+        var block = catalog.Get("block");
+        var wedge = catalog.Get("wedge");
+        var invPyramid = catalog.Get("inverse_pyramid");
+
+        // --- баг 3 (PlaceBlock): Wedge растянут вдоль Z (его "задняя стенка" Z- есть только у формы САМОЙ ПО СЕБЕ,
+        // а не у каждой клетки растяжения) на 5 клеток. Ожидаемо: низ (Y-, у ВСЕХ 5 клеток — размер по Y всё ещё 1,
+        // так что тут они одновременно и Origin, и MaxCell) сливается в 1 полосу; задняя стенка — только у самой
+        // первой (Origin.Z) клетки, ни одной лишней внутренней стенки на границах клеток 0|1, 1|2, 2|3, 3|4.
+        // (до фикса Construction.BoundaryFaceMask здесь было faces=10 quads=6 — по лишней стенке на каждой из
+        // 4 внутренних границ, ни одна не сливалась с соседней, т.к. каждая была на своём Z-срезе.)
+        var gridA = new VoxelGrid();
+        var conA = new Construction(gridA);
+        conA.PlaceBlock(new Vector3I(0, 0, 0), new Vector3I(1, 1, 5), wedge, wedge.DefaultColor);
+        var statsA = Measure(gridA);
+        Check(statsA.Faces == 6 && statsA.Quads == 2,
+            "PlaceBlock: a Wedge stretched 5 cells along its closed axis (Z-) draws that wall only once (at the true " +
+            "boundary), not once per internal cell edge — bottom merges into 1 strip, back stays 1 face",
+            $"faces={statsA.Faces} quads={statsA.Quads}");
+
+        // --- баг 3 (TrySetSize, тот же сценарий, но через рост уже стоящего блока, а не PlaceBlock за один раз —
+        // раньше маска у уже стоявших клеток при росте не пересчитывалась вообще, см. комментарий в TrySetSize).
+        var gridB = new VoxelGrid();
+        var conB = new Construction(gridB);
+        var grown = conB.Place(new Vector3I(0, 0, 0), wedge, wedge.DefaultColor);
+        conB.TrySetSize(grown!, wedge, new Vector3I(1, 1, 5));
+        var statsB = Measure(gridB);
+        Check(statsB.Faces == 6 && statsB.Quads == 2,
+            "TrySetSize: growing a Wedge to span 5 cells along Z- has the same fix applied as PlaceBlock " +
+            "(existing cells' masks are recomputed too, not just the newly added ones)",
+            $"faces={statsB.Faces} quads={statsB.Quads}");
+
+        // --- воспроизведение бага именно с InvertedPyramid у большого размера (тот случай, что видел пользователь):
+        // 3 полные стороны (x=0,y=0,z=0 локально) должны остаться РОВНО 3 склеенными прямоугольниками на весь
+        // bounding box, без единой лишней "перпендикулярной" стенки внутри.
+        var gridC = new VoxelGrid();
+        var conC = new Construction(gridC);
+        conC.PlaceBlock(new Vector3I(0, 0, 0), new Vector3I(3, 2, 8), invPyramid, invPyramid.DefaultColor);
+        var statsC = Measure(gridC);
+        int expectedFacesC = 2 * 8 /* x=0: Y*Z */ + 3 * 8 /* y=0: X*Z */ + 3 * 2 /* z=0: X*Y */;
+        Check(statsC.Faces == expectedFacesC && statsC.Quads == 3,
+            "PlaceBlock: a 3x2x8 InvertedPyramid (matches the size that showed the bug in-game) merges each of its " +
+            "3 full-coverage sides into exactly 1 quad each, with zero extra internal walls",
+            $"faces={statsC.Faces} quads={statsC.Quads} (expected faces={expectedFacesC} quads=3)");
+
+        // Ни одна КЛЕТКА этого экземпляра, кроме самой Origin, не должна нести бит Z- (иначе где-то среди её
+        // внутренних соседей возникла бы точка для ложной стенки) - прямая проверка данных, а не только их следствия.
+        for (int z = 0; z <= 7; z++)
+        {
+            byte mask = gridC.GetFaceMask(new Vector3I(0, 0, z));
+            bool hasZMinus = (mask & (1 << 4)) != 0;
+            Check(hasZMinus == (z == 0), $"InvertedPyramid cell z={z}: Z- bit set only at the true boundary (z=0)", $"mask={Convert.ToString(mask, 2)}");
+        }
+
+        // --- баг 2: частичная (не FullCoverage) грань формы, полностью спрятанная за соседом, который целиком
+        // закрывает СВОЮ обращённую сюда сторону, больше не рисуется. Wedge в (0,0,0), куб в (1,0,0) - правый
+        // треугольный борт Wedge (нормаль +X) полностью загорожен левой стороной куба.
+        var gridD = new VoxelGrid();
+        gridD.TrySet(new Vector3I(1, 0, 0), block.RuntimeId, CellColor.Pack(Colors.Gray));
+        byte occludedD = ShapeMeshBuilder.ComputeOcclusionMask(gridD, Vector3I.Zero, Vector3I.Zero);
+        Check((occludedD & (1 << 1)) != 0, "ComputeOcclusionMask: +X is occluded when a solid cube sits fully closing that side", $"mask={Convert.ToString(occludedD, 2)}");
+        var wedgeMeshBaseline = ShapeMeshBuilder.BuildData(BlockShape.Slope, Vector3I.One, Vector3I.Zero, Vector3I.Zero, Colors.White)!;
+        var wedgeMeshOccluded = ShapeMeshBuilder.BuildData(BlockShape.Slope, Vector3I.One, Vector3I.Zero, Vector3I.Zero, Colors.White, occludedD)!;
+        Check(wedgeMeshBaseline.Indices.Count / 3 == 4 && wedgeMeshOccluded.Indices.Count / 3 == 3,
+            "BuildData: occluding +X drops the right triangular bort (1 of Wedge's 4 partial triangles), the ramp " +
+            "and left bort are untouched",
+            $"baseline={wedgeMeshBaseline.Indices.Count / 3} occluded={wedgeMeshOccluded.Indices.Count / 3}");
+
+        // --- не-регрессия: сосед есть, но НЕ закрывает свою сторону целиком (другой Wedge своим треугольным
+        // бортом, а не полной гранью) - occludedMask должен остаться 0 для этого направления (иначе там появилась
+        // бы настоящая дыра, а не спрятанная-и-безопасно-убранная грань).
+        var gridE = new VoxelGrid();
+        byte otherWedgeMask = ShapeMeshBuilder.FullCoverageMask(BlockShape.Slope, Vector3I.Zero, Vector3I.Zero);
+        gridE.TrySet(new Vector3I(1, 0, 0), wedge.RuntimeId, CellColor.Pack(Colors.Gray), otherWedgeMask);
+        byte occludedE = ShapeMeshBuilder.ComputeOcclusionMask(gridE, Vector3I.Zero, Vector3I.Zero);
+        Check((occludedE & (1 << 1)) == 0,
+            "ComputeOcclusionMask: a neighbor that does NOT fully close its facing side (another Wedge's triangular " +
+            "bort, not a full face) never occludes - stays conservative, no hole is created",
+            $"mask={Convert.ToString(occludedE, 2)}");
+
+        // --- не-регрессия: у растянутого (не 1x1x1) экземпляра, где только ЧАСТЬ границы имеет закрывающего
+        // соседа, направление НЕ считается закрытым целиком - иначе часть, которая реально открыта, потеряла бы
+        // свою грань (дыра). Wedge растянут на 3 клетки по Y (тут X=0 - боковой борт по всей длине), куб стоит
+        // только рядом с одной из трёх клеток.
+        var gridF = new VoxelGrid();
+        gridF.TrySet(new Vector3I(1, 1, 0), block.RuntimeId, CellColor.Pack(Colors.Gray)); // сосед только у средней клетки (y=1)
+        byte occludedF = ShapeMeshBuilder.ComputeOcclusionMask(gridF, Vector3I.Zero, new Vector3I(0, 2, 0));
+        Check((occludedF & (1 << 1)) == 0,
+            "ComputeOcclusionMask: a closing neighbor next to only part of a stretched instance's boundary does not " +
+            "occlude that whole side - the still-open part would otherwise get a hole",
+            $"mask={Convert.ToString(occludedF, 2)}");
+    }
+
     // ================================================================== вращение перед установкой (J/K/L)
 
     private void RunRotationStateTests()
@@ -586,6 +721,113 @@ public sealed class SelfTest
         state.RotatePendingY();
         state.RotatePendingZ();
         Check(state.PendingRotationSteps == new Vector3I(0, 1, 1), "RotatePendingY/Z increment Y/Z independently");
+    }
+
+    // ================================================================== точечная покраска наклонных/треугольных граней
+
+    /// <summary>
+    /// Было "сознательно отложено" (см. Docs/ROADMAP.md), затем стало багом ("красятся все подобные поверхности, а
+    /// не конкретно выбранная") - раньше <c>BuildEditor.UseToolAtHover</c> красил ВЕСЬ экземпляр целиком в ответ на
+    /// клик по любой наклонной/треугольной грани (ту же рампу, оба борта, низ и заднюю стенку разом), т.к.
+    /// <see cref="ShapeMeshBuilder"/> принимал ровно один цвет на весь меш. Теперь <see cref="BlockInstance.RegionColors"/> +
+    /// <see cref="ShapeMeshBuilder.TryFindPaintRegion"/> красят РОВНО ту грань формы, в которую попал луч.
+    /// </summary>
+    private void RunPaintRegionTests()
+    {
+        GD.Print("-- point paint of non-cube shape faces (ramp/triangular sides), not the whole instance");
+
+        // TryRaycastFace: НАСТОЯЩЕЕ пересечение луча с реальной геометрией формы - в отличие от TryFindPaintRegion
+        // (приближение по осевому направлению попадания в ограничивающий куб клетки), может попасть НАПРЯМУЮ в
+        // диагональную грань. Срез InvertedPyramid (грань 6, плоскость x+y+z=2, вершины (1,1,0)/(1,0,1)/(0,1,1)) —
+        // раньше был принципиально недостижим через TryFindPaintRegion (все 6 осевых направлений её куба заняты
+        // другими гранями формы, см. её doc-комментарий) - с точным рейкастом луч, направленный точно в центр этого
+        // треугольника, попадает в него напрямую.
+        var invSliceCentroidUnit = new Vector3(2f / 3f, 2f / 3f, 2f / 3f); // среднее вершин (1,1,0),(1,0,1),(0,1,1)
+        var invSliceCentroidWorld = invSliceCentroidUnit * BuildSpace.CellSize; // extent = CellSize при size=1x1x1
+        var rayFromOutsideCorner = new Vector3(2f, 2f, 2f);
+        var towardSlice = (invSliceCentroidWorld - rayFromOutsideCorner).Normalized();
+        Check(ShapeMeshBuilder.TryRaycastFace(BlockShape.InvertedPyramid, Vector3I.One, Vector3I.Zero, Vector3I.Zero, Vector3.Zero, rayFromOutsideCorner, towardSlice, out int invSliceRegion) && invSliceRegion == 6,
+            "InvertedPyramid: a ray aimed at the diagonal slice's centroid hits it directly (face index 6) - previously unreachable via the axis-bit fallback alone",
+            $"region={invSliceRegion}");
+
+        var awayFromSlice = new Vector3(1f, 1f, 1f).Normalized(); // прочь от среза, не к нему
+        Check(!ShapeMeshBuilder.TryRaycastFace(BlockShape.InvertedPyramid, Vector3I.One, Vector3I.Zero, Vector3I.Zero, Vector3.Zero, rayFromOutsideCorner, awayFromSlice, out _),
+            "InvertedPyramid: a ray pointed away from the shape hits nothing (no false positive behind the ray origin)");
+
+        // Тот же точный рейкаст даёт то же самое, что осевое приближение, там, где оно и так было прямым попаданием
+        // (левый треугольный борт Wedge, x=0) - не регрессия для уже работавшего случая.
+        var leftBortCentroidWorld = new Vector3(0f, 1f / 3f, 1f / 3f) * BuildSpace.CellSize; // среднее (0,0,0),(0,1,0),(0,0,1)
+        var rayFromOutsideLeft = new Vector3(-5f, leftBortCentroidWorld.Y, leftBortCentroidWorld.Z);
+        Check(ShapeMeshBuilder.TryRaycastFace(BlockShape.Slope, Vector3I.One, Vector3I.Zero, Vector3I.Zero, Vector3.Zero, rayFromOutsideLeft, Vector3.Right, out int wedgeLeftRegion) && wedgeLeftRegion == 3,
+            "Wedge: a ray aimed at the left bort's centroid hits it directly (face index 3), matching TryFindPaintRegion for this case");
+
+        const byte xMinus = 1 << 0, xPlus = 1 << 1, yMinus = 1 << 2, yPlus = 1 << 3, zMinus = 1 << 4, zPlus = 1 << 5;
+
+        // Запасной вариант (TryFindPaintRegion, используется только когда TryRaycastFace не находит настоящего
+        // пересечения): Wedge: X-/X+ - его собственные треугольные борта, попадание бьёт напрямую по индексу. Y+/Z+ у формы вообще
+        // нет своей грани (см. BlockGeometry: WedgeFaces не содержит нормали (0,1,0)/(0,0,1)) - на самом деле там
+        // видна диагональная рампа, поэтому оба откатываются на её индекс (2).
+        Check(ShapeMeshBuilder.TryFindPaintRegion(BlockShape.Slope, Vector3I.Zero, Vector3I.Zero, xMinus, out int leftBort) && leftBort == 3,
+            "Wedge: hitting X- maps directly to its left triangular bort (face index 3)");
+        Check(ShapeMeshBuilder.TryFindPaintRegion(BlockShape.Slope, Vector3I.Zero, Vector3I.Zero, xPlus, out int rightBort) && rightBort == 4,
+            "Wedge: hitting X+ maps directly to its right triangular bort (face index 4)");
+        Check(ShapeMeshBuilder.TryFindPaintRegion(BlockShape.Slope, Vector3I.Zero, Vector3I.Zero, yPlus, out int rampFromTop) && rampFromTop == 2,
+            "Wedge: hitting Y+ (no face of its own there - the ramp is what's actually visible) falls back to the ramp (face index 2)");
+        Check(ShapeMeshBuilder.TryFindPaintRegion(BlockShape.Slope, Vector3I.Zero, Vector3I.Zero, zPlus, out int rampFromFront) && rampFromFront == 2,
+            "Wedge: hitting Z+ falls back to the same ramp (face index 2)");
+
+        // Pyramid: базовая/z=0/x=0 грани - осеориентированные (хоть и треугольные, не покрывают грань клетки
+        // целиком - см. BlockGeometry) - попадание бьёт напрямую; X+/Y+/Z+ не имеют своей грани - откат на срез (3).
+        Check(ShapeMeshBuilder.TryFindPaintRegion(BlockShape.Pyramid, Vector3I.Zero, Vector3I.Zero, yMinus, out int pyramidBase) && pyramidBase == 0,
+            "Pyramid: hitting Y- maps directly to its base (face index 0)");
+        Check(ShapeMeshBuilder.TryFindPaintRegion(BlockShape.Pyramid, Vector3I.Zero, Vector3I.Zero, zMinus, out int pyramidBack) && pyramidBack == 1,
+            "Pyramid: hitting Z- maps directly to its z=0 face (face index 1)");
+        Check(ShapeMeshBuilder.TryFindPaintRegion(BlockShape.Pyramid, Vector3I.Zero, Vector3I.Zero, xMinus, out int pyramidSide) && pyramidSide == 2,
+            "Pyramid: hitting X- maps directly to its x=0 face (face index 2)");
+        Check(ShapeMeshBuilder.TryFindPaintRegion(BlockShape.Pyramid, Vector3I.Zero, Vector3I.Zero, xPlus, out int pyramidSlice) && pyramidSlice == 3,
+            "Pyramid: hitting X+ (no face of its own - only the diagonal slice is there) falls back to it (face index 3)");
+
+        // InvertedPyramid: ВСЕ 6 осевых направлений заняты своими гранями (3 FullCoverage + 3 усечённых треугольных) -
+        // диагональный срез (индекс 6) в принципе не достижим таким рейкастом (см. doc-комментарий TryFindPaintRegion,
+        // ROADMAP.md, оставшийся scoped-гэп) - тут проверяем только 3 усечённых грани, попадание в которые как раз
+        // возможно (X-/Y-/Z- у неё FullCoverage, красятся через VoxelGrid, сюда не попадают вовсе).
+        Check(ShapeMeshBuilder.TryFindPaintRegion(BlockShape.InvertedPyramid, Vector3I.Zero, Vector3I.Zero, xPlus, out int invTruncX) && invTruncX == 3,
+            "InvertedPyramid: hitting X+ maps directly to its truncated corner there (face index 3)");
+        Check(ShapeMeshBuilder.TryFindPaintRegion(BlockShape.InvertedPyramid, Vector3I.Zero, Vector3I.Zero, yPlus, out int invTruncY) && invTruncY == 4,
+            "InvertedPyramid: hitting Y+ maps directly to its truncated corner there (face index 4)");
+        Check(ShapeMeshBuilder.TryFindPaintRegion(BlockShape.InvertedPyramid, Vector3I.Zero, Vector3I.Zero, zPlus, out int invTruncZ) && invTruncZ == 5,
+            "InvertedPyramid: hitting Z+ maps directly to its truncated corner there (face index 5)");
+
+        Check(!ShapeMeshBuilder.TryFindPaintRegion(BlockShape.Cube, Vector3I.Zero, Vector3I.Zero, xMinus, out _),
+            "Cube has no ShapeMeshBuilder geometry at all - TryFindPaintRegion correctly refuses it (a cube face paints through VoxelGrid instead)");
+
+        // BuildData: regionColors переопределяет цвет РОВНО указанной грани (по стабильному индексу, не по
+        // геометрии) - остальные грани красятся в общий color, как и раньше.
+        var green = CellColor.Pack(Colors.Green);
+        var overridden = ShapeMeshBuilder.BuildData(BlockShape.Slope, Vector3I.One, Vector3I.Zero, Vector3I.Zero, Colors.White,
+            regionColors: new Dictionary<int, uint> { [2] = green })!;
+        int greenVerts = overridden.Colors.Count(c => c == Colors.Green);
+        int whiteVerts = overridden.Colors.Count(c => c == Colors.White);
+        Check(greenVerts == 4 && whiteVerts == 6,
+            "Wedge BuildData: regionColors[2] (ramp, 4 vertices) paints only the ramp green, the 2 triangular borts (3+3 vertices) stay white",
+            $"green={greenVerts} white={whiteVerts}");
+
+        // Construction: PaintRegion меняет только BlockInstance.RegionColors (не VoxelGrid, не представительный
+        // Color); Paint (весь экземпляр) сбрасывает точечные правки - иначе "перекрасить целиком" не выглядело бы
+        // таковым, если старые точечные акценты продолжали бы проступать поверх нового цвета.
+        var construction = new Construction(new VoxelGrid());
+        var wedge = construction.Place(new Vector3I(0, 0, 0), BlockCatalog.Instance.Get("wedge"), Colors.Gray)!;
+        Check(construction.PaintRegion(wedge, 2, Colors.Green), "PaintRegion returns true when the region's color actually changes");
+        Check(!construction.PaintRegion(wedge, 2, Colors.Green), "PaintRegion returns false when called again with the same color (no-op)");
+        Check(construction.PaintRegion(wedge, 3, Colors.Blue), "PaintRegion on a second, different region also succeeds independently");
+        Check(wedge.Color == CellColor.Pack(Colors.Gray), "PaintRegion never touches the instance's own representative Color");
+        Check(wedge.RegionColors != null && wedge.RegionColors.Count == 2
+              && wedge.RegionColors[2] == green && wedge.RegionColors[3] == CellColor.Pack(Colors.Blue),
+            "PaintRegion keeps both region overrides side by side (ramp green, left bort blue), not overwriting one with the other");
+
+        construction.Paint(wedge, Colors.Red);
+        Check(wedge.Color == CellColor.Pack(Colors.Red) && wedge.RegionColors is not { Count: > 0 },
+            "whole-instance Paint clears any region overrides - a full repaint should look like one, not show old accents through it");
     }
 
     // ================================================================== постройка: экземпляры блоков, Resize, JSON
@@ -770,6 +1012,25 @@ public sealed class SelfTest
             "Undo restores the face's previous color");
         Check(history.Redo(construction, catalog) && construction.Grid.GetFaceColor(new Vector3I(20, 0, 0), 1, true) == faceRed,
             "Redo re-applies the face paint");
+
+        // Точечная покраска ГРАНИ ФОРМЫ (Construction.PaintRegion, см. BlockInstance.RegionColors) тоже переживает
+        // Undo/Redo - хранится по Origin экземпляра, а не по InstanceId (см. class doc: Deserialize строит экземпляры
+        // заново, с новыми id по порядку, Origin же остаётся тем же).
+        construction.Clear();
+        var wedgeForUndo = construction.Place(new Vector3I(30, 0, 0), catalog.Get("wedge"), Colors.Gray)!;
+        var beforeRegionPaint = history.Capture(construction);
+        construction.PaintRegion(wedgeForUndo, 2, Colors.Green); // рампа
+        history.RecordIfChanged(beforeRegionPaint, construction);
+        Check(history.CanUndo, "painting a shape's region records an undo entry even though the instance's own Color did not change");
+
+        Check(history.Undo(construction, catalog), "Undo (region paint) succeeds");
+        var wedgeAfterUndo = construction.Instances.First();
+        Check(wedgeAfterUndo.RegionColors is not { Count: > 0 }, "Undo removes the region color override");
+
+        Check(history.Redo(construction, catalog), "Redo (region paint) succeeds");
+        var wedgeAfterRedo = construction.Instances.First();
+        Check(wedgeAfterRedo.RegionColors != null && wedgeAfterRedo.RegionColors.TryGetValue(2, out uint restoredRegion) && restoredRegion == CellColor.Pack(Colors.Green),
+            "Redo re-applies the region color override");
     }
 
     // ================================================================== интеграция: реальный ввод
@@ -830,11 +1091,20 @@ public sealed class SelfTest
         bool accumulated = Input.UseAccumulatedInput;
         Input.UseAccumulatedInput = false;
 
+        // Редактор сам ставит корневой блок 1x1 в центральную клетку (0,0,0) при входе (см. BuildEditor.PlaceRootBlock) -
+        // проверяем это здесь, ДО того как остальные тесты ниже расчистят сцену под себя (Construction.Clear()).
+        var rootOwner = editor.World.Construction.GetOwner(Vector3I.Zero);
+        Check(rootOwner != null && rootOwner.BlockSlug == "block" && rootOwner.Size == Vector3I.One,
+            "the editor places a 1x1x1 root block in the center cell (0,0,0) on start", $"{rootOwner}");
+
         // Без окна (headless) корневой вьюпорт всего 64x64 — задаём реальный размер, чтобы вёрстка UI и проекции были осмысленными.
         editor.GetTree().Root.Size = new Vector2I(1600, 900);
         await Frames(editor, 3);
         GD.Print($"  info  viewport={editor.GetViewport().GetVisibleRect().Size} display={DisplayServer.GetName()} window={DisplayServer.WindowGetSize()}");
-        grid.Clear();
+        // Construction.Clear(), не голый grid.Clear(): редактор при входе сам ставит корневой блок 1x1 в центр
+        // (см. BuildEditor.PlaceRootBlock) - это настоящий экземпляр Construction, просто обнулить сетку недостаточно
+        // (Construction продолжала бы считать эту клетку занятой её экземпляром - расхождение с VoxelGrid).
+        editor.World.Construction.Clear();
         state.Tool = ToolMode.None;
         state.Wireframe = false;
         state.Borders = true;
@@ -879,17 +1149,26 @@ public sealed class SelfTest
         await Click(editor, Screen(TopOf(new Vector3I(0, 2, 0))), MouseButton.Right);
         Check(grid.BlockCount == 3, "RMB with no tool selected does nothing");
 
-        // 3. Инструменты тулбара: Paint на ПКМ, Delete на ЛКМ (см. BuildEditor.ButtonFor).
+        // 3. Инструменты тулбара: и Paint, и Delete — на ЛКМ (см. BuildEditor.ButtonFor); не конфликтуют, т.к.
+        // взаимоисключающие режимы. ПКМ инструментам не назначена вообще. Цель - свежий обычный куб (не только что
+        // поставленный на (0,2,0) InvertedPyramid - у него "верх" не FullCoverage, эта механика отдельно проверена
+        // ниже, в тесте про покраску скошенной поверхности формы), чтобы "покрашена ровно одна грань, остальные не
+        // тронуты" проверялось однозначно, на форме, где это в принципе применимо.
+        state.SelectedSlot = 0;
+        await Click(editor, Screen(TopOf(new Vector3I(0, 2, 0))), MouseButton.Left);
+        var target = new Vector3I(0, 3, 0);
+        Check(grid.GetId(target) == BlockCatalog.Instance.Get("block").RuntimeId, "paint/delete test setup: a plain cube sits at the test target cell");
+
         state.PaintColor = Colors.Red;
         state.Tool = ToolMode.Paint;
-        var target = new Vector3I(0, 2, 0);
         await Move(editor, Screen(TopOf(target)));
         Check(!editor.Ghost.Visible, "paint tool active: placement ghost is hidden even over a free cell");
-        int blocksBeforePaintLmb = grid.BlockCount;
-        await Click(editor, Screen(TopOf(target)), MouseButton.Left);
-        Check(grid.BlockCount == blocksBeforePaintLmb && grid.GetId(new Vector3I(0, 3, 0)) == 0,
-            "paint tool active: LMB does not place a block (Paint owns RMB, not LMB)");
         await Click(editor, Screen(TopOf(target)), MouseButton.Right);
+        Check(grid.GetFaceColor(target, 1, true) != CellColor.Pack(Colors.Red), "paint tool active: RMB does nothing (Paint is on LMB)");
+        int blocksBeforePaint = grid.BlockCount;
+        await Click(editor, Screen(TopOf(target)), MouseButton.Left);
+        Check(grid.BlockCount == blocksBeforePaint && grid.GetId(new Vector3I(0, 4, 0)) == 0,
+            "paint tool active: LMB does not place a block (it paints instead)");
         // По грани, а не по всему блоку: TopOf наводит на верхнюю (Y+) грань - красится ровно она, остальные
         // 5 граней клетки (в т.ч. "представительная" грань X-, которую отдаёт GetColor) остаются как были.
         Check(grid.GetFaceColor(target, 1, true) == CellColor.Pack(Colors.Red) && grid.GetId(target) != 0,
@@ -901,11 +1180,11 @@ public sealed class SelfTest
         await Move(editor, Screen(TopOf(target)));
         Check(!editor.Ghost.Visible, "delete tool active: placement ghost is hidden too");
         await Click(editor, Screen(TopOf(target)), MouseButton.Right);
-        Check(grid.GetId(target) != 0, "delete tool active: RMB does nothing (Delete moved to LMB, RMB is Paint's button)");
+        Check(grid.GetId(target) != 0, "delete tool active: RMB does nothing (Delete is on LMB, RMB is unused by tools)");
         await Click(editor, Screen(TopOf(target)), MouseButton.Left);
-        Check(grid.GetId(target) == 0 && grid.BlockCount == 2, "delete tool removes the block under the cursor (LMB)");
+        Check(grid.GetId(target) == 0 && grid.BlockCount == 3, "delete tool removes the block under the cursor (LMB)");
         state.Tool = ToolMode.None;
-        await Move(editor, Screen(TopOf(new Vector3I(0, 1, 0)))); // (0,2,0) только что удалена - точно свободна
+        await Move(editor, Screen(TopOf(new Vector3I(0, 2, 0)))); // target (0,3,0) только что удалён - точно свободен
         Check(editor.Ghost.Visible, "no tool active: placement ghost is visible again");
 
         // `X` — горячая клавиша Delete, эквивалент клика по кнопке на тулбаре (повторное нажатие выключает).
@@ -1169,10 +1448,76 @@ public sealed class SelfTest
         if (state.PendingMirror.X != 0) state.ToggleMirrorX();
         if (state.PendingMirror.Y != 0) state.ToggleMirrorY();
         if (state.PendingMirror.Z != 0) state.ToggleMirrorZ();
-        state.SelectedSlot = 0;
+        while (state.PendingRotationSteps.X != 0) state.RotatePendingX();
+        while (state.PendingRotationSteps.Y != 0) state.RotatePendingY();
+        while (state.PendingRotationSteps.Z != 0) state.RotatePendingZ();
         editor.World.Construction.Clear();
 
-        // Перетаскивание инструмента с зажатым ПКМ: три блока в ряд, «проедания насквозь» без движения мыши нет.
+        // --- баг: призрак Wedge/Pyramid/InvertedPyramid не показывал свои FullCoverage-стороны (у Wedge - низ и
+        // заднюю стенку) - у настоящего поставленного блока их дорисовывает ChunkMesher по данным VoxelGrid, но
+        // призрак никогда в неё не попадает (это только превью), поэтому без явного флага
+        // ShapeMeshBuilder.BuildData.includeFullCoverageFaces у него был виден только "дырявый" силуэт (рампа + 2
+        // треугольных борта - 4 треугольника вместо 8).
+        state.SelectedSlot = 3; // wedge
+        await Move(editor, ground);
+        Check(editor.Ghost.Visible, "wedge ghost setup: placement ghost is visible over empty ground");
+        int ghostTriangles = editor.Ghost.Mesh.GetFaces().Length / 3;
+        Check(ghostTriangles == 8,
+            "wedge ghost includes its 2 FullCoverage sides (bottom+back, 2 quads = 4 triangles) in addition to the " +
+            "4 partial ones (ramp + 2 triangular borts) - not just the partial ones, so its silhouette is solid",
+            $"got {ghostTriangles} triangles");
+
+        // --- баг (исправлен): покраска стороны формы, которую она НЕ закрывает целиком (Wedge закрывает только
+        // низ/заднюю стенку - "верх", Y+, никогда не FullCoverage), раньше перекрашивала ВЕСЬ экземпляр целиком
+        // ("красятся все подобные поверхности, а не конкретно выбранная") - теперь красит РОВНО ту грань формы,
+        // в которую попал луч (см. ShapeMeshBuilder.TryFindPaintRegion/Construction.PaintRegion), а не всё сразу.
+        var wedgeCell = new Vector3I(0, 0, 0);
+        var wedgeInstance = editor.World.Construction.Place(wedgeCell, BlockCatalog.Instance.Get("wedge"), Colors.Gray);
+        camera.LookAtPoint(new Vector3(0.125f, 5f, 0.125f), new Vector3(0.125f, 0f, 0.125f)); // прямо вниз на клетку
+        await Frames(editor, 2);
+        var wedgeTop = Screen(new Vector3(0.125f, 0.25f, 0.125f));
+        await Move(editor, wedgeTop);
+        Check(editor.Hover.IsBlock && editor.Hover.BlockCell == wedgeCell && editor.Hover.Normal == Vector3I.Up,
+            "paint-region setup: looking straight down hits the Wedge's Y+ bounding-cube side (not one of its 2 " +
+            "FullCoverage sides)", $"{editor.Hover}");
+
+        state.Tool = ToolMode.Paint;
+        state.PaintColor = Colors.Green;
+        await Click(editor, wedgeTop, MouseButton.Left);
+        Check(wedgeInstance!.Color == CellColor.Pack(Colors.Gray),
+            "painting the Wedge's Y+ side (no face of its own there - the ramp is what's actually visible) leaves " +
+            "the instance's own representative Color untouched",
+            $"color={Convert.ToString(wedgeInstance!.Color, 16)}");
+        Check(wedgeInstance.RegionColors != null && wedgeInstance.RegionColors.TryGetValue(2, out uint rampColor) && rampColor == CellColor.Pack(Colors.Green),
+            "...instead it paints exactly the ramp (face index 2), the only geometry actually visible from that side");
+        Check(grid.GetFaceColor(wedgeCell, 2, false) != CellColor.Pack(Colors.Green),
+            "the FullCoverage back face (Z-) is untouched by painting the ramp - no more \"paints every similar surface\"");
+
+        // Тот же экземпляр, но клик по левому борту (X-, своя осеориентированная грань формы, не откат на рампу) -
+        // другой цвет, другой индекс: оба точечных цвета должны сосуществовать, не перезаписывая друг друга.
+        camera.LookAtPoint(new Vector3(-5f, 0.125f, 0.125f), new Vector3(0.125f, 0.125f, 0.125f)); // смотрим вдоль +X
+        await Frames(editor, 2);
+        var wedgeLeft = Screen(new Vector3(0f, 0.125f, 0.125f));
+        await Move(editor, wedgeLeft);
+        Check(editor.Hover.IsBlock && editor.Hover.BlockCell == wedgeCell && editor.Hover.Normal == Vector3I.Left,
+            "paint-region setup: looking along +X hits the Wedge's X- bounding-cube side (its own left triangular bort)",
+            $"{editor.Hover}");
+
+        state.PaintColor = Colors.Blue;
+        await Click(editor, wedgeLeft, MouseButton.Left);
+        Check(wedgeInstance!.RegionColors!.TryGetValue(3, out uint bortColor) && bortColor == CellColor.Pack(Colors.Blue),
+            "painting the X- side (its own left bort, face index 3) paints exactly that region");
+        Check(wedgeInstance.RegionColors.TryGetValue(2, out uint rampStillGreen) && rampStillGreen == CellColor.Pack(Colors.Green),
+            "...without touching the ramp painted a moment ago (both region overrides coexist side by side)");
+        Check(wedgeInstance.Color == CellColor.Pack(Colors.Gray), "...and still without touching the instance's representative Color");
+
+        state.Tool = ToolMode.None;
+        editor.World.Construction.Clear();
+        camera.LookAtPoint(new Vector3(1.5f, 2f, 2.5f), new Vector3(0.125f, 0.0f, 0.125f));
+        await Frames(editor, 2);
+        state.SelectedSlot = 0;
+
+        // Перетаскивание инструмента с зажатой ЛКМ: три блока в ряд, «проедания насквозь» без движения мыши нет.
         DemoBuilds.Fill(grid, new Vector3I(0, 0, 0), new Vector3I(2, 0, 0), Block);
         DemoBuilds.Fill(grid, new Vector3I(0, 0, 1), new Vector3I(2, 0, 1), Block);
         camera.LookAtPoint(new Vector3(0.4f, 2.5f, 2.0f), new Vector3(0.4f, 0.0f, 0.2f));
@@ -1183,17 +1528,17 @@ public sealed class SelfTest
         state.PaintColor = Colors.Blue;
         state.Tool = ToolMode.Paint;
         await Move(editor, p0);
-        Send(new InputEventMouseButton { ButtonIndex = MouseButton.Right, Pressed = true, Position = p0, GlobalPosition = p0 });
+        Send(new InputEventMouseButton { ButtonIndex = MouseButton.Left, Pressed = true, Position = p0, GlobalPosition = p0 });
         await Frames(editor, 1);
         await Move(editor, p1);
         await Move(editor, p2);
-        Send(new InputEventMouseButton { ButtonIndex = MouseButton.Right, Pressed = false, Position = p2, GlobalPosition = p2 });
+        Send(new InputEventMouseButton { ButtonIndex = MouseButton.Left, Pressed = false, Position = p2, GlobalPosition = p2 });
         await Frames(editor, 2);
         uint blue = CellColor.Pack(Colors.Blue);
         // TopOf наводит на верхнюю (Y+) грань каждого блока - по грани красится именно она.
         Check(grid.GetFaceColor(new Vector3I(0, 0, 0), 1, true) == blue && grid.GetFaceColor(new Vector3I(1, 0, 0), 1, true) == blue
               && grid.GetFaceColor(new Vector3I(2, 0, 0), 1, true) == blue,
-            "holding RMB and dragging paints the top face of every block passed over");
+            "holding LMB with Paint active drags the paint across every block passed over");
         Check(grid.GetFaceColor(new Vector3I(1, 0, 1), 1, true) != blue, "drag painting does not touch blocks that were not under the cursor");
 
         int before = grid.BlockCount;

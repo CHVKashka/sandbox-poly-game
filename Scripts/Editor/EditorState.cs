@@ -4,9 +4,12 @@ using SandboxPolyGame.Blocks;
 
 namespace SandboxPolyGame.Editor;
 
-/// <summary>Инструмент, действующий на ПКМ. Установка блока (ЛКМ) работает всегда независимо от инструмента.
+/// <summary>Инструмент, действующий на ЛКМ (см. <c>Editor.BuildEditor.ButtonFor</c>) — Delete и Paint делят эту
+/// кнопку, не конфликтуя, потому что активен максимум один из них разом. Пока активен любой из них, обычная
+/// установка блока по ЛКМ выключена (см. <c>Editor.BuildEditor</c> <c>_UnhandledInput</c>/<c>UpdateCursorVisuals</c>).
 /// Resize сюда не входит: он не действует на уже поставленные блоки, а настраивает размер ПРИЗРАКА (см.
-/// <see cref="EditorState.PendingSize"/>/<see cref="EditorState.ResizePanelOpen"/>), поэтому не занимает ПКМ.</summary>
+/// <see cref="EditorState.PendingSize"/>/<see cref="EditorState.ResizePanelOpen"/>), поэтому кнопку мыши не занимает
+/// вообще.</summary>
 public enum ToolMode
 {
     None,

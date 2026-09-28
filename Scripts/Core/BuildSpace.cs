@@ -12,9 +12,23 @@ public static class BuildSpace
     public const int ChunkMask = ChunkSize - 1;
     public const int ChunkVolume = ChunkSize * ChunkSize * ChunkSize;
 
-    /// <summary>Допустимая область построек (включительно), в клетках: 64 м x 64 м x 64 м.</summary>
-    public static readonly Vector3I MinCell = new(-128, -64, -128);
-    public static readonly Vector3I MaxCell = new(127, 191, 127);
+    /// <summary>
+    /// Допустимая область построек (включительно), в клетках — симметрична относительно центра мира (0,0,0) по
+    /// каждой оси: влево/вправо (X) и вверх/вниз (Y) по 25 м от центра, вперёд/назад (Z) по 50 м от центра
+    /// (см. <see cref="Editor.BuildEditor"/> — там же граница области отрисовывается пунктирной линией). Центральная
+    /// клетка (0,0,0) занимает угол [0,0,0]..[0.25,0.25,0.25] м — ровно с ней граничит начало координат, поэтому
+    /// "центром" считается именно клетка (0,0,0) (см. <see cref="Editor.BuildEditor"/>, корневой блок редактора).
+    /// Не const (в отличие от <see cref="CellSize"/>) — предполагается, что позже область сможет меняться в
+    /// процессе игры (растущий мир и т.п.), тогда это станет обычным изменяемым состоянием; весь остальной код
+    /// читает границы отсюда, а не хранит собственные копии чисел, так что готов к этому уже сейчас.
+    /// </summary>
+    private const float SideHalfExtentMeters = 25f;
+    private const float ForwardHalfExtentMeters = 50f;
+
+    public static readonly Vector3I MinCell = new(
+        -(int)(SideHalfExtentMeters / CellSize), -(int)(SideHalfExtentMeters / CellSize), -(int)(ForwardHalfExtentMeters / CellSize));
+    public static readonly Vector3I MaxCell = new(
+        (int)(SideHalfExtentMeters / CellSize) - 1, (int)(SideHalfExtentMeters / CellSize) - 1, (int)(ForwardHalfExtentMeters / CellSize) - 1);
 
     public static bool InBounds(Vector3I c) =>
         c.X >= MinCell.X && c.X <= MaxCell.X &&
@@ -23,6 +37,12 @@ public static class BuildSpace
 
     /// <summary>Мировая позиция минимального угла клетки.</summary>
     public static Vector3 CellMin(Vector3I c) => new Vector3(c.X, c.Y, c.Z) * CellSize;
+
+    /// <summary>Мировые координаты минимального/максимального угла ВСЕЙ области построек (внешние грани клеток
+    /// <see cref="MinCell"/>/<see cref="MaxCell"/>) — используется для отрисовки её границы, см.
+    /// <see cref="Editor.BuildEditor"/>.</summary>
+    public static Vector3 WorldMin => CellMin(MinCell);
+    public static Vector3 WorldMax => CellMin(MaxCell + Vector3I.One);
 
     public static Vector3 CellCenter(Vector3I c) =>
         (new Vector3(c.X, c.Y, c.Z) + new Vector3(0.5f, 0.5f, 0.5f)) * CellSize;

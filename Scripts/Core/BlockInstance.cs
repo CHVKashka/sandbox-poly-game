@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using Godot;
 
 namespace SandboxPolyGame.Core;
@@ -40,4 +41,15 @@ public sealed class BlockInstance
 
     /// <summary>Включительный максимальный угол занимаемой области.</summary>
     public Vector3I MaxCell => Origin + Size - Vector3I.One;
+
+    /// <summary>
+    /// Точечная покраска отдельных наклонных/треугольных граней не-кубической формы (см.
+    /// <see cref="Construction.PaintRegion"/>/<see cref="ShapeMeshBuilder.TryFindPaintRegion"/>) — ключ: индекс
+    /// грани в массиве <c>faces</c> у <see cref="BlockGeometry"/> (стабилен независимо от поворота/отражения/
+    /// размера), значение: упакованный цвет (см. <see cref="CellColor"/>). null или отсутствие ключа — грань красится
+    /// в общий <see cref="Color"/> экземпляра. Не персистентно (как и поклеточная покраска граней куба, см.
+    /// <see cref="ConstructionIO"/>) — Save/Load в JSON хранит только <see cref="Color"/>; Ctrl+Z/Ctrl+Y это видят
+    /// (см. <c>Editor.UndoHistory</c>).
+    /// </summary>
+    public Dictionary<int, uint>? RegionColors { get; set; }
 }

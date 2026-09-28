@@ -4,6 +4,8 @@
 
   Uses YOUR double-precision export templates from the custom engine build (see Docs/01-engine-build.md).
   The export preset is generated here (export_presets.cfg contains machine-specific paths and is not committed).
+  The engine is located automatically (same search as run.bat/test.bat - see find-godot-engine.ps1);
+  pass -GodotSrc or set GODOT_SRC only if you need to override the auto-detected one.
 
   Run from anywhere:
     powershell -ExecutionPolicy Bypass -File Tools\export-windows.ps1
@@ -12,13 +14,19 @@
   Result: Builds\Windows\sandbox-poly-game.exe (+ sandbox-poly-game.pck and the data_sandbox-poly-game_windows_x86_64 folder - keep them together).
 #>
 param(
-    [string]$GodotSrc = $(if ($env:GODOT_SRC) { $env:GODOT_SRC } else { "D:\Programs\Godot-4.6.3-double" }),
+    [string]$GodotSrc,
     [ValidateSet("release", "debug")]
     [string]$Config = "release"
 )
 
 $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
+
+if (-not $GodotSrc) {
+    $GodotSrc = & (Join-Path $PSScriptRoot "find-godot-engine.ps1")
+    if (-not $GodotSrc) { throw "Could not locate the custom double-precision Godot engine. Build it per Docs/01-engine-build.md, or pass -GodotSrc / set GODOT_SRC." }
+}
+
 $bin = Join-Path $GodotSrc "bin"
 $editor = Join-Path $bin "godot.windows.editor.double.x86_64.mono.console.exe"
 $templateRelease = Join-Path $bin "godot.windows.template_release.double.x86_64.mono.exe"

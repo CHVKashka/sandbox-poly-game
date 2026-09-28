@@ -8,8 +8,8 @@ namespace SandboxPolyGame.Editor.Ui;
 /// <summary>
 /// Тулбар справа: перекраска (с палитрой, см. ниже), удаление, размер следующего ставящегося блока (Resize, панель
 /// с полями X/Y/Z), каркас (Wireframe) и границы блоков (Borders), сохранение/загрузка постройки. Paint/Delete —
-/// взаимоисключающие инструменты; какая кнопка мыши их применяет, см. <c>BuildEditor.ButtonFor</c> (Delete — ЛКМ,
-/// Paint — ПКМ; пока активен любой из них, ЛКМ не ставит блок и призрак скрыт). Resize/Wireframe/Borders —
+/// взаимоисключающие инструменты, оба на ЛКМ (см. <c>BuildEditor.ButtonFor</c> — не конфликтуют, т.к. активен
+/// максимум один; пока активен любой из них, ЛКМ не ставит блок и призрак скрыт). Resize/Wireframe/Borders —
 /// независимые переключатели, не занимают ни одну кнопку мыши (Resize настраивает ПРИЗРАК —
 /// <see cref="EditorState.PendingSize"/> — а не уже поставленные блоки). У каждой кнопки-переключателя есть
 /// кружок-индикатор в углу, показывающий, что она включена.
@@ -86,7 +86,7 @@ internal sealed class ToolbarUi
         _paintPanel.Visible = false;
 
         _paint = UiStyle.MakeButton("Paint", new Vector2(168, 38), toggle: true);
-        _paint.TooltipText = "RMB: paint the block under the cursor with the selected color";
+        _paint.TooltipText = "LMB: paint the face under the cursor with the selected color";
         _paintDot = UiStyle.AddActiveIndicator(_paint);
         _paint.Toggled += on =>
         {
@@ -145,7 +145,7 @@ internal sealed class ToolbarUi
         column.AddChild(load);
 
         column.AddChild(new HSeparator());
-        column.AddChild(UiStyle.MakeLabel("LMB - place block (or Delete)\nRMB - paint", 12, UiStyle.TextDim));
+        column.AddChild(UiStyle.MakeLabel("LMB - place block\n(or Delete/Paint when active)", 12, UiStyle.TextDim));
 
         layerRoot.AddChild(margin);
         Refresh();

@@ -22,5 +22,8 @@ Builds/
 export_presets.cfg
 export_credentials.cfg
 
+# Кэш пути к движку (генерируется Tools/find-godot-engine.ps1, свой на каждой машине)
+.godot-engine-path.txt
+
 # Скриншоты/дампы диагностики
 *.dmp

@@ -14,4 +14,5 @@ if errorlevel 1 (
 
 echo.
 echo Build OK.
+pause
 exit /b 0

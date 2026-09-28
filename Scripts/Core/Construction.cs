@@ -65,13 +65,13 @@ public sealed class Construction
             if (!BuildSpace.InBounds(cell) || Grid.IsSolid(cell)) return null;
         }
 
-        byte faceMask = FullCoverageMask(definition, rotationSteps, mirror);
+        byte instanceMask = FullCoverageMask(definition, rotationSteps, mirror);
         _nextId++;
         _instances[instance.InstanceId] = instance;
         foreach (var cell in cells)
         {
             _owner[cell] = instance.InstanceId;
-            Grid.TrySet(cell, definition.RuntimeId, instance.Color, faceMask);
+            Grid.TrySet(cell, definition.RuntimeId, instance.Color, BoundaryFaceMask(instanceMask, cell, instance.Origin, instance.MaxCell));
         }
 
         Changed?.Invoke();
@@ -91,6 +91,35 @@ public sealed class Construction
         return ShapeMeshBuilder.FullCoverageMask(building.Shape, rotationSteps, mirror);
     }
 
+    /// <summary>
+    /// <paramref name="instanceMask"/> описывает, какие стороны ЕДИНИЧНОЙ формы блока закрыты целиком (см.
+    /// <see cref="FullCoverageMask"/>) — это относится к форме САМОЙ ПО СЕБЕ, а не к конкретной клетке внутри
+    /// растянутого Resize'ом многоклеточного экземпляра. Клетка ВНУТРИ такого экземпляра (не на границе его
+    /// bounding box вдоль соответствующей оси) на самом деле ни с какой стороны не "заканчивается" — с этой стороны
+    /// у неё точно такой же сосед из ТОГО ЖЕ экземпляра, поэтому включать туда бит нельзя: у формы направленный
+    /// только в одну сторону (например, только Y- у Wedge, но не Y+), два таких соседа НЕ гасят друг друга взаимно
+    /// (в отличие от куба, у которого закрыты сразу обе стороны каждой оси) — <see cref="ChunkMesher"/> решил бы,
+    /// что внутренняя клетка "закрывает" сторону, которой сосед не противопоставляет встречный бит, и нарисовал бы
+    /// ложную, торчащую наружу внутреннюю стену прямо посреди фигуры (на каждой внутренней границе клеток вдоль этой
+    /// оси - тем заметнее, чем крупнее Resize). Поэтому бит направления оставляем только на КРАЙНЕМ слое клеток
+    /// экземпляра вдоль этой оси/стороны (сравнение с <paramref name="origin"/>/<paramref name="maxCell"/>) — ровно
+    /// там, где эта сторона формы действительно является внешней гранью всей постройки, а не внутренним стыком.
+    /// Для куба (маска 0b111111, обе стороны каждой оси) это ничего не меняет: соседняя клетка ТОГО ЖЕ экземпляра
+    /// по-прежнему взаимно гасит грань как раньше — просто через отсутствие встречного бита с обеих сторон
+    /// одновременно, а не через явное закрытие с обеих; итоговый видимый меш идентичен.
+    /// </summary>
+    private static byte BoundaryFaceMask(byte instanceMask, Vector3I cell, Vector3I origin, Vector3I maxCell)
+    {
+        byte mask = 0;
+        if ((instanceMask & (1 << 0)) != 0 && cell.X == origin.X) mask |= 1 << 0; // X-
+        if ((instanceMask & (1 << 1)) != 0 && cell.X == maxCell.X) mask |= 1 << 1; // X+
+        if ((instanceMask & (1 << 2)) != 0 && cell.Y == origin.Y) mask |= 1 << 2; // Y-
+        if ((instanceMask & (1 << 3)) != 0 && cell.Y == maxCell.Y) mask |= 1 << 3; // Y+
+        if ((instanceMask & (1 << 4)) != 0 && cell.Z == origin.Z) mask |= 1 << 4; // Z-
+        if ((instanceMask & (1 << 5)) != 0 && cell.Z == maxCell.Z) mask |= 1 << 5; // Z+
+        return mask;
+    }
+
     public bool Remove(BlockInstance instance)
     {
         if (!_instances.Remove(instance.InstanceId)) return false;
@@ -105,16 +134,46 @@ public sealed class Construction
         return true;
     }
 
+    /// <summary>Красит ВЕСЬ экземпляр целиком в один цвет — сбрасывает и представительный <see cref="BlockInstance.Color"/>
+    /// (влияет на все FullCoverage-грани его клеток в <see cref="VoxelGrid"/>), и любую точечную покраску отдельных
+    /// наклонных/треугольных граней (<see cref="BlockInstance.RegionColors"/>, см. <see cref="PaintRegion"/>) —
+    /// иначе "перекрасить целиком" не выглядело бы таковым, если старые точечные правки продолжали бы проступать.</summary>
     public bool Paint(BlockInstance instance, Color color)
     {
         uint packed = CellColor.Pack(color);
-        if (instance.Color == packed) return false;
+        bool hadRegionColors = instance.RegionColors is { Count: > 0 };
+        if (instance.Color == packed && !hadRegionColors) return false;
 
         instance.Color = packed;
+        instance.RegionColors = null;
         foreach (var cell in CellsOf(instance)) Grid.TryPaint(cell, packed);
         Changed?.Invoke();
         return true;
     }
+
+    /// <summary>
+    /// Красит РОВНО одну наклонную/треугольную грань не-кубической формы (см. <see cref="ShapeMeshBuilder.TryFindPaintRegion"/>
+    /// про то, как определяется <paramref name="regionIndex"/> по попаданию луча), не весь экземпляр — см.
+    /// <see cref="BlockInstance.RegionColors"/>. Не трогает <see cref="VoxelGrid"/> (эти грани рисует не
+    /// <see cref="ChunkMesher"/>, а <see cref="ShapeMeshBuilder"/> напрямую для каждого экземпляра, см.
+    /// <c>Editor.ShapeInstanceView</c>) — только событие <see cref="Changed"/>, на которое та и подписана.
+    /// </summary>
+    public bool PaintRegion(BlockInstance instance, int regionIndex, Color color)
+    {
+        uint packed = CellColor.Pack(color);
+        instance.RegionColors ??= new Dictionary<int, uint>();
+        if (instance.RegionColors.TryGetValue(regionIndex, out uint existing) && existing == packed) return false;
+
+        instance.RegionColors[regionIndex] = packed;
+        Changed?.Invoke();
+        return true;
+    }
+
+    /// <summary>Принудительно поднимает <see cref="Changed"/> без изменения состояния — нужно
+    /// <c>Editor.UndoHistory</c> после того, как оно восстановило <see cref="BlockInstance.RegionColors"/> напрямую
+    /// (в отличие от поклеточной покраски граней куба, это состояние самого <see cref="Construction"/>, а не
+    /// <see cref="VoxelGrid"/>, поэтому не поднимает <see cref="VoxelGrid.CellChanged"/> само по себе).</summary>
+    public void NotifyChanged() => Changed?.Invoke();
 
     /// <summary>
     /// Задаёт новый размер блока. Origin никогда не двигается — блок всегда растёт/сжимается от своего origin
@@ -152,13 +211,16 @@ public sealed class Construction
             Grid.TryRemove(cell);
         }
 
-        byte faceMask = FullCoverageMask(definition, instance.RotationSteps, instance.Mirror);
+        byte instanceMask = FullCoverageMask(definition, instance.RotationSteps, instance.Mirror);
         instance.Size = newSize;
+        // Растущему экземпляру нужно пересчитать маску не только у НОВЫХ клеток, но и у уже стоявших вдоль границы -
+        // клетка, которая раньше была крайней (несла бит FullCoverage), могла стать внутренней после роста в ту же
+        // сторону (см. BoundaryFaceMask), и наоборот при сжатии. Проще всего пройтись по всем клеткам финального
+        // размера разом.
         foreach (var cell in newCells)
         {
-            if (oldCells.Contains(cell)) continue;
             _owner[cell] = instance.InstanceId;
-            Grid.TrySet(cell, definition.RuntimeId, instance.Color, faceMask);
+            Grid.TrySet(cell, definition.RuntimeId, instance.Color, BoundaryFaceMask(instanceMask, cell, instance.Origin, instance.MaxCell));
         }
 
         Changed?.Invoke();

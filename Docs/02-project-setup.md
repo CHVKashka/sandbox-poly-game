@@ -4,9 +4,17 @@
 
 В корне репозитория — готовые скрипты (двойной клик или из `cmd`/PowerShell), оборачивающие команды из этого
 документа. Все сами вызывают `dotnet build` перед запуском/тестами, чтобы не ловить `Cannot instantiate C# script`
-после чистки `.godot`/`obj`/`bin` (см. «Заметки по окружению» ниже). Движок по умолчанию ищут в
-`D:\Programs\Godot-4.6.3-double` — другой путь задаётся переменной окружения `GODOT_SRC` перед запуском
-(`set GODOT_SRC=D:\Godot\godot-src && run.bat`).
+после чистки `.godot`/`obj`/`bin` (см. «Заметки по окружению» ниже).
+
+Движок ищется **автоматически**, без правки скриптов и без переменных окружения — `run.bat`/`test.bat`/`edit.bat`/
+`export.bat` вызывают `Tools\find-godot-engine.ps1`, который проверяет по очереди: `GODOT_SRC` (если задана и
+движок там реально есть) → кэш из прошлого успешного поиска (`.godot-engine-path.txt` в корне репозитория, в
+`.gitignore`, свой на каждой машине) → список типичных путей (`C:\Godot\godot-src`, `D:\Godot\godot-src` и т.п.) →
+полное сканирование локальных дисков как крайний случай (медленно, но результат кэшируется, так что происходит
+один раз на машину). Если движок не собран или лежит в нестандартном месте и сканирование его не находит —
+скрипт выведет ошибку с указанием на [01-engine-build.md](01-engine-build.md). Задать путь вручную (например,
+если на машине несколько сборок движка) по-прежнему можно через `GODOT_SRC`:
+`set GODOT_SRC=D:\Godot\godot-src && run.bat`.
 
 | Скрипт | Действие |
 |---|---|
@@ -21,7 +29,7 @@
 ```
 sandbox-poly-game/
 ├─ project.godot            настройки проекта (главная сцена, окно 1600x900, MSAA 2x, метка Double Precision)
-├─ sandbox-poly-game.csproj / .sln   C#-проект (Godot.NET.Sdk 4.6.3, net8.0, GodotFloat64=true)
+├─ sandbox-poly-game.csproj / .sln   C#-проект (Godot.NET.Sdk 4.7.2, net8.0, GodotFloat64=true)
 ├─ nuget.config             привязка пакетов Godot* к локальному источнику GodotDouble (см. ниже)
 ├─ build.bat / run.bat / edit.bat / test.bat / export.bat   быстрый старт (см. выше)
 ├─ blocks/                  data-driven описания блоков, по одному XML-файлу на блок (см. 03)
@@ -32,7 +40,7 @@ sandbox-poly-game/
 │  ├─ Core/                 логика без сцены: сетка клеток, чанки, меширование, каркас, рейкаст, постройка (Construction)
 │  ├─ Editor/               узлы и UI редактора: BuildEditor, FlyCamera, VoxelWorld, EditorState, Ui/*
 │  └─ Dev/                  инструменты разработчика: самотесты, скриншот-харнесс, демо-постройки
-├─ Shaders/build_grid.gdshader   шейдер сетки на земле
+├─ Shaders/work_area_boundary.gdshader   шейдер пунктирной границы области построек
 ├─ Tools/export-windows.ps1 экспорт игры в отдельный exe (см. ниже)
 ├─ Docs/                    эта документация
 └─ .gitignore, .gitattributes
@@ -44,7 +52,7 @@ sandbox-poly-game/
 ## C#-проект
 
 `sandbox-poly-game.csproj`:
-- `Sdk="Godot.NET.Sdk/4.6.3"` — версия должна совпадать с версией движка.
+- `Sdk="Godot.NET.Sdk/4.7.2"` — версия должна совпадать с версией движка.
 - `AssemblyName = sandbox-poly-game` — совпадает с `[dotnet] project/assembly_name` в `project.godot`.
 - `GodotFloat64 = true` — определяет константу `GODOT_REAL_T_IS_DOUBLE`; редактор Godot передаёт это сам, свойство
   в csproj нужно, чтобы **сборка из командной строки** (`dotnet build`) была согласована с double-движком.
@@ -54,14 +62,14 @@ sandbox-poly-game/
 
 ### NuGet и «двойные» пакеты (важно)
 
-`GodotSharp`, `Godot.SourceGenerators`, `Godot.NET.Sdk` версии `4.6.3` есть на nuget.org, но **официальные — float**.
+`GodotSharp`, `Godot.SourceGenerators`, `Godot.NET.Sdk` версии `4.7.2` есть на nuget.org, но **официальные — float**.
 Проект обязан компилироваться против **своих** пакетов из `<GODOT_SRC>\bin\GodotSharp\Tools\nupkgs`
 (собираются `build_assemblies.py --precision=double`, см. [01](01-engine-build.md)). Для этого:
 
 1. На устройстве один раз: `dotnet nuget add source <GODOT_SRC>\bin\GodotSharp\Tools\nupkgs --name GodotDouble`.
 2. `nuget.config` в корне репозитория (`packageSourceMapping`) заставляет брать `Godot*` только из `GodotDouble`.
 
-Проверка (на этой машине выполнена): SHA256 `%USERPROFILE%\.nuget\packages\godotsharp\4.6.3\lib\net8.0\GodotSharp.dll`
+Проверка (на этой машине выполнена): SHA256 `%USERPROFILE%\.nuget\packages\godotsharp\4.7.2\lib\net8.0\GodotSharp.dll`
 = SHA256 `<GODOT_SRC>\bin\GodotSharp\Api\Release\GodotSharp.dll`.
 Если после пересборки движка проект ведёт себя странно — удалить `%USERPROFILE%\.nuget\packages\godot*` и пересобрать.
 
@@ -92,7 +100,7 @@ dotnet build sandbox-poly-game.csproj                              # напря�
 ```powershell
 export.bat                       # release (обёртка над Tools\export-windows.ps1, см. «Быстрый старт» выше)
 export.bat -Config debug
-export.bat -GodotSrc D:\Godot\godot-src   # если движок не в D:\Programs\Godot-4.6.3-double (или задать переменную GODOT_SRC)
+export.bat -GodotSrc D:\Godot\godot-src   # только если нужно переопределить автоматически найденный движок
 
 # то же самое напрямую, без обёртки:
 powershell -ExecutionPolicy Bypass -File Tools\export-windows.ps1              # release

@@ -18,8 +18,9 @@ namespace SandboxPolyGame.Editor;
 /// поле <c>Color</c>) — точечная покраска ГРАНЕЙ (<see cref="VoxelGrid.TryPaintFace"/>) в него не попадает, а
 /// перестройка постройки через <see cref="ConstructionIO.Deserialize"/> заново красит все 6 граней каждой клетки
 /// в этот представительный цвет. Поэтому снэпшот здесь — не просто JSON, а <see cref="Snapshot"/> (JSON + отдельный
-/// дамп per-face цветов всех клеток, принадлежащих экземплярам Construction) — иначе Undo/Redo стирали бы точечную
-/// покраску граней. Клетки, залитые в обход Construction (см. <c>Dev.DemoBuilds</c>), этим не покрыты — как и
+/// дамп per-face цветов всех клеток, принадлежащих экземплярам Construction, + дамп точечной покраски наклонных/
+/// треугольных граней не-кубических форм, см. <see cref="BlockInstance.RegionColors"/>) — иначе Undo/Redo стирали бы
+/// точечную покраску. Клетки, залитые в обход Construction (см. <c>Dev.DemoBuilds</c>), этим не покрыты — как и
 /// раньше, история вообще не знает про них.
 /// </summary>
 public sealed class UndoHistory
@@ -27,9 +28,9 @@ public sealed class UndoHistory
     private const int MaxDepth = 100;
 
     /// <summary>Состояние постройки на момент снятия снэпшота: <see cref="Json"/> — экземпляры (см.
-    /// <see cref="ConstructionIO.Serialize"/>), <see cref="Faces"/> — per-face цвета их клеток (см.
-    /// <see cref="UndoHistory"/> class doc).</summary>
-    public readonly record struct Snapshot(string Json, string Faces);
+    /// <see cref="ConstructionIO.Serialize"/>), <see cref="Faces"/> — per-face цвета их клеток, <see cref="Regions"/> —
+    /// точечная покраска наклонных/треугольных граней не-кубических форм (см. <see cref="UndoHistory"/> class doc).</summary>
+    public readonly record struct Snapshot(string Json, string Faces, string Regions);
 
     private readonly List<Snapshot> _undoStack = new();
     private readonly List<Snapshot> _redoStack = new();
@@ -37,9 +38,10 @@ public sealed class UndoHistory
     public bool CanUndo => _undoStack.Count > 0;
     public bool CanRedo => _redoStack.Count > 0;
 
-    /// <summary>Снимает снэпшот текущего состояния постройки (JSON + per-face цвета) — вызывается ДО действия;
-    /// результат передаётся в <see cref="RecordIfChanged"/> ПОСЛЕ него.</summary>
-    public Snapshot Capture(Construction construction) => new(ConstructionIO.Serialize(construction), SerializeFaceColors(construction));
+    /// <summary>Снимает снэпшот текущего состояния постройки (JSON + per-face цвета + точечная покраска граней форм) —
+    /// вызывается ДО действия; результат передаётся в <see cref="RecordIfChanged"/> ПОСЛЕ него.</summary>
+    public Snapshot Capture(Construction construction) =>
+        new(ConstructionIO.Serialize(construction), SerializeFaceColors(construction), SerializeRegionColors(construction));
 
     /// <summary>
     /// Если состояние правда изменилось с момента <paramref name="before"/> (иначе это была бы пустая запись в
@@ -50,7 +52,7 @@ public sealed class UndoHistory
     public void RecordIfChanged(Snapshot before, Construction construction)
     {
         var current = Capture(construction);
-        if (before.Json == current.Json && before.Faces == current.Faces) return;
+        if (before.Json == current.Json && before.Faces == current.Faces && before.Regions == current.Regions) return;
 
         _undoStack.Add(before);
         if (_undoStack.Count > MaxDepth) _undoStack.RemoveAt(0);
@@ -87,6 +89,8 @@ public sealed class UndoHistory
     {
         ConstructionIO.Deserialize(construction, snapshot.Json, catalog);
         RestoreFaceColors(construction, snapshot.Faces);
+        RestoreRegionColors(construction, snapshot.Regions);
+        construction.NotifyChanged(); // RegionColors — состояние Construction, не VoxelGrid, само по себе рендер не поднимает
     }
 
     /// <summary>Дамп per-face цветов (см. class doc) — по строке на клетку, принадлежащую экземпляру Construction:
@@ -125,6 +129,60 @@ public sealed class UndoHistory
             {
                 grid.TryPaintFace(cell, f / 2, f % 2 == 1, uint.Parse(colors[f]));
             }
+        }
+    }
+
+    /// <summary>Дамп точечной покраски наклонных/треугольных граней форм (см. <see cref="BlockInstance.RegionColors"/>) —
+    /// по строке на экземпляр, у которого она есть: <c>ox,oy,oz:faceIndex=color,faceIndex=color;</c>. Ключ —
+    /// Origin экземпляра, а не <see cref="BlockInstance.InstanceId"/> — id не переживает
+    /// <see cref="ConstructionIO.Deserialize"/> (он строит экземпляры заново, с новыми id по порядку), а Origin
+    /// однозначно определяет экземпляр (клетка может принадлежать только одному) и остаётся тем же после
+    /// сериализации/десериализации.</summary>
+    private static string SerializeRegionColors(Construction construction)
+    {
+        var sb = new StringBuilder();
+        foreach (var instance in construction.Instances)
+        {
+            if (instance.RegionColors is not { Count: > 0 } regions) continue;
+
+            var o = instance.Origin;
+            sb.Append(o.X).Append(',').Append(o.Y).Append(',').Append(o.Z).Append(':');
+            bool first = true;
+            foreach (var (faceIndex, color) in regions)
+            {
+                if (!first) sb.Append(',');
+                sb.Append(faceIndex).Append('=').Append(color);
+                first = false;
+            }
+
+            sb.Append(';');
+        }
+
+        return sb.ToString();
+    }
+
+    private static void RestoreRegionColors(Construction construction, string dump)
+    {
+        if (dump.Length == 0) return;
+
+        var byOrigin = new Dictionary<Vector3I, BlockInstance>();
+        foreach (var instance in construction.Instances) byOrigin[instance.Origin] = instance;
+
+        foreach (var entry in dump.Split(';', StringSplitOptions.RemoveEmptyEntries))
+        {
+            int colon = entry.IndexOf(':');
+            var coords = entry[..colon].Split(',');
+            var origin = new Vector3I(int.Parse(coords[0]), int.Parse(coords[1]), int.Parse(coords[2]));
+            if (!byOrigin.TryGetValue(origin, out var instance)) continue;
+
+            var regions = new Dictionary<int, uint>();
+            foreach (var pair in entry[(colon + 1)..].Split(',', StringSplitOptions.RemoveEmptyEntries))
+            {
+                int eq = pair.IndexOf('=');
+                regions[int.Parse(pair[..eq])] = uint.Parse(pair[(eq + 1)..]);
+            }
+
+            instance.RegionColors = regions;
         }
     }
 }
