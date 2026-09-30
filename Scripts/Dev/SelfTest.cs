@@ -6,6 +6,7 @@ using Godot;
 using SandboxPolyGame.Blocks;
 using SandboxPolyGame.Core;
 using SandboxPolyGame.Editor;
+using SandboxPolyGame.World;
 
 namespace SandboxPolyGame.Dev;
 
@@ -51,7 +52,13 @@ public sealed class SelfTest
         test.RunPaintRegionTests();
         test.RunConstructionTests();
         test.RunUndoHistoryTests();
+        await test.RunNetworkingTests(editor);
+        await test.RunPlayerAndWorldTests(editor);
         await test.RunEditorTests(editor);
+        // Обязательно ПОСЛЕДним - реально трогает SceneTree.Multiplayer (Core.NetHub.Host), см. class doc про то,
+        // что "отключение" оставляет NetHub.LocalPeerId нерабочим до конца процесса (не наша логика - особенность
+        // движка, см. RunHostedWorldPlayerTest) - ни один тест после него не должен полагаться на Multiplayer.
+        await test.RunHostedWorldPlayerTest(editor);
 
         GD.Print($"=== self-test finished: {test._passed} passed, {test._failed} failed ===");
         editor.GetTree().Quit(test._failed == 0 ? 0 : 1);
@@ -913,6 +920,64 @@ public sealed class SelfTest
         Check(n != null && n!.Mirror == new Vector3I(1, 0, 1), "Place: stores the given mirror flags on the new instance");
 
         RunSaveLoadTests(catalog, block, wedge, pyramid);
+        RunConstructionStorageTests(block);
+    }
+
+    /// <summary>
+    /// Именованные сохранения (<see cref="ConstructionStorage"/>, см. Docs/05-world-and-vehicle-systems.md) — не
+    /// произвольный путь через FileDialog, а метаданные (имя/описание/даты) + автоматический путь в настоящей папке
+    /// "Документы" ОС. Пишет и удаляет ровно один реальный тестовый файл там же, где будут лежать настоящие
+    /// сохранения игрока (тот же путь кода) — имя специально узнаваемое (<c>__selftest_storage__</c>), чтобы не
+    /// перепутать с сохранением игрока, и подчищается в конце независимо от результата проверок выше.
+    /// </summary>
+    private void RunConstructionStorageTests(BlockDefinition block)
+    {
+        GD.Print("-- construction storage: named saves with metadata (name/description/dates), auto-managed paths");
+
+        Check(ConstructionStorage.SanitizeFileName("My Boat!") == "My Boat",
+            "SanitizeFileName keeps letters/digits/space/-/_, strips characters unsafe for a file name");
+        Check(ConstructionStorage.SanitizeFileName("???") == "construction",
+            "SanitizeFileName falls back to a default name when nothing safe is left");
+
+        Check(DirAccess.DirExistsAbsolute(ConstructionStorage.Directory), "Directory exists (auto-created) after being accessed");
+
+        const string testName = "__selftest_storage__";
+        string path = ConstructionStorage.ResolveNewPath(testName);
+        // На случай, если прошлый прогон упал до очистки в конце - не даём этому тесту зависеть от состояния диска.
+        if (FileAccess.FileExists(path)) DirAccess.RemoveAbsolute(path);
+        path = ConstructionStorage.ResolveNewPath(testName);
+
+        try
+        {
+            var construction = new Construction(new VoxelGrid());
+            construction.Place(Vector3I.Zero, block, block.DefaultColor);
+
+            var errorA = ConstructionStorage.Save(construction, path, testName, "first description");
+            Check(errorA == Error.Ok && FileAccess.FileExists(path), "Save writes a JSON file at the resolved path");
+
+            var metaA = ConstructionIO.ReadMetadata(FileAccess.GetFileAsString(path));
+            Check(metaA.Name == testName && metaA.Description == "first description"
+                  && !string.IsNullOrEmpty(metaA.CreatedUtc) && metaA.CreatedUtc == metaA.ModifiedUtc,
+                "first save: name/description stored, createdUtc == modifiedUtc", $"{metaA}");
+
+            var errorB = ConstructionStorage.Save(construction, path, testName, "updated description");
+            var metaB = ConstructionIO.ReadMetadata(FileAccess.GetFileAsString(path));
+            Check(errorB == Error.Ok && metaB.CreatedUtc == metaA.CreatedUtc,
+                "re-saving the same path preserves the original createdUtc (only modifiedUtc/description change)");
+            Check(metaB.Description == "updated description", "re-saving updates the description");
+
+            var found = ConstructionStorage.List().FirstOrDefault(c => c.Path == path);
+            Check(found.Path == path && found.Name == testName, "List() finds the saved construction by name/path", $"{found}");
+
+            string collidingPath = ConstructionStorage.ResolveNewPath(testName);
+            Check(collidingPath != path && !FileAccess.FileExists(collidingPath),
+                "ResolveNewPath avoids colliding with an existing file of the same sanitized name",
+                $"{collidingPath}");
+        }
+        finally
+        {
+            if (FileAccess.FileExists(path)) DirAccess.RemoveAbsolute(path);
+        }
     }
 
     private void RunSaveLoadTests(BlockCatalog catalog, BlockDefinition block, BlockDefinition wedge, BlockDefinition pyramid)
@@ -1033,6 +1098,328 @@ public sealed class SelfTest
             "Redo re-applies the region color override");
     }
 
+    // ================================================================== сеть (мультиплеер)
+
+    /// <summary>
+    /// Мультиплеер (см. Docs/05-world-and-vehicle-systems.md, «Мультиплеер», <see cref="NetHub"/>) — НЕ сквозной
+    /// тест двух игроков (для этого нужны два реальных процесса игры, что этот харнесс не умеет — см. class doc
+    /// <see cref="NetHub"/> про то, что именно поэтому это требует ручной проверки пользователем). Вместо этого
+    /// несколько независимых, но каждая по-настоящему работающих проверок: (1) <see cref="NetEditOps.Apply"/> —
+    /// ровно тот код, которым и сервер, и каждый клиент применяют одну и ту же правку (все 6 видов, включая полную
+    /// покраску по грани/региону — паритет с одиночным редактированием, см. 05); (2) <see cref="UndoHistory"/> с
+    /// авторством записей — правило "откатить можно только своё последнее действие, пока никто другой не построил
+    /// поверх" (см. 05), полностью тестируется без единого сетевого вызова (авторы — просто разные <c>long</c> id, не
+    /// настоящие peer); (3) настоящее ENet-рукопожатие сервер+клиент по локальной петле — не через <c>NetHub</c>/
+    /// <c>SceneTree.Multiplayer</c> (тот один на дерево, а тут нужны сразу два конца), а два независимых "сырых"
+    /// <see cref="ENetMultiplayerPeer"/> — подтверждает, что модуль ENet не вырезан из сборки движка (открытый
+    /// вопрос, отмеченный в доке при проектировании мультиплеера), не рискуя задеть единственный реальный
+    /// <see cref="MultiplayerApi"/> сцены.
+    /// </summary>
+    private async Task RunNetworkingTests(BuildEditor host)
+    {
+        GD.Print("-- networking: shared-edit application logic (NetEditOps), shared undo authorship, real ENet loopback handshake");
+
+        RunNetEditOpsTests();
+        RunSharedUndoAuthorshipTests();
+        await RunEnetLoopbackTest(host);
+    }
+
+    /// <summary>
+    /// Диагностика бага, найденного пользователем: "на хосте, даже без подключённых клиентов, не появляется
+    /// 'Press E' у верстака". Реально переводит <see cref="NetHub"/> в сетевой режим — настоящий
+    /// <see cref="ENetMultiplayerPeer.CreateServer"/> на СЕАНСОВЫЙ <c>SceneTree.Multiplayer</c>, не отдельный "сырой"
+    /// peer, как в <see cref="RunEnetLoopbackTest"/> — тут важно воспроизвести именно то, что видит настоящий
+    /// <see cref="World.GameWorld"/>. Затем собирает тестовый <see cref="World.GameWorld"/> той же техникой, что и
+    /// <see cref="RunPlayerAndWorldTests"/> (поверх дерева <paramref name="host"/>, не как главная сцена — самой
+    /// <see cref="World.Ui.NetworkLobbyUi"/> это не касается, она показывается только для настоящей главной сцены).
+    /// Ноль подключённых клиентов - ровно сценарий "хост открыл игру и пока один".
+    /// <para/>
+    /// <b>Обязательно ПОСЛЕДНИЙ тест во всём прогоне</b> (см. вызов в <see cref="RunAsync"/>) — реально трогает
+    /// <c>SceneTree.Multiplayer</c> вызовом <see cref="NetHub.Host"/>, и "отключение" в конце
+    /// (<see cref="NetHub.Disconnect"/>) оставляет движковый <c>get_unique_id()</c> нерабочим до конца процесса
+    /// (проверено: `Multiplayer.MultiplayerPeer = null` после того, как peer уже был назначен хоть раз, — это НЕ то
+    /// же самое, что "peer никогда не назначался" — судя по всему, `SceneTree` держит какой-то ненулевой peer по
+    /// умолчанию, пока его не тронули явно, а вот после явного сброса в null это скрытое умолчание не
+    /// восстанавливается; движковая ошибка "No multiplayer peer is assigned" в консоли — это оно). Ни один тест
+    /// ПОСЛЕ этого не должен полагаться на <c>Node.IsMultiplayerAuthority</c>/<c>Multiplayer.GetUniqueId</c>.
+    /// </summary>
+    private async Task RunHostedWorldPlayerTest(BuildEditor host)
+    {
+        GD.Print("-- networking: hosted GameWorld spawns a local player for the host with zero clients connected");
+
+        var hostErr = NetHub.Instance.Host(37999);
+        Check(hostErr == Error.Ok, "NetHub.Host succeeds (sets up the 'host, zero clients connected' scenario)");
+
+        var world = new GameWorld { Name = "SelfTestHostedWorld" };
+        host.AddChild(world);
+        await Frames(host, 10);
+
+        Check(world.Player != null, "hosting a networked game (even with zero connected clients) still spawns a local Player for the host");
+        Player? firstPlayerNode = world.Player;
+        if (world.Player != null)
+        {
+            Check(world.Player.Camera != null && world.Player.Camera.Current,
+                "the host's own player camera is the active one in a networked game (not stuck non-authoritative)");
+            Check(world.Workbenches.Count == 3, "the hosted world still builds its 3 workbenches (world building isn't networked/gated)");
+        }
+
+        // Регрессия на баг, найденный пользователем: раньше игроки жили ПОД GameWorld - когда хост (сервер, значит
+        // авторитативен над самим существованием этих узлов) входил в свой редактор, его собственная пересборка
+        // сцены попутно уничтожала ВСЕХ реплицированных игроков у ВСЕХ клиентов разом (серый экран,
+        // ObjectDisposedException у остальных). Симулируем ровно этот переход - GameWorld этого же пира
+        // освобождается и пересобирается заново (как при возврате из BuildEditor), NetHub переживает это как
+        // автозагрузка (см. её EnsurePlayerReplication class doc). Заодно симулируем то, что реально делает
+        // GameWorld.EnterEditor перед уходом (SetActive(false) + спрятать PlayersRoot - см. её же баг "в редакторе
+        // отображается персонаж хоста"), чтобы проверить, что возврат в мир корректно отменяет оба эффекта.
+        firstPlayerNode?.SetActive(false);
+        if (NetHub.Instance.PlayersRoot != null) NetHub.Instance.PlayersRoot.Visible = false;
+
+        world.QueueFree();
+        await Frames(host, 1);
+
+        var world2 = new GameWorld { Name = "SelfTestHostedWorld2" };
+        host.AddChild(world2);
+        await Frames(host, 3);
+
+        Check(world2.Player == firstPlayerNode,
+            "returning to the networked world (same peer, e.g. after entering/exiting the editor) reconnects to the SAME persistent player node, not a fresh one");
+        Check(firstPlayerNode != null && GodotObject.IsInstanceValid(firstPlayerNode),
+            "...and that node is still valid - NOT freed by the first GameWorld's own teardown (this was the actual crash for other players)");
+        Check(firstPlayerNode != null && firstPlayerNode.IsProcessing() && firstPlayerNode.IsPhysicsProcessing(),
+            "...and processing is (re)enabled on return (Player.SetActive) - not left paused after simulating an editor visit");
+        Check(NetHub.Instance.PlayersRoot is { Visible: true },
+            "...and PlayersRoot is visible again on return (was hidden to simulate the editor visit) - other players no longer bleed into whatever scene isn't GameWorld");
+        Check(firstPlayerNode != null && firstPlayerNode.Camera.Current,
+            "...and the player's camera is re-activated as current (the editor's own camera would have taken over and then been freed with its scene)");
+
+        world2.QueueFree();
+        await Frames(host, 1);
+        host.EditorCamera.Current = true; // тестовый мир выше забрал "текущую" камеру вьюпорта - вернуть редакторскую
+        NetHub.Instance.Disconnect(); // см. doc выше - безопасно только потому, что это последний тест в прогоне
+
+        // Регрессия на баг, найденный пользователем: "Couldn't create an ENet host" при повторном Host() после
+        // Exit to menu - Disconnect() раньше только обнулял ссылку на peer, не закрывая её явно, из-за чего
+        // нижележащий ENet-сокет (UDP-порт) мог остаться занятым. Тот же порт, что и выше - если он не освободился,
+        // повторный Host() тут же это подтвердит.
+        var rehostErr = NetHub.Instance.Host(37999);
+        Check(rehostErr == Error.Ok, "hosting again on the same port right after Disconnect() succeeds - the previous ENet peer released the port (Disconnect calls Close(), not just clears the reference)");
+        NetHub.Instance.Disconnect();
+    }
+
+    private void RunNetEditOpsTests()
+    {
+        var construction = new Construction(new VoxelGrid());
+
+        bool placedRoot = NetEditOps.Apply(construction, NetEditKind.Place, Vector3I.Zero, Vector3I.One, "block", Colors.White, Vector3I.Zero, Vector3I.Zero);
+        Check(placedRoot, "NetEditOps.Place places the first block when the grid is empty");
+        Check(construction.Grid.IsSolid(Vector3I.Zero), "...and the grid actually reflects it");
+
+        bool placedAdjacent = NetEditOps.Apply(construction, NetEditKind.Place, new Vector3I(1, 0, 0), Vector3I.One, "block", Colors.White, Vector3I.Zero, Vector3I.Zero);
+        Check(placedAdjacent, "NetEditOps.Place accepts a block touching an existing one");
+
+        bool placedFarAway = NetEditOps.Apply(construction, NetEditKind.Place, new Vector3I(5, 5, 5), Vector3I.One, "block", Colors.White, Vector3I.Zero, Vector3I.Zero);
+        Check(!placedFarAway, "NetEditOps.Place rejects a block touching nothing - same adjacency rule as solo editing (PlacementRules)");
+
+        bool placedUnknownSlug = NetEditOps.Apply(construction, NetEditKind.Place, new Vector3I(2, 0, 0), Vector3I.One, "not-a-real-slug", Colors.White, Vector3I.Zero, Vector3I.Zero);
+        Check(!placedUnknownSlug, "NetEditOps.Place rejects an unknown block slug");
+
+        // PaintInstance - весь экземпляр целиком (кубу принадлежит клетка (0,0,0), поставленная выше).
+        bool paintedInstance = NetEditOps.Apply(construction, NetEditKind.PaintInstance, Vector3I.Zero, Vector3I.One, "", Colors.Red, Vector3I.Zero, Vector3I.Zero);
+        Check(paintedInstance, "NetEditOps.PaintInstance recolors the owned instance at that cell");
+        Check(construction.GetOwner(Vector3I.Zero)?.Color == CellColor.Pack(Colors.Red), "...and the instance's own representative color actually changed");
+
+        // PaintFace - ровно одна грань решётки (кубы FullCoverage на всех 6 сторонах - берём X+, axis=0, positive=true).
+        bool paintedFace = NetEditOps.Apply(construction, NetEditKind.PaintFace, Vector3I.Zero, Vector3I.One, "", Colors.Blue, Vector3I.Zero, Vector3I.Zero, extraInt: 0, extraBool: true);
+        Check(paintedFace, "NetEditOps.PaintFace paints exactly one grid face");
+        Check(construction.Grid.GetFaceColor(Vector3I.Zero, 0, true) == CellColor.Pack(Colors.Blue), "...that face is now blue");
+        Check(construction.Grid.GetFaceColor(Vector3I.Zero, 0, false) == CellColor.Pack(Colors.Red), "...the opposite face (X-) is untouched - still the whole-instance red from PaintInstance above");
+
+        // PaintCell - голая клетка решётки, залитая в обход Construction (как Dev.DemoBuilds) - PaintInstance/PaintRegion
+        // работают только через владеющий экземпляр, PaintCell - единственный вид, который красит такую клетку.
+        var bareCell = new Vector3I(20, 0, 0);
+        construction.Grid.TrySet(bareCell, Block, CellColor.Pack(Colors.White));
+        bool paintedBareCell = NetEditOps.Apply(construction, NetEditKind.PaintCell, bareCell, Vector3I.One, "", Colors.Green, Vector3I.Zero, Vector3I.Zero);
+        Check(paintedBareCell, "NetEditOps.PaintCell paints a bare grid cell with no owning Construction instance");
+        Check(construction.Grid.GetColor(bareCell) == CellColor.Pack(Colors.Green), "...its color actually changed");
+
+        bool paintedEmptyCell = NetEditOps.Apply(construction, NetEditKind.PaintCell, new Vector3I(9, 9, 9), Vector3I.One, "", Colors.Blue, Vector3I.Zero, Vector3I.Zero);
+        Check(!paintedEmptyCell, "NetEditOps.PaintCell on a genuinely empty (never placed/filled) cell is a no-op (false)");
+
+        // PaintRegion - наклонная/треугольная грань не-кубической формы (Wedge, регион 2 = рампа, см. RunPaintRegionTests).
+        if (BlockCatalog.Instance.TryGetBySlug("wedge", out var wedgeDef))
+        {
+            var wedgeCell = new Vector3I(0, 0, 5);
+            construction.PlaceBlock(wedgeCell, Vector3I.One, wedgeDef, Colors.White);
+            bool paintedRegion = NetEditOps.Apply(construction, NetEditKind.PaintRegion, wedgeCell, Vector3I.One, "", Colors.Yellow, Vector3I.Zero, Vector3I.Zero, extraInt: 2);
+            Check(paintedRegion, "NetEditOps.PaintRegion paints a Wedge's ramp region (index 2)");
+            Check(construction.GetOwner(wedgeCell)?.RegionColors?.GetValueOrDefault(2) == CellColor.Pack(Colors.Yellow), "...the region color is recorded on the instance");
+        }
+        else
+        {
+            Check(false, "NetEditOps setup: 'wedge' slug resolves (needed for the PaintRegion test)");
+        }
+
+        bool removed = NetEditOps.Apply(construction, NetEditKind.Remove, new Vector3I(1, 0, 0), Vector3I.One, "", Colors.White, Vector3I.Zero, Vector3I.Zero);
+        Check(removed, "NetEditOps.Remove clears the instance owning that cell");
+        Check(!construction.Grid.IsSolid(new Vector3I(1, 0, 0)), "...and the grid cell is actually empty again");
+    }
+
+    /// <summary>
+    /// Общая на сессию <see cref="UndoHistory"/> с авторством записей (см. class doc) — правило "откатить можно
+    /// только своё последнее действие, и только пока сверху никто другой не построил" (выбранный вариант, см.
+    /// Docs/05-world-and-vehicle-systems.md, «Мультиплеер»). Полностью логика, без единого сетевого вызова: авторы
+    /// (peer A = 100, peer B = 200) - просто разные <c>long</c>, ровно так же сервер (<c>NetHub.ServerApplyEdit</c>)
+    /// передаёт настоящий <c>Multiplayer.GetRemoteSenderId()</c>.
+    /// </summary>
+    private void RunSharedUndoAuthorshipTests()
+    {
+        const long peerA = 100, peerB = 200;
+        var construction = new Construction(new VoxelGrid());
+        var catalog = BlockCatalog.Instance;
+        var history = new UndoHistory();
+
+        Check(history.PeekUndoAuthor == null && history.PeekRedoAuthor == null, "fresh shared history has no undo/redo author");
+
+        // Peer A ставит блок.
+        var beforeA = history.Capture(construction);
+        NetEditOps.Apply(construction, NetEditKind.Place, Vector3I.Zero, Vector3I.One, "block", Colors.White, Vector3I.Zero, Vector3I.Zero);
+        history.RecordIfChanged(beforeA, construction, peerA);
+        Check(history.PeekUndoAuthor == peerA, "the top undo entry is authored by whoever just acted (peer A)");
+
+        // Peer B ставит блок поверх - теперь верхняя запись должна принадлежать B, а не A.
+        var beforeB = history.Capture(construction);
+        NetEditOps.Apply(construction, NetEditKind.Place, new Vector3I(1, 0, 0), Vector3I.One, "block", Colors.White, Vector3I.Zero, Vector3I.Zero);
+        history.RecordIfChanged(beforeB, construction, peerB);
+        Check(history.PeekUndoAuthor == peerB, "after peer B acts, the top undo entry is now B's, not A's");
+
+        // Peer A пытается откатить - НЕ должно сработать (сервер отказал бы: PeekUndoAuthor != peerA), правило
+        // проверяется ДО вызова Undo (см. NetHub.ServerUndo), поэтому здесь просто проверяем сам признак отказа.
+        Check(history.PeekUndoAuthor != peerA, "peer A's own request would be rejected - the tip belongs to B, not A (server checks PeekUndoAuthor before calling Undo)");
+
+        // Peer B (настоящий автор верхней записи) откатывает - должно сработать.
+        Check(history.PeekUndoAuthor == peerB && history.Undo(construction, catalog), "peer B (the real author of the tip) can undo it");
+        Check(!construction.Grid.IsSolid(new Vector3I(1, 0, 0)), "...and B's block is actually gone again");
+        Check(history.PeekUndoAuthor == peerA, "the tip is now A's placement - A could undo next, back to an empty grid");
+
+        // После отмены B верхняя запись redo-стека тоже должна принадлежать B (переживает того же автора).
+        Check(history.PeekRedoAuthor == peerB, "the redo entry produced by undoing B's action is still tagged as B's");
+        Check(history.Redo(construction, catalog), "peer B can redo their own undone action");
+        Check(construction.Grid.IsSolid(new Vector3I(1, 0, 0)), "...and B's block is back");
+
+        // Новое действие (A ставит ещё один блок) обрывает redo-ветку целиком, как и в одиночной истории.
+        var beforeA2 = history.Capture(construction);
+        NetEditOps.Apply(construction, NetEditKind.Place, new Vector3I(2, 0, 0), Vector3I.One, "block", Colors.White, Vector3I.Zero, Vector3I.Zero);
+        history.RecordIfChanged(beforeA2, construction, peerA);
+        Check(history.PeekRedoAuthor == null, "a new action clears the redo stack (and its authorship with it)");
+
+        // Одиночная игра (без authorId) - поведение не меняется: Undo/Redo безусловны, PeekUndoAuthor всегда null.
+        var soloConstruction = new Construction(new VoxelGrid());
+        var soloHistory = new UndoHistory();
+        var beforeSolo = soloHistory.Capture(soloConstruction);
+        NetEditOps.Apply(soloConstruction, NetEditKind.Place, Vector3I.Zero, Vector3I.One, "block", Colors.White, Vector3I.Zero, Vector3I.Zero);
+        soloHistory.RecordIfChanged(beforeSolo, soloConstruction); // без authorId - как в Editor.BuildEditor
+        Check(soloHistory.PeekUndoAuthor == null, "solo editing never tags an author - RecordIfChanged without authorId");
+        Check(soloHistory.Undo(soloConstruction, catalog), "solo Undo is unconditional regardless of PeekUndoAuthor");
+    }
+
+    private async Task RunEnetLoopbackTest(Node host)
+    {
+        const int port = 27099; // маловероятно занят чем-то ещё на машине разработчика
+        var server = new ENetMultiplayerPeer();
+        var client = new ENetMultiplayerPeer();
+        try
+        {
+            Error serverErr = server.CreateServer(port, 1);
+            Error clientErr = client.CreateClient("127.0.0.1", port);
+            Check(serverErr == Error.Ok && clientErr == Error.Ok,
+                "ENetMultiplayerPeer.CreateServer/CreateClient both succeed (this engine build has NOT stripped the ENet module)",
+                $"server={serverErr} client={clientErr}");
+
+            bool connected = false;
+            for (int i = 0; i < 120 && !connected; i++)
+            {
+                server.Poll();
+                client.Poll();
+                connected = client.GetConnectionStatus() == MultiplayerPeer.ConnectionStatus.Connected;
+                if (!connected) await Frames(host, 1);
+            }
+
+            Check(connected, "a real ENet client completes a loopback handshake with a real ENet server within 120 frames");
+        }
+        finally
+        {
+            client.Close();
+            server.Close();
+        }
+    }
+
+    // ================================================================== открытый мир: игрок, террейн-заглушка
+
+    /// <summary>
+    /// Заготовка на время прототипа (см. Docs/05-world-and-vehicle-systems.md) — плоская плитка 25×25 м + игрок от
+    /// первого лица, без входа в редактор и без спавна построек (это отдельные, ещё не сделанные шаги). Сначала
+    /// чистая логика движения (не требует сцены), потом сборка <see cref="GameWorld"/> целиком поверх дерева
+    /// <paramref name="editor"/> (та же техника, что и остальные интеграционные тесты ниже — сцена не обязана быть
+    /// главной, чтобы её можно было собрать и проверить).
+    /// </summary>
+    private async Task RunPlayerAndWorldTests(BuildEditor editor)
+    {
+        GD.Print("-- open world: movement math, flat terrain tile placeholder, basic scene wiring");
+
+        Check(Player.ComputeWalkVelocity(Vector2.Zero, 0, 5) == Vector3.Zero, "no input -> zero velocity");
+
+        var forward = Player.ComputeWalkVelocity(new Vector2(0, -1), 0, 5);
+        Check(forward.DistanceTo(new Vector3(0, 0, -5)) < 1e-4, "W at yaw 0 moves along -Z (forward)", $"{forward}");
+
+        var right = Player.ComputeWalkVelocity(new Vector2(1, 0), 0, 5);
+        Check(right.DistanceTo(new Vector3(5, 0, 0)) < 1e-4, "D at yaw 0 moves along +X (right)", $"{right}");
+
+        var diagonal = Player.ComputeWalkVelocity(new Vector2(1, -1), 0, 5);
+        Check(Math.Abs(diagonal.Length() - 5) < 1e-4,
+            "diagonal input (W+D together) is normalized first - same speed as a single direction, not faster",
+            $"{diagonal}");
+
+        var turned = Player.ComputeWalkVelocity(new Vector2(0, -1), Math.PI / 2, 5);
+        Check(turned.DistanceTo(new Vector3(-5, 0, 0)) < 1e-4,
+            "W at yaw +90 degrees follows the body's turned forward direction, not the original -Z",
+            $"{turned}");
+
+        // GameWorld собирает террейн-плитку, верстаки+зоны спавна и игрока сама в _Ready - никакой отдельной
+        // "инициализации" не нужно.
+        var world = new GameWorld { Name = "SelfTestWorld" };
+        editor.AddChild(world);
+        await Frames(editor, 2);
+
+        Check(world.Terrain != null && world.Terrain.Size == GameWorld.TileSize,
+            "GameWorld builds a terrain tile placeholder on _Ready", $"size={world.Terrain?.Size}");
+        Check(world.Terrain!.GetNodeOrNull("Collision") is CollisionShape3D, "the terrain tile has a collision shape (not visual-only)");
+        Check(world.Player != null, "GameWorld spawns a player on _Ready");
+        Check(world.Player!.Camera != null && world.Player.Camera.Current, "the player's first-person camera is the active one");
+
+        // Три пары верстак+зона спавна (большая/средняя/маленькая, см. задачу) - структура, не интерактивность
+        // (наведение взглядом/E/R/F1 не проверены самотестами - требуют настоящего рейкаста по физике в сцене,
+        // которая тут живёт только пару кадров ради проверки, см. Docs/05-world-and-vehicle-systems.md).
+        Check(world.Workbenches.Count == 3, "GameWorld builds 3 workbench+spawn-area pairs (large/medium/small)", $"count={world.Workbenches.Count}");
+        var large = world.Workbenches.FirstOrDefault(w => w.Name == "WorkbenchLarge");
+        var medium = world.Workbenches.FirstOrDefault(w => w.Name == "WorkbenchMedium");
+        var small = world.Workbenches.FirstOrDefault(w => w.Name == "WorkbenchSmall");
+        Check(large != null && medium != null && small != null, "all three workbenches are present by name");
+        Check(large?.SpawnArea != null && medium?.SpawnArea != null && small?.SpawnArea != null,
+            "every workbench has a linked SpawnArea (many workbenches CAN share one area, but each has at least its own)");
+        Check(large != null && medium != null && small != null
+              && Mathf.IsEqualApprox(large.SpawnArea.Size, 16f)
+              && Mathf.IsEqualApprox(medium.SpawnArea.Size, 8f)
+              && Mathf.IsEqualApprox(small.SpawnArea.Size, 4f),
+            "spawn area sizes follow large / half (medium) / quarter (small)",
+            $"{large?.SpawnArea.Size}/{medium?.SpawnArea.Size}/{small?.SpawnArea.Size}");
+        Check(large?.GetNodeOrNull("Collision") is CollisionShape3D,
+            "a workbench has a collision shape (needed for look-based interaction - see GameWorld.RaycastFromCamera)");
+
+        world.QueueFree();
+        await Frames(editor, 1);
+        editor.EditorCamera.Current = true; // world.Player.Camera выше отобрал "текущую" камеру вьюпорта - вернуть редакторскую
+    }
+
     // ================================================================== интеграция: реальный ввод
 
     private static void Send(InputEvent e) => Input.ParseInputEvent(e);
@@ -1149,6 +1536,22 @@ public sealed class SelfTest
         await Click(editor, Screen(TopOf(new Vector3I(0, 2, 0))), MouseButton.Right);
         Check(grid.BlockCount == 3, "RMB with no tool selected does nothing");
 
+        // Соседство (BuildEditor.CanPlaceFootprint/TouchesExistingBlock): непустая постройка - блок ставится только
+        // рядом с уже стоящим, ровно гранью - даже клетка по диагонали через угол (0 общих граней с постройкой,
+        // хотя и касается по ребру/углу) не считается. Постройка сейчас занимает (0,0,0)/(0,1,0)/(0,2,0).
+        int blocksBeforeAdjacency = grid.BlockCount;
+        var diagonalGround = Screen(new Vector3(0.375f, 0f, 0.375f)); // клетка (1,0,1) - по диагонали от (0,0,0)
+        await Move(editor, diagonalGround);
+        Check(editor.Hover.Found && !editor.Hover.IsBlock && editor.Hover.PlaceCell == new Vector3I(1, 0, 1),
+            "adjacency setup: hovering a ground cell diagonal to the build (shares no face with it)", $"{editor.Hover}");
+        Check(!editor.Ghost.Visible, "placement ghost is hidden over a cell that only touches diagonally, not face-to-face");
+        await Click(editor, diagonalGround, MouseButton.Left);
+        Check(grid.BlockCount == blocksBeforeAdjacency,
+            "LMB over a cell touching the build only diagonally places nothing",
+            $"blocks={grid.BlockCount}");
+        // Соседство лицом-к-лицу по-прежнему работает как раньше - следующий блок теста (клик по верху (0,2,0))
+        // это же и демонстрирует.
+
         // 3. Инструменты тулбара: и Paint, и Delete — на ЛКМ (см. BuildEditor.ButtonFor); не конфликтуют, т.к.
         // взаимоисключающие режимы. ПКМ инструментам не назначена вообще. Цель - свежий обычный куб (не только что
         // поставленный на (0,2,0) InvertedPyramid - у него "верх" не FullCoverage, эта механика отдельно проверена
@@ -1230,18 +1633,26 @@ public sealed class SelfTest
 
         state.Borders = true;
 
-        // 2. Хотбар: клавиши 1-9, колесо, Tab.
+        // 2. Хотбар: клавиши 1-9, Tab. Колесо мыши больше не листает хотбар - зумит камеру (см.
+        // BuildEditor._UnhandledInput/FlyCamera.Zoom).
         await PressKey(editor, Godot.Key.Key3);
         Check(state.SelectedSlot == 2, "key 3 selects hotbar slot 3");
+
+        var zoomStart = camera.GlobalPosition;
+        var zoomForward = -camera.GlobalTransform.Basis.Z;
+        Send(new InputEventMouseButton { ButtonIndex = MouseButton.WheelUp, Pressed = true, Position = new Vector2(400, 300) });
+        await Frames(editor, 2);
+        Check(state.SelectedSlot == 2, "mouse wheel no longer changes the hotbar slot");
+        var afterZoomIn = camera.GlobalPosition;
+        Check(afterZoomIn.DistanceTo(zoomStart) > 0.01 && (afterZoomIn - zoomStart).Normalized().Dot(zoomForward) > 0.99,
+            "mouse wheel up zooms the camera in (moves forward along its view direction)", $"{zoomStart} -> {afterZoomIn}");
+
+        Send(new InputEventMouseButton { ButtonIndex = MouseButton.WheelDown, Pressed = true, Position = new Vector2(400, 300) });
         Send(new InputEventMouseButton { ButtonIndex = MouseButton.WheelDown, Pressed = true, Position = new Vector2(400, 300) });
         await Frames(editor, 2);
-        Check(state.SelectedSlot == 3, "mouse wheel down selects the next slot");
-        Send(new InputEventMouseButton { ButtonIndex = MouseButton.WheelUp, Pressed = true, Position = new Vector2(400, 300) });
-        Send(new InputEventMouseButton { ButtonIndex = MouseButton.WheelUp, Pressed = true, Position = new Vector2(400, 300) });
-        Send(new InputEventMouseButton { ButtonIndex = MouseButton.WheelUp, Pressed = true, Position = new Vector2(400, 300) });
-        Send(new InputEventMouseButton { ButtonIndex = MouseButton.WheelUp, Pressed = true, Position = new Vector2(400, 300) });
-        await Frames(editor, 2);
-        Check(state.SelectedSlot == 8, "mouse wheel wraps around the hotbar (slot 4 -> 4 steps back -> slot 9)");
+        var afterZoomOut = camera.GlobalPosition;
+        Check(afterZoomOut.DistanceTo(afterZoomIn) > 0.01 && (afterZoomOut - afterZoomIn).Normalized().Dot(zoomForward) < -0.99,
+            "mouse wheel down zooms the camera back out (moves backward)", $"{afterZoomIn} -> {afterZoomOut}");
 
         int blocksBefore = grid.BlockCount;
         await PressKey(editor, Godot.Key.Tab);
@@ -1613,6 +2024,53 @@ public sealed class SelfTest
         Check(grid.BlockCount == 3, "Ctrl+Z undoes a whole LMB (Delete) drag stroke in one step, not per cell", $"blocks={grid.BlockCount}");
         state.Tool = ToolMode.None;
         editor.World.Construction.Clear();
+
+        // Диалог сохранения (кнопка Save на тулбаре, см. Ui.SaveDialogUi/Core.ConstructionStorage): имя/описание,
+        // Done сохраняет с метаданными под автоматическим путём (не FileDialog, как раньше), Escape/Cancel закрывает
+        // без сохранения, горячие клавиши редактора не срабатывают, пока диалог открыт (иначе, например, "1" в
+        // названии заодно переключал бы слот хотбара — см. фикс в BuildEditor.HandleKey). Само превью (PNG) не
+        // проверяем — требует нескольких реально отрисованных кадров, ненадёжно в этом headless-окружении разработки
+        // (см. class doc ConstructionPreviewRenderer); проверяется только то, что запись файла с метаданными и
+        // блокировка ввода работают.
+        editor.World.Construction.Place(new Vector3I(0, 0, 0), BlockCatalog.Instance.Get("block"), Colors.White);
+        var saveButton = FindButton("Save...");
+        Check(saveButton != null, "toolbar: Save button exists");
+        await Click(editor, CenterOf(saveButton!), MouseButton.Left);
+        Check(editor.Ui.SaveDialogOpen, "clicking Save opens the save dialog");
+
+        state.SelectedSlot = 3;
+        Send(new InputEventKey { PhysicalKeycode = Godot.Key.Key1, Keycode = Godot.Key.Key1, Pressed = true });
+        await Frames(editor, 1);
+        Check(state.SelectedSlot == 3,
+            "pressing '1' while the save dialog is open does not change the hotbar slot (would otherwise fight with typing a name)");
+
+        Send(new InputEventKey { PhysicalKeycode = Godot.Key.Escape, Keycode = Godot.Key.Escape, Pressed = true });
+        await Frames(editor, 1);
+        Check(!editor.Ui.SaveDialogOpen, "Escape closes the save dialog without saving (like Cancel)");
+
+        await Click(editor, CenterOf(saveButton!), MouseButton.Left);
+        var nameField = editor.GetTree().Root.FindChildren("*", "LineEdit", true, false)
+            .OfType<LineEdit>().First(f => f.IsVisibleInTree() && f.PlaceholderText == "My Boat");
+        var descriptionField = editor.GetTree().Root.FindChildren("*", "TextEdit", true, false)
+            .OfType<TextEdit>().First(f => f.IsVisibleInTree());
+        var doneButton = FindButtons(editor).Find(b => b.Text == "Done");
+        Check(doneButton != null, "save dialog: Done button exists");
+
+        const string testVehicleName = "__selftest_vehicle__";
+        nameField.Text = "";
+        await Click(editor, CenterOf(doneButton!), MouseButton.Left);
+        Check(editor.Ui.SaveDialogOpen, "Done with an empty name does not close the dialog (a name is required)");
+
+        nameField.Text = testVehicleName;
+        descriptionField.Text = "a self-test vehicle";
+        await Click(editor, CenterOf(doneButton!), MouseButton.Left);
+        Check(!editor.Ui.SaveDialogOpen, "Done with a name closes the dialog");
+
+        var savedEntry = ConstructionStorage.List().FirstOrDefault(c => c.Name == testVehicleName);
+        Check(savedEntry.Path != null && FileAccess.FileExists(savedEntry.Path) && savedEntry.Description == "a self-test vehicle",
+            "Done writes a named save file with the entered name/description, discoverable via ConstructionStorage.List",
+            $"{savedEntry}");
+        if (savedEntry.Path != null) DirAccess.RemoveAbsolute(savedEntry.Path);
 
         // 1. Камера: WASD и поворот по СКМ.
         camera.LookAtPoint(new Vector3(1.5f, 2f, 2.5f), new Vector3(0.125f, 0.0f, 0.125f));

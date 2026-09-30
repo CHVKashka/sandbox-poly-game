@@ -57,6 +57,13 @@ internal sealed class ToolbarUi
     /// <summary>Нажата кнопка Load — открыть диалог выбора файла (см. <see cref="EditorUi"/>).</summary>
     public event Action? LoadRequested;
 
+    /// <summary>Нажата кнопка Exit — выйти из редактора обратно в мир БЕЗ спавна постройки (см. <see cref="EditorUi"/>).</summary>
+    public event Action? ExitRequested;
+
+    /// <summary>Нажата кнопка Spawn — посчитать параметры постройки и выйти в мир, поставив её у верстака физическим
+    /// телом (см. <see cref="EditorUi"/>).</summary>
+    public event Action? SpawnRequested;
+
     public Control Panel { get; }
 
     public ToolbarUi(Control layerRoot, EditorState state)
@@ -79,6 +86,21 @@ internal sealed class ToolbarUi
         var column = new VBoxContainer();
         column.AddThemeConstantOverride("separation", 8);
         panel.AddChild(column);
+
+        // Выход из редактора - наверху, отдельно от инструментов построения (см. EditorUi): Exit ничего не спавнит,
+        // Spawn считает параметры постройки (центр масс, коллизия) и материализует её у верстака физическим телом.
+        var sessionRow = UiStyle.Transparent(new HBoxContainer());
+        sessionRow.AddThemeConstantOverride("separation", 8);
+        var exit = UiStyle.MakeButton("Exit", new Vector2(78, 34));
+        exit.TooltipText = "Leave the editor without spawning the construction into the world";
+        exit.Pressed += () => ExitRequested?.Invoke();
+        sessionRow.AddChild(exit);
+        var spawn = UiStyle.MakeButton("Spawn", new Vector2(78, 34));
+        spawn.TooltipText = "Spawn this construction into the world as a physical vehicle and leave the editor";
+        spawn.Pressed += () => SpawnRequested?.Invoke();
+        sessionRow.AddChild(spawn);
+        column.AddChild(sessionRow);
+        column.AddChild(new HSeparator());
 
         column.AddChild(UiStyle.MakeLabel("Tools", 18));
 

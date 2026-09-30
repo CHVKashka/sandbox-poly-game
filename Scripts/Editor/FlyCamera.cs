@@ -15,6 +15,7 @@ public partial class FlyCamera : Camera3D
     public double FastMultiplier { get; set; } = 4.0;
     public double SlowMultiplier { get; set; } = 0.25;
     public double LookSensitivity { get; set; } = 0.0025;
+    public double ZoomStep { get; set; } = 0.6;
     public bool MovementEnabled { get; set; } = true;
 
     private double _yaw;
@@ -45,6 +46,12 @@ public partial class FlyCamera : Camera3D
     }
 
     private void ApplyRotation() => Rotation = new Vector3(_pitch, _yaw, 0);
+
+    /// <summary>Двигает камеру вдоль направления взгляда (вперёд — положительный <paramref name="steps"/>) — колесо
+    /// мыши в редакторе теперь зумит камеру этим методом, а не листает слоты хотбара (см. <c>BuildEditor</c>).
+    /// Не "настоящий" зум (не меняет FOV/перспективу) — обычное перемещение свободной камеры, тот же приём, что и
+    /// WASD, просто по колесу и с своим шагом на "щелчок".</summary>
+    public void Zoom(double steps) => GlobalPosition -= GlobalTransform.Basis.Z * (float)(steps * ZoomStep);
 
     public override void _Process(double delta)
     {

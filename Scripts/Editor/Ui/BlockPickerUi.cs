@@ -73,7 +73,7 @@ internal sealed class BlockPickerUi
     }
 
     public void Refresh() =>
-        _hint.Text = $"Click a block to put it into hotbar slot {_state.SelectedSlot + 1} (keys 1-9 or mouse wheel change the slot)";
+        _hint.Text = $"Click a block to put it into hotbar slot {_state.SelectedSlot + 1} (keys 1-9 change the slot)";
 
     private Control CreateCard(BlockDefinition def)
     {

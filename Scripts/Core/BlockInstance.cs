@@ -49,7 +49,7 @@ public sealed class BlockInstance
     /// размера), значение: упакованный цвет (см. <see cref="CellColor"/>). null или отсутствие ключа — грань красится
     /// в общий <see cref="Color"/> экземпляра. Не персистентно (как и поклеточная покраска граней куба, см.
     /// <see cref="ConstructionIO"/>) — Save/Load в JSON хранит только <see cref="Color"/>; Ctrl+Z/Ctrl+Y это видят
-    /// (см. <c>Editor.UndoHistory</c>).
+    /// (см. <c>UndoHistory</c>).
     /// </summary>
     public Dictionary<int, uint>? RegionColors { get; set; }
 }

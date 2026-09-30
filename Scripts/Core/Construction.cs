@@ -170,7 +170,7 @@ public sealed class Construction
     }
 
     /// <summary>Принудительно поднимает <see cref="Changed"/> без изменения состояния — нужно
-    /// <c>Editor.UndoHistory</c> после того, как оно восстановило <see cref="BlockInstance.RegionColors"/> напрямую
+    /// <c>UndoHistory</c> после того, как оно восстановило <see cref="BlockInstance.RegionColors"/> напрямую
     /// (в отличие от поклеточной покраски граней куба, это состояние самого <see cref="Construction"/>, а не
     /// <see cref="VoxelGrid"/>, поэтому не поднимает <see cref="VoxelGrid.CellChanged"/> само по себе).</summary>
     public void NotifyChanged() => Changed?.Invoke();
@@ -242,5 +242,26 @@ public sealed class Construction
         {
             yield return new Vector3I(x, y, z);
         }
+    }
+
+    /// <summary>
+    /// Минимальный/максимальный угол (включительно) всех клеток постройки разом — используется и превью-рендером
+    /// (<c>Editor.ConstructionPreviewRenderer</c>), и спавном физического тела (<c>World.VehicleSpawner</c>), чтобы
+    /// центрировать камеру/тело по фактическим границам постройки, а не по условному началу координат.
+    /// <see cref="Vector3I.Zero"/>/<see cref="Vector3I.Zero"/>, если постройка пуста.
+    /// </summary>
+    public (Vector3I Min, Vector3I Max) ComputeBounds()
+    {
+        if (_instances.Count == 0) return (Vector3I.Zero, Vector3I.Zero);
+
+        var min = new Vector3I(int.MaxValue, int.MaxValue, int.MaxValue);
+        var max = new Vector3I(int.MinValue, int.MinValue, int.MinValue);
+        foreach (var instance in _instances.Values)
+        {
+            min = new Vector3I(Math.Min(min.X, instance.Origin.X), Math.Min(min.Y, instance.Origin.Y), Math.Min(min.Z, instance.Origin.Z));
+            max = new Vector3I(Math.Max(max.X, instance.MaxCell.X), Math.Max(max.Y, instance.MaxCell.Y), Math.Max(max.Z, instance.MaxCell.Z));
+        }
+
+        return (min, max);
     }
 }

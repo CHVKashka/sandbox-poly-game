@@ -30,25 +30,45 @@ public static class ConstructionIO
     /// <code>
     /// {
     ///   "version": 1,
+    ///   "name": "My Boat",
+    ///   "description": "A small fishing boat",
+    ///   "createdUtc": "2026-09-29T12:00:00.0000000Z",
+    ///   "modifiedUtc": "2026-09-29T12:05:00.0000000Z",
     ///   "blocks": [
     ///     { "id": "wedge", "origin": [0, 0, 0], "size": [1, 1, 1], "color": "#808890", "rotation": [0, 1, 0], "mirror": [1, 0, 0] }
     ///   ]
     /// }
     /// </code>
     /// <c>id</c> — слаг блока (<see cref="BlockDefinition.Slug"/>), не числовой рантайм-id (он не стабилен между запусками).
-    /// <c>rotation</c>/<c>mirror</c> опциональны (по умолчанию [0,0,0]).
+    /// <c>rotation</c>/<c>mirror</c> опциональны (по умолчанию [0,0,0]). <c>name</c>/<c>description</c>/
+    /// <c>createdUtc</c>/<c>modifiedUtc</c> — метаданные именованного сохранения (см. <see cref="ConstructionStorage"/>),
+    /// тоже опциональны: отсутствуют у файлов, сохранённых через голый <see cref="Serialize(Construction)"/>
+    /// (в частности — снэпшоты <c>UndoHistory</c>, которым метаданные не нужны и не должны на них влиять).
     /// </summary>
     private sealed class Document
     {
         [JsonPropertyName("version")] public int Version { get; set; } = 1;
+        [JsonPropertyName("name")] public string? Name { get; set; }
+        [JsonPropertyName("description")] public string? Description { get; set; }
+        [JsonPropertyName("createdUtc")] public string? CreatedUtc { get; set; }
+        [JsonPropertyName("modifiedUtc")] public string? ModifiedUtc { get; set; }
         [JsonPropertyName("blocks")] public List<BlockEntry> Blocks { get; set; } = new();
     }
 
+    /// <summary>Метаданные именованного сохранения (см. <see cref="ReadMetadata"/>) — без блоков, дёшево читать для
+    /// списка построек на верстаке (см. <see cref="ConstructionStorage.List"/>).</summary>
+    public readonly record struct SaveMetadata(string? Name, string? Description, string? CreatedUtc, string? ModifiedUtc);
+
     private static readonly JsonSerializerOptions Options = new() { WriteIndented = true };
 
-    public static string Serialize(Construction construction)
+    /// <summary>Сериализация без метаданных — блоки только. Используется там, где имя/описание/даты не нужны и не
+    /// должны запоминаться (в первую очередь — снэпшоты <c>UndoHistory</c>); для именованных сохранений на
+    /// диск см. перегрузку с метаданными и/или <see cref="ConstructionStorage"/>.</summary>
+    public static string Serialize(Construction construction) => Serialize(construction, null, null, null, null);
+
+    public static string Serialize(Construction construction, string? name, string? description, string? createdUtc, string? modifiedUtc)
     {
-        var document = new Document();
+        var document = new Document { Name = name, Description = description, CreatedUtc = createdUtc, ModifiedUtc = modifiedUtc };
         foreach (var instance in construction.Instances)
         {
             document.Blocks.Add(new BlockEntry
@@ -63,6 +83,14 @@ public static class ConstructionIO
         }
 
         return JsonSerializer.Serialize(document, Options);
+    }
+
+    /// <summary>Читает только метаданные (имя/описание/даты), не трогая <see cref="Construction"/> — не нужно
+    /// разбирать/размещать блоки только чтобы показать файл в списке построек на верстаке.</summary>
+    public static SaveMetadata ReadMetadata(string json)
+    {
+        var document = JsonSerializer.Deserialize<Document>(json, Options) ?? new Document();
+        return new SaveMetadata(document.Name, document.Description, document.CreatedUtc, document.ModifiedUtc);
     }
 
     /// <summary>Полностью заменяет содержимое постройки данными из JSON. Неизвестные блоки/некорректные записи пропускаются.</summary>

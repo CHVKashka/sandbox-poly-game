@@ -13,10 +13,12 @@ namespace SandboxPolyGame.Editor;
 /// Управление: WASD/Q/E/Shift — камера; зажатая СКМ — поворот; ЛКМ — поставить блок из выбранного слота хотбара,
 /// пока не активен ни один инструмент (см. <see cref="ButtonFor"/>); Delete и Paint — тоже ЛКМ, каждый в своём
 /// режиме (`X` переключает Delete, как и кнопка на тулбаре; Paint красит ровно ту грань клетки, в которую попал луч,
-/// см. <see cref="UseToolAtHover"/>); 1–9 и колесо — слот хотбара; Tab — список блоков;
+/// см. <see cref="UseToolAtHover"/>); 1–9 — слот хотбара, колесо мыши — зум камеры (<see cref="FlyCamera.Zoom"/>);
+/// Tab — список блоков;
 /// J/K/L — повернуть блок, который встанет следующим, вокруг X/Y/Z; U/I/O — отразить его по X/Y/Z; панель Resize
 /// на тулбаре — его размер. Все три (поворот/отражение/размер) настраивают ПРИЗРАК, а не уже поставленные блоки —
-/// см. <see cref="EditorState"/>. Ctrl+Z/Ctrl+Y — отмена/повтор (см. <see cref="UndoHistory"/>).
+/// см. <see cref="EditorState"/>. Ctrl+Z/Ctrl+Y — отмена/повтор (см. <see cref="UndoHistory"/> — в сетевой сессии
+/// верстака та же комбинация уходит на сервер, см. <see cref="_networkWorkbenchName"/>).
 /// </summary>
 public partial class BuildEditor : Node3D
 {
@@ -41,6 +43,15 @@ public partial class BuildEditor : Node3D
     private Vector3I? _lastToolCell;
     private Vector2 _lastToolMouse;
     private double _infoTimer;
+
+    // Мультиплеер (см. Docs/05-world-and-vehicle-systems.md, «Мультиплеер»): не null - это сетевая сессия
+    // совместного редактирования верстака _networkWorkbenchName, а не одиночная игра. Правки идут через
+    // NetHub.RequestEdit/EditApplied (см. ApplyEdit/OnNetworkEditApplied) вместо прямой мутации _world.Construction;
+    // Ctrl+Z/Y тоже уходят на сервер (NetHub.RequestUndo/RequestRedo) - общая на сессию история с авторством записей,
+    // откатить можно только своё последнее действие, и только пока никто другой не построил поверх (см. HandleKey).
+    // null - обычное одиночное редактирование, ни один из новых веток кода не затронут.
+    private string? _networkWorkbenchName;
+    private bool _isSessionAdmin;
 
     // Снэпшот постройки на момент нажатия кнопки инструмента (см. UndoHistory) - весь "мазок" перетаскивания
     // Paint/Delete фиксируется в истории одним шагом, а не по клетке.
@@ -67,7 +78,36 @@ public partial class BuildEditor : Node3D
 
         _world = new VoxelWorld { Name = "World" };
         AddChild(_world);
-        PlaceRootBlock();
+
+        // Мультиплеер: вход в сетевую сессию верстака (см. World.GameWorld.OnSessionReadyForMe/OnJoinAcceptedForMe)
+        // вместо обычного Create vehicle/Load - постройка приходит уже сериализованной от сервера, не с диска.
+        _networkWorkbenchName = EditorHandoff.NetworkedWorkbenchName;
+        EditorHandoff.NetworkedWorkbenchName = null;
+        _isSessionAdmin = EditorHandoff.IsSessionAdmin;
+
+        if (_networkWorkbenchName != null)
+        {
+            if (EditorHandoff.PendingNetworkedConstructionJson is { } networkedJson)
+            {
+                EditorHandoff.PendingNetworkedConstructionJson = null;
+                ConstructionIO.Deserialize(_world.Construction, networkedJson, BlockCatalog.Instance);
+                _world.RebuildDirty();
+            }
+
+            NetHub.Instance.EditApplied += OnNetworkEditApplied;
+            NetHub.Instance.JoinRequestIncoming += OnJoinRequestIncoming;
+            NetHub.Instance.JoinCancelled += OnJoinCancelled;
+            NetHub.Instance.SessionClosedForMe += OnSessionClosedForMe;
+            NetHub.Instance.SessionSynced += OnSessionSynced;
+            NetHub.Instance.UndoRedoRejected += OnUndoRedoRejected;
+        }
+        // Вход через верстак с уже выбранной постройкой (EditorHandoff.PendingConstructionPath, см. EditorUi) сам
+        // заменит содержимое (ConstructionIO.Deserialize вызывает Construction.Clear()) - ставить и сразу стирать
+        // корневой блок незачем; "Create vehicle" (путь не задан) получает его, как и раньше.
+        else if (EditorHandoff.PendingConstructionPath == null)
+        {
+            PlaceRootBlock();
+        }
 
         _camera = new FlyCamera { Name = "Camera", Fov = 70f, Near = 0.05f, Far = 600f };
         AddChild(_camera);
@@ -77,6 +117,11 @@ public partial class BuildEditor : Node3D
         BuildCursorVisuals();
 
         _ui = new EditorUi(this, _state);
+        if (_networkWorkbenchName is { } workbenchName)
+        {
+            _ui.JoinResponseRequested += (requesterId, accepted) => NetHub.Instance.RespondToJoin(workbenchName, requesterId, accepted);
+        }
+
         _state.Changed += OnStateChanged;
         OnStateChanged();
 
@@ -84,45 +129,91 @@ public partial class BuildEditor : Node3D
         DevHarness.Start(this);
     }
 
+    public override void _ExitTree()
+    {
+        if (_networkWorkbenchName == null) return;
+        NetHub.Instance.EditApplied -= OnNetworkEditApplied;
+        NetHub.Instance.JoinRequestIncoming -= OnJoinRequestIncoming;
+        NetHub.Instance.JoinCancelled -= OnJoinCancelled;
+        NetHub.Instance.SessionClosedForMe -= OnSessionClosedForMe;
+        NetHub.Instance.SessionSynced -= OnSessionSynced;
+        NetHub.Instance.UndoRedoRejected -= OnUndoRedoRejected;
+    }
+
+    /// <summary>Я админ этой сетевой сессии и ухожу (Exit/Spawn, см. <see cref="Ui.EditorUi"/>) - сессия закрывается
+    /// для ВСЕХ участников разом (см. Docs/05, «Мультиплеер» - раздельный уход одного не-админ участника не
+    /// закрывает её, см. class doc <see cref="Core.WorkbenchSession"/>). Ничего не делает для одиночной игры и для
+    /// участника, присоединившегося через Join (не админ).</summary>
+    public void LeaveNetworkSessionIfAdmin()
+    {
+        if (_networkWorkbenchName != null && _isSessionAdmin) NetHub.Instance.RequestCloseSession(_networkWorkbenchName);
+    }
+
+    /// <summary>Правка принята сервером и разослана всем участникам сессии (см. <see cref="NetHub.EditApplied"/>) -
+    /// применяем её локально РОВНО ТЕМ ЖЕ кодом, что применил сервер (<see cref="NetEditOps.Apply"/>), включая
+    /// случай, когда правку запросил я сам (сервер не считает клиентский запрос состоявшимся, пока не подтвердит и
+    /// не разошлёт - см. class doc про "не сырые клики").</summary>
+    private void OnNetworkEditApplied(string workbenchName, NetEditKind kind, Vector3I cell, Vector3I size,
+        string blockSlug, Color color, Vector3I rotation, Vector3I mirror, int extraInt, bool extraBool)
+    {
+        if (workbenchName != _networkWorkbenchName) return;
+        NetEditOps.Apply(_world.Construction, kind, cell, size, blockSlug, color, rotation, mirror, extraInt, extraBool);
+        UpdateHover();
+    }
+
+    /// <summary>Мой Undo/Redo принят сервером — полная ресинхронизация постройки (см. <see cref="NetHub.SessionSynced"/>),
+    /// тем же <see cref="UndoHistory.Restore"/>, что применяет Undo/Redo локально в одиночной игре.</summary>
+    private void OnSessionSynced(string workbenchName, UndoHistory.Snapshot snapshot)
+    {
+        if (workbenchName != _networkWorkbenchName) return;
+        UndoHistory.Restore(_world.Construction, BlockCatalog.Instance, snapshot);
+        UpdateHover();
+    }
+
+    /// <summary>Мой Undo/Redo отклонён (ничего отменять, или отменяемое — не моё последнее действие, см. Docs/05,
+    /// «Мультиплеер») — показываем причину в статусной строке, как и результат Save/Load.</summary>
+    private void OnUndoRedoRejected(string workbenchName, string reason)
+    {
+        if (workbenchName != _networkWorkbenchName) return;
+        _ui.SetStatus(reason);
+    }
+
+    /// <summary>Я админ и кто-то просится присоединиться, пока я уже в редакторе (см. class doc
+    /// <see cref="Editor.Ui.JoinRequestPopupUi"/> про то, почему это может случиться и здесь, и в
+    /// <c>World.GameWorld</c>). Чаще всего именно ЗДЕСЬ — админ обычно уже в редакторе к моменту чужого Join (сам
+    /// только что создал сессию).</summary>
+    private void OnJoinRequestIncoming(string workbenchName, long requesterId)
+    {
+        if (workbenchName != _networkWorkbenchName || !_isSessionAdmin) return;
+        _ui.ShowJoinRequestPopup(requesterId);
+        // Явно, не полагаясь на то, что мышь тут "и так обычно видна" (FlyCamera прячет её только на время зажатой
+        // СКМ) - баг, найденный пользователем: курсор всё равно иногда пропадал, по кнопкам Accept/Decline
+        // нельзя было кликнуть. Тот же фикс уже был у World.GameWorld.OnJoinRequestIncoming, тут его не хватало.
+        Input.MouseMode = Input.MouseModeEnum.Visible;
+    }
+
+    /// <summary>Заявитель передумал (кнопка Cancel на его плашке ожидания) - убрать попап, если он ещё показывает
+    /// именно эту заявку (см. <see cref="Ui.EditorUi.HideJoinRequestPopupIfFrom"/>).</summary>
+    private void OnJoinCancelled(string workbenchName, long requesterId)
+    {
+        if (workbenchName != _networkWorkbenchName || !_isSessionAdmin) return;
+        _ui.HideJoinRequestPopupIfFrom(requesterId);
+    }
+
+    /// <summary>Админ завершил сессию (вышел/заспавнил) - остальных участников выкидывает обратно в мир без
+    /// предупреждения (см. Docs/05, «Мультиплеер»). <see cref="EditorHandoff.PendingPlayerPosition"/> всё ещё
+    /// хранит позицию, с которой участник вошёл (задана при Join, см. World.GameWorld) - GameWorld восстановит её
+    /// как обычно при возврате, отдельно ничего готовить не нужно.</summary>
+    private void OnSessionClosedForMe(string workbenchName)
+    {
+        if (workbenchName != _networkWorkbenchName) return;
+        Callable.From(() => GetTree().ChangeSceneToFile("res://Scenes/World.tscn")).CallDeferred();
+    }
+
     // ------------------------------------------------------------------ сцена
 
-    private void BuildEnvironment()
-    {
-        // Один плоский цвет неба и земли (запрос пользователя) — без градиента "к горизонту", все 4 slot'а
-        // ProceduralSkyMaterial совпадают.
-        var skyGroundColor = Color.FromHtml("#6682FF");
-        var sky = new Sky
-        {
-            SkyMaterial = new ProceduralSkyMaterial
-            {
-                SkyTopColor = skyGroundColor,
-                SkyHorizonColor = skyGroundColor,
-                GroundHorizonColor = skyGroundColor,
-                GroundBottomColor = skyGroundColor,
-            },
-        };
-
-        AddChild(new WorldEnvironment
-        {
-            Name = "Environment",
-            Environment = new Godot.Environment
-            {
-                BackgroundMode = Godot.Environment.BGMode.Sky,
-                Sky = sky,
-                AmbientLightSource = Godot.Environment.AmbientSource.Sky,
-            },
-        });
-
-        AddChild(new DirectionalLight3D
-        {
-            Name = "Sun",
-            RotationDegrees = new Vector3(-55, -35, 0),
-            LightEnergy = 1.1f,
-            ShadowEnabled = true,
-            DirectionalShadowMode = DirectionalLight3D.ShadowMode.Parallel2Splits,
-            DirectionalShadowMaxDistance = 40f,
-        });
-    }
+    // Один плоский цвет неба и земли (запрос пользователя) — общий с World.GameWorld, см. EnvironmentBuilder.
+    private void BuildEnvironment() => EnvironmentBuilder.BuildFlatSkyAndSun(this, Color.FromHtml("#6682FF"));
 
     /// <summary>
     /// Ставит корневой блок 1x1x1 (обычный куб, слаг "block") в центральную клетку (0,0,0) при входе в редактор —
@@ -307,6 +398,21 @@ public partial class BuildEditor : Node3D
 
     private void HandleKey(InputEventKey key)
     {
+        if (_ui.SaveDialogOpen)
+        {
+            // Пока открыт диалог сохранения, буквы/цифры должны попадать в поля имени/описания как текст, а не
+            // становиться горячими клавишами редактора (иначе, например, "x" в названии заодно переключало бы
+            // инструмент Delete) - Escape остаётся единственным исключением, закрывает диалог без сохранения,
+            // как и кнопка Cancel.
+            if (key.PhysicalKeycode == Key.Escape)
+            {
+                _ui.CloseSaveDialog();
+                GetViewport().SetInputAsHandled();
+            }
+
+            return;
+        }
+
         switch (key.PhysicalKeycode)
         {
             case Key.Tab:
@@ -359,19 +465,25 @@ public partial class BuildEditor : Node3D
 
             // Отмена/повтор — как и остальные "глобальные" горячие клавиши тут, не должны перехватывать Ctrl+Z/Y,
             // когда фокус на текстовом поле (иначе отменяли бы постройку вместо правки текста в панели Resize).
+            // В сетевой сессии (_networkWorkbenchName != null) уходят запросом на сервер (NetHub.RequestUndo/Redo) —
+            // откатить можно только СВОЁ последнее действие, и только пока никто другой не построил поверх (сервер
+            // отклонит иначе, см. Docs/05-world-and-vehicle-systems.md, «Мультиплеер»); применение — по ответу
+            // (OnSessionSynced/OnUndoRedoRejected), не сразу здесь.
             case Key.Z when key.CtrlPressed && GetViewport().GuiGetFocusOwner() is not LineEdit:
-                if (_undo.Undo(_world.Construction, BlockCatalog.Instance)) UpdateHover();
+                if (_networkWorkbenchName != null) NetHub.Instance.RequestUndo(_networkWorkbenchName);
+                else if (_undo.Undo(_world.Construction, BlockCatalog.Instance)) UpdateHover();
                 break;
 
             case Key.Y when key.CtrlPressed && GetViewport().GuiGetFocusOwner() is not LineEdit:
-                if (_undo.Redo(_world.Construction, BlockCatalog.Instance)) UpdateHover();
+                if (_networkWorkbenchName != null) NetHub.Instance.RequestRedo(_networkWorkbenchName);
+                else if (_undo.Redo(_world.Construction, BlockCatalog.Instance)) UpdateHover();
                 break;
         }
     }
 
     public override void _UnhandledInput(InputEvent e)
     {
-        if (e is not InputEventMouseButton button || _ui.PickerOpen) return;
+        if (e is not InputEventMouseButton button || _ui.IsModalOpen) return;
 
         switch (button.ButtonIndex)
         {
@@ -388,12 +500,14 @@ public partial class BuildEditor : Node3D
                 if (ButtonFor(_state.Tool) == MouseButton.Right) StartToolStroke(MouseButton.Right);
                 break;
 
+            // Колесо мыши — зум камеры (FlyCamera.Zoom), не листание хотбара (слот теперь меняется только клавишами
+            // 1-9 или кликом по слоту/карточке в списке блоков).
             case MouseButton.WheelUp when button.Pressed:
-                _state.SelectedSlot = (_state.SelectedSlot + EditorState.HotbarSize - 1) % EditorState.HotbarSize;
+                _camera.Zoom(1);
                 break;
 
             case MouseButton.WheelDown when button.Pressed:
-                _state.SelectedSlot = (_state.SelectedSlot + 1) % EditorState.HotbarSize;
+                _camera.Zoom(-1);
                 break;
         }
     }
@@ -445,12 +559,12 @@ public partial class BuildEditor : Node3D
 
         string slug = _state.SelectedBlockSlug;
         if (string.IsNullOrEmpty(slug) || !BlockCatalog.Instance.TryGetBySlug(slug, out var definition)) return;
+        // Тот же гейт, что и у призрака (CanPlaceFootprint) - блок можно поставить только рядом с уже стоящим
+        // (кроме самой первой клетки постройки) - иначе ЛКМ по пустой земле поставила бы блок в стороне от всего.
+        if (!CanPlaceFootprint(_hover.PlaceCell, _state.PendingSize)) return;
 
-        var before = _undo.Capture(_world.Construction);
-        _world.Construction.PlaceBlock(_hover.PlaceCell, _state.PendingSize, definition, definition.DefaultColor,
+        ApplyEdit(NetEditKind.Place, _hover.PlaceCell, _state.PendingSize, definition.Slug, definition.DefaultColor,
             _state.PendingRotationSteps, _state.PendingMirror);
-        _undo.RecordIfChanged(before, _world.Construction);
-        UpdateHover();
     }
 
     /// <summary>
@@ -472,6 +586,12 @@ public partial class BuildEditor : Node3D
     /// например, залита инструментом разработчика в обход Construction — откатывается на поклеточное удаление/
     /// покраску, как раньше). Resize сюда не входит — он не действует на уже поставленные блоки, см.
     /// <see cref="EditorState.PendingSize"/>.
+    /// <para/>
+    /// Этот метод (резолв — какая именно грань/регион/блок/клетка) ОДИНАКОВ для одиночной игры и сетевой сессии —
+    /// разница только в <see cref="ApplyEdit"/> (применить сразу локально или запросом на сервер, см. её doc).
+    /// Полная покраска в сети (2026-09-29 (6)) — раньше сетевая сессия огрубляла Paint до целиком блока/клетки; клиент
+    /// и так уже резолвит грань/регион локально (нужно и для одиночной игры), поэтому отправить резолвленный результат
+    /// по сети — не сложнее, чем отправить огрублённый.
     /// </summary>
     private void UseToolAtHover()
     {
@@ -484,54 +604,80 @@ public partial class BuildEditor : Node3D
         switch (_state.Tool)
         {
             case ToolMode.Paint:
-                var normal = _hover.Normal;
-                int axis = normal.X != 0 ? 0 : normal.Y != 0 ? 1 : 2;
-                bool positive = normal[axis] > 0;
-                byte hitBit = (byte)(1 << (axis * 2 + (positive ? 1 : 0)));
-                bool isFullCoverageSide = (_world.Grid.GetFaceMask(cell) & hitBit) != 0;
-                if (isFullCoverageSide)
-                {
-                    _world.Grid.TryPaintFace(cell, axis, positive, CellColor.Pack(_state.PaintColor));
-                }
-                else
-                {
-                    var owner = _world.Construction.GetOwner(cell);
-                    var building = owner != null && BlockCatalog.Instance.TryGetBySlug(owner.BlockSlug, out var def)
-                        ? def.GetComponent<BuildingBlockComponent>()
-                        : null;
-                    int region = -1;
-                    if (owner != null && building != null)
-                    {
-                        var rayOrigin = _camera.ProjectRayOrigin(_mousePosition);
-                        var rayDir = _camera.ProjectRayNormal(_mousePosition);
-                        var originWorld = BuildSpace.CellMin(owner.Origin);
-                        if (!ShapeMeshBuilder.TryRaycastFace(building.Shape, owner.Size, owner.RotationSteps, owner.Mirror, originWorld, rayOrigin, rayDir, out region))
-                        {
-                            ShapeMeshBuilder.TryFindPaintRegion(building.Shape, owner.RotationSteps, owner.Mirror, hitBit, out region);
-                        }
-                    }
-
-                    if (owner != null && region >= 0)
-                    {
-                        _world.Construction.PaintRegion(owner, region, _state.PaintColor);
-                    }
-                    else if (owner != null)
-                    {
-                        _world.Construction.Paint(owner, _state.PaintColor);
-                    }
-                    else
-                    {
-                        _world.Grid.TryPaint(cell, CellColor.Pack(_state.PaintColor));
-                    }
-                }
-
+                ApplyPaintAtCell(cell);
                 break;
 
             case ToolMode.Delete:
-                var instance = _world.Construction.GetOwner(cell);
-                if (instance != null) _world.Construction.Remove(instance);
-                else _world.Grid.TryRemove(cell);
+                ApplyEdit(NetEditKind.Remove, cell, Vector3I.One, "", Colors.White, Vector3I.Zero, Vector3I.Zero);
                 break;
+        }
+    }
+
+    private void ApplyPaintAtCell(Vector3I cell)
+    {
+        var normal = _hover.Normal;
+        int axis = normal.X != 0 ? 0 : normal.Y != 0 ? 1 : 2;
+        bool positive = normal[axis] > 0;
+        byte hitBit = (byte)(1 << (axis * 2 + (positive ? 1 : 0)));
+        bool isFullCoverageSide = (_world.Grid.GetFaceMask(cell) & hitBit) != 0;
+
+        if (isFullCoverageSide)
+        {
+            ApplyEdit(NetEditKind.PaintFace, cell, Vector3I.One, "", _state.PaintColor, Vector3I.Zero, Vector3I.Zero, axis, positive);
+            return;
+        }
+
+        var owner = _world.Construction.GetOwner(cell);
+        var building = owner != null && BlockCatalog.Instance.TryGetBySlug(owner.BlockSlug, out var def)
+            ? def.GetComponent<BuildingBlockComponent>()
+            : null;
+        int region = -1;
+        if (owner != null && building != null)
+        {
+            var rayOrigin = _camera.ProjectRayOrigin(_mousePosition);
+            var rayDir = _camera.ProjectRayNormal(_mousePosition);
+            var originWorld = BuildSpace.CellMin(owner.Origin);
+            if (!ShapeMeshBuilder.TryRaycastFace(building.Shape, owner.Size, owner.RotationSteps, owner.Mirror, originWorld, rayOrigin, rayDir, out region))
+            {
+                ShapeMeshBuilder.TryFindPaintRegion(building.Shape, owner.RotationSteps, owner.Mirror, hitBit, out region);
+            }
+        }
+
+        if (owner != null && region >= 0)
+        {
+            ApplyEdit(NetEditKind.PaintRegion, cell, Vector3I.One, "", _state.PaintColor, Vector3I.Zero, Vector3I.Zero, region);
+        }
+        else if (owner != null)
+        {
+            ApplyEdit(NetEditKind.PaintInstance, cell, Vector3I.One, "", _state.PaintColor, Vector3I.Zero, Vector3I.Zero);
+        }
+        else
+        {
+            ApplyEdit(NetEditKind.PaintCell, cell, Vector3I.One, "", _state.PaintColor, Vector3I.Zero, Vector3I.Zero);
+        }
+    }
+
+    /// <summary>
+    /// Единственная точка мутации <see cref="_world"/>.<see cref="VoxelWorld.Construction"/> из ввода игрока —
+    /// одиночная игра применяет правку сразу (<see cref="NetEditOps.Apply"/>, тот же метод, что использует сервер
+    /// сетевой сессии) и пишет её в свою локальную <see cref="_undo"/>; сетевая сессия НИЧЕГО не мутирует тут же —
+    /// только шлёт запрос (<see cref="NetHub.RequestEdit"/>) и ждёт подтверждения (<see cref="OnNetworkEditApplied"/>),
+    /// чтобы не разойтись с сервером/остальными участниками, если два игрока попали в одну клетку одновременно (см.
+    /// Docs/05-world-and-vehicle-systems.md, «Мультиплеер»).
+    /// </summary>
+    private void ApplyEdit(NetEditKind kind, Vector3I cell, Vector3I size, string blockSlug, Color color,
+        Vector3I rotation, Vector3I mirror, int extraInt = 0, bool extraBool = false)
+    {
+        if (_networkWorkbenchName != null)
+        {
+            NetHub.Instance.RequestEdit(_networkWorkbenchName, kind, cell, size, blockSlug, color, rotation, mirror, extraInt, extraBool);
+            return;
+        }
+
+        var before = _undo.Capture(_world.Construction);
+        if (NetEditOps.Apply(_world.Construction, kind, cell, size, blockSlug, color, rotation, mirror, extraInt, extraBool))
+        {
+            _undo.RecordIfChanged(before, _world.Construction);
         }
 
         UpdateHover();
@@ -541,7 +687,7 @@ public partial class BuildEditor : Node3D
 
     public override void _Process(double delta)
     {
-        _camera.MovementEnabled = !_ui.PickerOpen;
+        _camera.MovementEnabled = !_ui.IsModalOpen;
         UpdateHover();
 
         // Удержание кнопки инструмента: он применяется к каждому новому блоку под курсором, но только если мышь сдвинулась —
@@ -597,22 +743,20 @@ public partial class BuildEditor : Node3D
         }
     }
 
-    /// <summary>Все ли клетки прямоугольной области <paramref name="size"/> клеток от <paramref name="origin"/>
-    /// (растёт только в положительную сторону) свободны и внутри области построек — используется и для видимости
-    /// призрака, и как основа проверки в <see cref="Construction.PlaceBlock"/> (её же по факту делает он сам).</summary>
-    private bool CanPlaceFootprint(Vector3I origin, Vector3I size)
-    {
-        var max = origin + size - Vector3I.One;
-        for (int z = origin.Z; z <= max.Z; z++)
-        for (int y = origin.Y; y <= max.Y; y++)
-        for (int x = origin.X; x <= max.X; x++)
-        {
-            var cell = new Vector3I(x, y, z);
-            if (!BuildSpace.InBounds(cell) || _world.Grid.IsSolid(cell)) return false;
-        }
-
-        return true;
-    }
+    /// <summary>
+    /// Все ли клетки прямоугольной области <paramref name="size"/> клеток от <paramref name="origin"/> (растёт
+    /// только в положительную сторону) свободны, внутри области построек, и КАСАЮТСЯ уже стоящего блока хотя бы
+    /// одной гранью — используется и для видимости призрака, и как гейт перед вызовом
+    /// <see cref="Construction.PlaceBlock"/> в <see cref="PlaceAtHover"/> (сам он о соседстве ничего не знает —
+    /// проверка только здесь, на уровне UI, единая для того, что видно призраком, и того, что реально ставится).
+    /// Требование соседства не действует, пока постройка совсем пуста (<see cref="VoxelGrid.BlockCount"/> == 0) —
+    /// иначе самый первый блок в принципе некуда было бы поставить; на практике это почти никогда не наступает —
+    /// редактор сам ставит корневой блок при входе (<see cref="PlaceRootBlock"/>), это защита от мёртвой ситуации,
+    /// если его всё же удалили.
+    /// </summary>
+    // Правило соседства теперь общее с сервером сетевой сессии редактирования (см. PlacementRules class doc) — и
+    // клиент (призрак/гейт ЛКМ здесь), и NetHub на сервере применяют ровно одну и ту же проверку.
+    private bool CanPlaceFootprint(Vector3I origin, Vector3I size) => PlacementRules.CanPlaceFootprint(_world.Grid, origin, size);
 
     /// <summary>
     /// Призрак отражает настоящую форму выбранного блока (не только куб), текущий поворот/отражение

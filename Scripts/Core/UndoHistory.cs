@@ -3,9 +3,8 @@ using System.Collections.Generic;
 using System.Text;
 using Godot;
 using SandboxPolyGame.Blocks;
-using SandboxPolyGame.Core;
 
-namespace SandboxPolyGame.Editor;
+namespace SandboxPolyGame.Core;
 
 /// <summary>
 /// История отмены/повтора (Ctrl+Z/Ctrl+Y) для <see cref="Construction"/>. Снэпшот-based: каждый шаг — сериализованное
@@ -22,6 +21,19 @@ namespace SandboxPolyGame.Editor;
 /// треугольных граней не-кубических форм, см. <see cref="BlockInstance.RegionColors"/>) — иначе Undo/Redo стирали бы
 /// точечную покраску. Клетки, залитые в обход Construction (см. <c>Dev.DemoBuilds</c>), этим не покрыты — как и
 /// раньше, история вообще не знает про них.
+/// <para/>
+/// <b>Живёт в <c>Core</c>, не в <c>Editor</c></b> (перенесено 2026-09-29 (6)) — нужна и одиночному
+/// <c>Editor.BuildEditor</c> (как и раньше), и серверной <see cref="WorkbenchSession"/> сетевой сессии верстака
+/// (см. <c>Core.NetHub</c>/Docs/05-world-and-vehicle-systems.md, «Мультиплеер»), у которой нет вообще никакой
+/// Godot-сцены — класс и так не имел зависимостей от Editor/сцены, перенос лишь исправил слой, к которому он
+/// формально принадлежал.
+/// <para/>
+/// <b>Авторство записей</b> (<paramref name="authorId"/> у <see cref="RecordIfChanged(Snapshot, Construction, long?)"/>,
+/// <see cref="PeekUndoAuthor"/>/<see cref="PeekRedoAuthor"/>) — добавлено ради сетевого совместного редактирования:
+/// в общей сессии Undo может откатить только автор ЕЁ ЖЕ ВЕРХНЕЙ записи, а не чью угодно (см. class doc
+/// <c>NetHub</c>, «запрет отката, если сверху уже успел построить кто-то другой» — простое правило «отменяемо только
+/// самое верхнее по времени действие, и только его автором», без анализа зависимостей между действиями). В
+/// одиночной игре автор никогда не передаётся (перегрузки без него) — Undo/Redo безусловны, как и раньше.
 /// </summary>
 public sealed class UndoHistory
 {
@@ -33,30 +45,45 @@ public sealed class UndoHistory
     public readonly record struct Snapshot(string Json, string Faces, string Regions);
 
     private readonly List<Snapshot> _undoStack = new();
+    private readonly List<long?> _undoAuthors = new();
     private readonly List<Snapshot> _redoStack = new();
+    private readonly List<long?> _redoAuthors = new();
 
     public bool CanUndo => _undoStack.Count > 0;
     public bool CanRedo => _redoStack.Count > 0;
 
+    /// <summary>Автор записи, которую вернул бы следующий <see cref="Undo"/> — null, если стек пуст ИЛИ запись
+    /// сделана без авторства (одиночная игра). Сетевая сессия сверяет это с id запросившего Undo ДО вызова
+    /// <see cref="Undo"/>, чтобы отклонить чужой откат, а не выполнить и жаловаться постфактум.</summary>
+    public long? PeekUndoAuthor => _undoAuthors.Count > 0 ? _undoAuthors[^1] : null;
+
+    /// <summary>Симметрично <see cref="PeekUndoAuthor"/>, но для <see cref="Redo"/>.</summary>
+    public long? PeekRedoAuthor => _redoAuthors.Count > 0 ? _redoAuthors[^1] : null;
+
     /// <summary>Снимает снэпшот текущего состояния постройки (JSON + per-face цвета + точечная покраска граней форм) —
-    /// вызывается ДО действия; результат передаётся в <see cref="RecordIfChanged"/> ПОСЛЕ него.</summary>
+    /// вызывается ДО действия; результат передаётся в <see cref="RecordIfChanged(Snapshot, Construction)"/> ПОСЛЕ него.</summary>
     public Snapshot Capture(Construction construction) =>
         new(ConstructionIO.Serialize(construction), SerializeFaceColors(construction), SerializeRegionColors(construction));
+
+    /// <summary>Одиночная игра — без авторства (см. class doc).</summary>
+    public void RecordIfChanged(Snapshot before, Construction construction) => RecordIfChanged(before, construction, null);
 
     /// <summary>
     /// Если состояние правда изменилось с момента <paramref name="before"/> (иначе это была бы пустая запись в
     /// истории — например, ЛКМ в занятую клетку, или покраска грани в уже стоящий там цвет), кладёт снэпшот "до" в
-    /// стек отмены и стирает стек повтора (как в любом редакторе: новое действие после отмены обрывает старую
-    /// "будущую" ветку истории).
+    /// стек отмены (с автором <paramref name="authorId"/> — см. class doc) и стирает стек повтора (как в любом
+    /// редакторе: новое действие после отмены обрывает старую "будущую" ветку истории).
     /// </summary>
-    public void RecordIfChanged(Snapshot before, Construction construction)
+    public void RecordIfChanged(Snapshot before, Construction construction, long? authorId)
     {
         var current = Capture(construction);
         if (before.Json == current.Json && before.Faces == current.Faces && before.Regions == current.Regions) return;
 
         _undoStack.Add(before);
-        if (_undoStack.Count > MaxDepth) _undoStack.RemoveAt(0);
+        _undoAuthors.Add(authorId);
+        if (_undoStack.Count > MaxDepth) { _undoStack.RemoveAt(0); _undoAuthors.RemoveAt(0); }
         _redoStack.Clear();
+        _redoAuthors.Clear();
     }
 
     public bool Undo(Construction construction, BlockCatalog catalog)
@@ -65,8 +92,11 @@ public sealed class UndoHistory
 
         var current = Capture(construction);
         var previous = _undoStack[^1];
+        var previousAuthor = _undoAuthors[^1];
         _undoStack.RemoveAt(_undoStack.Count - 1);
+        _undoAuthors.RemoveAt(_undoAuthors.Count - 1);
         _redoStack.Add(current);
+        _redoAuthors.Add(previousAuthor);
 
         Restore(construction, catalog, previous);
         return true;
@@ -78,14 +108,22 @@ public sealed class UndoHistory
 
         var current = Capture(construction);
         var next = _redoStack[^1];
+        var nextAuthor = _redoAuthors[^1];
         _redoStack.RemoveAt(_redoStack.Count - 1);
+        _redoAuthors.RemoveAt(_redoAuthors.Count - 1);
         _undoStack.Add(current);
+        _undoAuthors.Add(nextAuthor);
 
         Restore(construction, catalog, next);
         return true;
     }
 
-    private static void Restore(Construction construction, BlockCatalog catalog, Snapshot snapshot)
+    /// <summary>Восстанавливает <paramref name="construction"/> из снэпшота — <c>public</c>/<c>static</c> (не только
+    /// внутренний хелпер <see cref="Undo"/>/<see cref="Redo"/>) ради сетевой полной ресинхронизации после Undo/Redo:
+    /// сервер применяет Undo/Redo к своей авторитативной постройке сессии и рассылает результирующий
+    /// <see cref="Capture"/> участникам целиком (не поштучной правкой, как обычные <c>NetEditOps</c> — Undo/Redo может
+    /// затронуть произвольное число блоков разом), каждый клиент применяет его этим же методом.</summary>
+    public static void Restore(Construction construction, BlockCatalog catalog, Snapshot snapshot)
     {
         ConstructionIO.Deserialize(construction, snapshot.Json, catalog);
         RestoreFaceColors(construction, snapshot.Faces);

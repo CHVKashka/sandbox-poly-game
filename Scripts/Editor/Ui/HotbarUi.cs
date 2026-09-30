@@ -3,7 +3,8 @@ using SandboxPolyGame.Blocks;
 
 namespace SandboxPolyGame.Editor.Ui;
 
-/// <summary>Хотбар на 9 слотов внизу по центру. Клик по слоту (или клавиши 1–9 / колесо) выбирает слот.</summary>
+/// <summary>Хотбар на 9 слотов внизу по центру. Клик по слоту (или клавиши 1–9) выбирает слот — колесо мыши с этого
+/// релиза зумит камеру (см. <c>BuildEditor</c>), а не листает слоты.</summary>
 internal sealed class HotbarUi
 {
     private sealed class Slot

@@ -19,7 +19,7 @@
 | Скрипт | Действие |
 |---|---|
 | `build.bat` | Только сборка C# (`dotnet build`) |
-| `run.bat` | Сборка + запуск редактора построек (главная сцена), как обычная игра |
+| `run.bat` | Сборка + запуск игры (главная сцена — открытый мир, `Scenes/World.tscn`; верстак ведёт в редактор построек) |
 | `edit.bat` | Сборка + открыть проект в GUI-редакторе Godot (`-e`) |
 | `test.bat` | Сборка + самотесты headless (см. [04-testing.md](04-testing.md)); код выхода 0 = всё прошло |
 | `export.bat [аргументы]` | Обёртка над `Tools\export-windows.ps1` — собирает отдельный `.exe` игры (см. ниже) |
@@ -33,12 +33,17 @@ sandbox-poly-game/
 ├─ nuget.config             привязка пакетов Godot* к локальному источнику GodotDouble (см. ниже)
 ├─ build.bat / run.bat / edit.bat / test.bat / export.bat   быстрый старт (см. выше)
 ├─ blocks/                  data-driven описания блоков, по одному XML-файлу на блок (см. 03)
+├─ meshes/                  статичные глб-модели мира (верстак и т.п.) — см. 05, «Формат моделей»
 ├─ Scenes/
-│  └─ BuildEditor.tscn      главная сцена: один узел со скриптом BuildEditor (всё остальное строится кодом)
+│  ├─ World.tscn            главная сцена (`run/main_scene`): открытый мир — один узел со скриптом GameWorld
+│  └─ BuildEditor.tscn      редактор построек — не главная сцена, вход через верстак (`ChangeSceneToFile`, см. 05);
+│                            дев-харнесс (`--selftest`/`--demo=...`) всегда сразу передаёт сюда управление, минуя мир
 ├─ Scripts/
 │  ├─ Blocks/                компоненты блоков (BaseComponent, BuildingBlock) и загрузчик blocks/*.xml (BlockCatalog)
-│  ├─ Core/                 логика без сцены: сетка клеток, чанки, меширование, каркас, рейкаст, постройка (Construction)
+│  ├─ Core/                 логика без сцены: сетка клеток, чанки, меширование, каркас, рейкаст, постройка (Construction),
+│  │                         именованные сохранения (ConstructionStorage), передача данных между сценами (EditorHandoff)
 │  ├─ Editor/               узлы и UI редактора: BuildEditor, FlyCamera, VoxelWorld, EditorState, Ui/*
+│  ├─ World/                открытый мир вне редактора: GameWorld, Player, TerrainTile, Workbench, VehicleSpawner, Ui/*
 │  └─ Dev/                  инструменты разработчика: самотесты, скриншот-харнесс, демо-постройки
 ├─ Shaders/work_area_boundary.gdshader   шейдер пунктирной границы области построек
 ├─ Tools/export-windows.ps1 экспорт игры в отдельный exe (см. ниже)
