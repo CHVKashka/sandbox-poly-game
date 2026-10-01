@@ -71,11 +71,27 @@ internal static class BlockIconView
     }
 
     /// <summary>Куб — простой центрированный <see cref="BoxMesh"/> цвета <see cref="BlockDefinition.DefaultColor"/>
-    /// (грани различаются освещением, не вершинными цветами). Остальные формы — <see cref="ShapeMeshBuilder"/> без
-    /// поворота/отражения/растяжения, отцентрированные так же, как куб (координаты формы — от угла 0..CellSize,
-    /// сдвигаем на -0.5 и масштабируем в 1/CellSize, чтобы получить такой же единичный куб с центром в начале координат).</summary>
-    private static MeshInstance3D BuildMeshInstance(BlockDefinition definition)
+    /// (грани различаются освещением, не вершинными цветами). Формы (Wedge/Pyramid/InvertedPyramid) —
+    /// <see cref="ShapeMeshBuilder"/> без поворота/отражения/растяжения, отцентрированные так же, как куб (координаты
+    /// формы — от угла 0..CellSize, сдвигаем на -0.5 и масштабируем в 1/CellSize, чтобы получить такой же единичный
+    /// куб с центром в начале координат). Функциональный блок со своей моделью (<see cref="FunctionalBlockComponent.ScenePath"/>,
+    /// например мотор/вал) — настоящая glTF-сцена, вписанная в тот же единичный куб тем же приёмом, что и в мире
+    /// (<see cref="FunctionalBlockGeometry"/>) — иначе иконка (цветной куб) не совпадала бы с тем, что реально стоит
+    /// в постройке.</summary>
+    private static Node3D BuildMeshInstance(BlockDefinition definition)
     {
+        var functional = definition.GetComponent<FunctionalBlockComponent>();
+        if (functional != null && !string.IsNullOrEmpty(functional.ScenePath))
+        {
+            var (scene, aabb) = FunctionalBlockGeometry.GetOrLoadScene(functional.ScenePath);
+            if (scene != null)
+            {
+                var instance = scene.Instantiate<Node3D>();
+                instance.Transform = FunctionalBlockGeometry.ComputeFitTransform(aabb, Vector3.One, Vector3.Zero, Vector3I.Zero, functional.ModelScale);
+                return instance;
+            }
+        }
+
         var building = definition.GetComponent<BuildingBlockComponent>();
         var material = new StandardMaterial3D
         {

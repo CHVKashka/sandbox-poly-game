@@ -21,7 +21,7 @@ public sealed class SelfTest
     private static readonly ushort Block = BlockCatalog.Instance.Get("block").RuntimeId;
 
     /// <summary>
-    /// Любой id, заведомо не совпадающий ни с одним реальным блоком каталога (сейчас их всего 4) — используется
+    /// Любой id, заведомо не совпадающий ни с одним реальным блоком каталога (сейчас их всего 10) — используется
     /// только там, где тесту нужны два РАЗНЫХ числовых id, а не конкретный настоящий блок (ChunkMesher не знает
     /// про каталог блоков вообще, поэтому для чистого меширования подходит любое число).
     /// </summary>
@@ -49,12 +49,16 @@ public sealed class SelfTest
         test.RunNonCubeMeshingTests();
         test.RunResizeMeshingTests();
         test.RunRotationStateTests();
+        test.RunFunctionalBlockPendingSizeTests();
+        test.RunFunctionalBlockGeometryTests();
         test.RunPaintRegionTests();
         test.RunConstructionTests();
         test.RunUndoHistoryTests();
         await test.RunNetworkingTests(editor);
         await test.RunPlayerAndWorldTests(editor);
         await test.RunEditorTests(editor);
+        await test.RunBlockPrefabEditorTests(editor);
+        test.RunVehicleSpawnerCollisionTests(editor);
         // Обязательно ПОСЛЕДним - реально трогает SceneTree.Multiplayer (Core.NetHub.Host), см. class doc про то,
         // что "отключение" оставляет NetHub.LocalPeerId нерабочим до конца процесса (не наша логика - особенность
         // движка, см. RunHostedWorldPlayerTest) - ни один тест после него не должен полагаться на Multiplayer.
@@ -381,7 +385,9 @@ public sealed class SelfTest
         GD.Print("-- block catalog: XML block definitions loaded from blocks/");
 
         var catalog = BlockCatalog.Instance;
-        Check(catalog.All.Count == 4, "catalog loaded 4 block definitions from blocks/ (block, wedge, pyramid, inverse_pyramid)",
+        Check(catalog.All.Count == 10,
+            "catalog loaded 10 block definitions from blocks/ (block, wedge, pyramid, inverse_pyramid + " +
+            "battery, cable, electric_motor, fuel_tank, pipe, shaft)",
             $"got {catalog.All.Count}");
 
         Check(catalog.TryGetBySlug("block", out var block) && block.Name == "Block" && block.RuntimeId != 0,
@@ -403,6 +409,49 @@ public sealed class SelfTest
             "block 'pyramid' has BuildingBlock.Shape = Pyramid");
         Check(catalog.TryGetBySlug("inverse_pyramid", out var inv) && inv.GetComponent<BuildingBlockComponent>()!.Shape == BlockShape.InvertedPyramid,
             "block 'inverse_pyramid' has BuildingBlock.Shape = InvertedPyramid");
+
+        RunFunctionalBlockCatalogTests(catalog);
+    }
+
+    /// <summary>Функциональные блоки (мотор/батарея/бак/труба/кабель/вал, см. Docs/05-world-and-vehicle-systems.md,
+    /// «Функциональные блоки») — расширение того же data-driven каталога через <see cref="FunctionalBlockComponent"/>,
+    /// взаимоисключающий с <see cref="BuildingBlockComponent"/> (ни у одного из этих блоков его нет).</summary>
+    private void RunFunctionalBlockCatalogTests(BlockCatalog catalog)
+    {
+        GD.Print("-- block catalog: functional blocks (FunctionalBlockComponent, ResourceType/ResourcePort)");
+
+        foreach (var slug in new[] { "electric_motor", "battery", "fuel_tank", "pipe", "cable", "shaft" })
+        {
+            Check(catalog.TryGetBySlug(slug, out var def) && def.GetComponent<BuildingBlockComponent>() == null
+                  && def.GetComponent<FunctionalBlockComponent>() != null,
+                $"'{slug}' resolves and has FunctionalBlockComponent, no BuildingBlockComponent (not resizable)");
+        }
+
+        Check(catalog.TryGetBySlug("electric_motor", out var motor), "setup: 'electric_motor' resolves");
+        var motorFn = motor!.GetComponent<FunctionalBlockComponent>()!;
+        Check(motorFn.Ports.Count == 2, "Electric Motor has exactly 2 ports (1 in + 1 out)", $"got {motorFn.Ports.Count}");
+        Check(motorFn.Ports.Count(p => p.Direction == PortDirection.In && p.Resource == ResourceType.Electricity) == 1,
+            "Electric Motor has exactly 1 Electricity input port");
+        Check(motorFn.Ports.Count(p => p.Direction == PortDirection.Out && p.Resource == ResourceType.Torque) == 1,
+            "Electric Motor has exactly 1 Torque output port");
+        Check(motorFn.Capacity == 0, "Electric Motor is not a storage block (capacity 0)");
+
+        Check(catalog.TryGetBySlug("battery", out var battery), "setup: 'battery' resolves");
+        var batteryFn = battery!.GetComponent<FunctionalBlockComponent>()!;
+        Check(batteryFn.Capacity == 100, "Battery declares a capacity to store Electricity", $"got {batteryFn.Capacity}");
+        Check(batteryFn.Ports.Any(p => p.Resource == ResourceType.Electricity), "Battery's port is typed Electricity");
+
+        Check(catalog.TryGetBySlug("fuel_tank", out var tank), "setup: 'fuel_tank' resolves");
+        var tankFn = tank!.GetComponent<FunctionalBlockComponent>()!;
+        Check(tankFn.Capacity == 100, "Fuel Tank declares a capacity to store Fluid", $"got {tankFn.Capacity}");
+        Check(tankFn.Ports.Any(p => p.Resource == ResourceType.Fluid), "Fuel Tank's port is typed Fluid");
+
+        Check(catalog.TryGetBySlug("pipe", out var pipe) && pipe!.GetComponent<FunctionalBlockComponent>()!.Ports.All(p => p.Resource == ResourceType.Fluid),
+            "Pipe's ports are both typed Fluid");
+        Check(catalog.TryGetBySlug("cable", out var cable) && cable!.GetComponent<FunctionalBlockComponent>()!.Ports.All(p => p.Resource == ResourceType.Electricity),
+            "Cable's ports are both typed Electricity");
+        Check(catalog.TryGetBySlug("shaft", out var shaft) && shaft!.GetComponent<FunctionalBlockComponent>()!.Ports.All(p => p.Resource == ResourceType.Torque),
+            "Shaft's ports are both typed Torque");
     }
 
     // ================================================================== геометрия форм (вершины Wedge/Pyramid/InvertedPyramid)
@@ -728,6 +777,129 @@ public sealed class SelfTest
         state.RotatePendingY();
         state.RotatePendingZ();
         Check(state.PendingRotationSteps == new Vector3I(0, 1, 1), "RotatePendingY/Z increment Y/Z independently");
+
+        // --- баг, найденный пользователем (2026-10-01 (8)): оси вращения должны быть ГЛОБАЛЬНЫМИ (мировыми,
+        // фиксированными), а не локальными (вокруг уже повёрнутой оси блока). Раньше ориентация пересобиралась
+        // заново из трёх НЕЗАВИСИМЫХ счётчиков в ФИКСИРОВАННОМ порядке X→Y→Z при КАЖДОМ нажатии - пока оси
+        // нажимались строго по одной или в порядке X,Y,Z, результат случайно совпадал с ожидаемым (см. тесты выше),
+        // но при ЧЕРЕДОВАНИИ (например, сначала Y, потом X) пересборка в фиксированном порядке давала СОВСЕМ другую
+        // ориентацию, чем "доверни ещё на 90° вокруг МИРОВОЙ X от того, что уже есть" - выглядело как будто кнопки
+        // вращения "меняются местами". Проверяем это напрямую: поворот вокруг X ПОСЛЕ поворота вокруг Y обязан
+        // совпадать с ПРЕДУМНОЖЕНИЕМ на фиксированный поворот вокруг мировой X (глобальная композиция), а не с
+        // послеумножением (которое было бы вращением вокруг уже повёрнутой ЛОКАЛЬНОЙ оси блока).
+        var globalAxisState = new EditorState();
+        globalAxisState.RotatePendingY();
+        var basisAfterY = globalAxisState.PendingRotationBasis;
+        globalAxisState.RotatePendingX();
+        var expectedGlobalX = new Basis(Vector3.Right, Mathf.Pi / 2f) * basisAfterY;
+        var unexpectedLocalX = basisAfterY * new Basis(Vector3.Right, Mathf.Pi / 2f);
+        Check(globalAxisState.PendingRotationBasis.IsEqualApprox(expectedGlobalX),
+            "rotating around X after already rotating around Y composes GLOBALLY (pre-multiplied by a fixed-axis " +
+            "rotation) - not around the block's own already-rotated local X axis",
+            $"got={globalAxisState.PendingRotationBasis} expectedGlobal={expectedGlobalX} (local would be {unexpectedLocalX})");
+    }
+
+    // ================================================================== функциональные блоки: фиксированный footprint, Resize недоступен
+
+    /// <summary>
+    /// Блок с <see cref="FunctionalBlockComponent"/> (мотор/батарея/бак/труба/кабель/вал) не резинится - в отличие
+    /// от <see cref="BuildingBlockComponent"/>, у него нет MinSize/MaxSize, он всегда ставится ровно своим
+    /// <see cref="FunctionalBlockComponent.Footprint"/>, и Resize-панель на тулбаре для него не действует ни на
+    /// одну ось (см. <see cref="EditorState"/> - приватный ClampToSelectedBlock).
+    /// </summary>
+    private void RunFunctionalBlockPendingSizeTests()
+    {
+        GD.Print("-- functional blocks: PendingSize is pinned to the block's fixed Footprint, Resize has no effect");
+
+        var state = new EditorState();
+        Check(state.SelectedBlockSlug == "block", "setup: default hotbar slot 0 is 'block' (shape blocks sort before functional ones)", state.SelectedBlockSlug);
+
+        state.SelectedSlot = 0;
+        state.AdjustPendingSize(0, 4);
+        Check(state.PendingSize == new Vector3I(5, 1, 1), "setup: growing a resizable block's PendingSize still works as before");
+
+        state.SetSlot(1, "electric_motor");
+        state.SelectedSlot = 1;
+        Check(state.PendingSize == Vector3I.One,
+            "selecting a functional block (fixed Footprint 1x1x1) immediately resets PendingSize to its Footprint", $"{state.PendingSize}");
+
+        state.AdjustPendingSize(0, 7);
+        Check(state.PendingSize == Vector3I.One,
+            "Resize has no effect on a functional block - PendingSize stays pinned to Footprint", $"{state.PendingSize}");
+
+        // PendingSize - одно общее значение на весь редактор, не память на слот (см. class doc EditorState.PendingSize) -
+        // переключение на функциональный блок уже перезаписало его на (1,1,1), поэтому рост отсюда начинается заново.
+        state.SelectedSlot = 0;
+        state.AdjustPendingSize(1, 3);
+        Check(state.PendingSize == new Vector3I(1, 4, 1), "setup: back on slot 0 ('block'), PendingSize resizes normally again");
+
+        state.SetSlot(0, "fuel_tank");
+        Check(state.PendingSize == Vector3I.One,
+            "SetSlot on the CURRENTLY selected slot re-resolves PendingSize immediately, not just on the next SelectedSlot change", $"{state.PendingSize}");
+    }
+
+    // ================================================================== функциональные блоки: подгонка настоящей модели под размер клетки
+
+    /// <summary>
+    /// <see cref="FunctionalBlockGeometry"/> — общая геометрия для <c>Editor.FunctionalBlockView</c> (размещённые
+    /// мотор/вал в мире) и <c>Editor.Ui.BlockIconView</c> (их иконка в хотбаре). Чистая математика, без загрузки
+    /// настоящих .glb — <see cref="FunctionalBlockGeometry.ComputeLocalAabb"/> проверяется на синтетическом дереве
+    /// узлов (вложенный <see cref="MeshInstance3D"/> со своим трансформом), <see cref="FunctionalBlockGeometry.ComputeFitTransform"/> —
+    /// на синтетическом <see cref="Aabb"/>.
+    /// </summary>
+    private void RunFunctionalBlockGeometryTests()
+    {
+        GD.Print("-- functional block geometry: ComputeLocalAabb (nested transforms) + ComputeFitTransform (uniform scale/center/rotate)");
+
+        // ComputeLocalAabb: дочерний Node3D сдвинут на (1,0,0), внутри него MeshInstance3D с BoxMesh 2x2x2 (центрирован
+        // на СВОЁМ происхождении, как и положено BoxMesh) - итоговый AABB в пространстве root должен учитывать сдвиг
+        // ребёнка, а не просто вернуть AABB меша как есть.
+        var root = new Node3D();
+        var child = new Node3D { Transform = new Transform3D(Basis.Identity, new Vector3(1, 0, 0)) };
+        child.AddChild(new MeshInstance3D { Mesh = new BoxMesh { Size = new Vector3(2, 2, 2) } });
+        root.AddChild(child);
+
+        var aabb = FunctionalBlockGeometry.ComputeLocalAabb(root);
+        Check(aabb.Position.IsEqualApprox(new Vector3(0, -1, -1)) && aabb.Size.IsEqualApprox(new Vector3(2, 2, 2)),
+            "ComputeLocalAabb: combines a nested MeshInstance3D's mesh AABB with its ancestor's own transform",
+            $"pos={aabb.Position} size={aabb.Size}");
+        root.Free();
+
+        // ComputeFitTransform: внецентренный AABB модели 2x4x2 (центр в (2,3,2)), вписываем в клетку 0.25^3 с
+        // центром в (0.5,0.5,0.5).
+        var modelAabb = new Aabb(new Vector3(1, 1, 1), new Vector3(2, 4, 2)); // охватывает (1,1,1)..(3,5,3)
+        var targetExtent = new Vector3(0.25f, 0.25f, 0.25f);
+        var targetCenter = new Vector3(0.5f, 0.5f, 0.5f);
+        var transform = FunctionalBlockGeometry.ComputeFitTransform(modelAabb, targetExtent, targetCenter, Vector3I.Zero, Vector3.One);
+
+        var mappedCenter = transform * new Vector3(2, 3, 2);
+        Check(mappedCenter.IsEqualApprox(targetCenter),
+            "ComputeFitTransform: the model's own AABB center maps exactly onto the target center", $"{mappedCenter}");
+
+        // Масштаб РАВНОМЕРНЫЙ (минимум из трёх осей: 0.25/2, 0.25/4, 0.25/2 = 0.0625, выигрывает Y) - X/Z тоже
+        // используют 0.0625, хотя сами по себе влезли бы с 0.125 - пропорции модели не искажаются.
+        var mappedMinCorner = transform * new Vector3(1, 1, 1);
+        var expectedMinCorner = targetCenter + new Vector3(-1, -2, -1) * 0.0625f;
+        Check(mappedMinCorner.IsEqualApprox(expectedMinCorner),
+            "ComputeFitTransform: scale is uniform (the tightest axis wins) - proportions are preserved, not stretched per-axis",
+            $"got={mappedMinCorner} expected={expectedMinCorner}");
+
+        // Поворот крутится вокруг ЦЕНТРА модели (та же конвенция, что и ShapeMeshBuilder.ComposeRotation) - центр
+        // по-прежнему должен лечь точно в targetCenter, какой бы ни была сама матрица поворота.
+        var rotatedTransform = FunctionalBlockGeometry.ComputeFitTransform(modelAabb, targetExtent, targetCenter, new Vector3I(0, 1, 0), Vector3.One);
+        var rotatedCenter = rotatedTransform * new Vector3(2, 3, 2);
+        Check(rotatedCenter.IsEqualApprox(targetCenter),
+            "ComputeFitTransform: rotation pivots around the model's own center - still maps exactly onto the target center", $"{rotatedCenter}");
+
+        // extraScale (Blocks.FunctionalBlockComponent.ModelScale, "Model stretch" в --blockeditor) - поправка
+        // ПОВЕРХ равномерного масштаба, покомпонентно: (1,1,1) не меняет ничего (уже проверено выше), а, например,
+        // (2,1,1) должен ровно удвоить расстояние от центра вдоль X и оставить Y/Z как есть.
+        var stretchedTransform = FunctionalBlockGeometry.ComputeFitTransform(modelAabb, targetExtent, targetCenter, Vector3I.Zero, new Vector3(2f, 1f, 1f));
+        var stretchedMinCorner = stretchedTransform * new Vector3(1, 1, 1);
+        var expectedStretchedMinCorner = targetCenter + new Vector3(-1 * 2f, -2, -1) * 0.0625f;
+        Check(stretchedMinCorner.IsEqualApprox(expectedStretchedMinCorner),
+            "ComputeFitTransform: extraScale stretches a single axis on top of the uniform fit, independently of the others",
+            $"got={stretchedMinCorner} expected={expectedStretchedMinCorner}");
     }
 
     // ================================================================== точечная покраска наклонных/треугольных граней
@@ -1163,6 +1335,62 @@ public sealed class SelfTest
             Check(world.Workbenches.Count == 3, "the hosted world still builds its 3 workbenches (world building isn't networked/gated)");
         }
 
+        // Баг, найденный пользователем: "Create vehicle" было недоступно, если кто-то уже редактировал через тот же
+        // физический верстак - теперь каждый вызов RequestOpenSession начинает СВОЮ, независимую сессию (уникальный
+        // ключ, см. NetHub.ServerOpenSession), и ни один не отклоняется, сколько бы их ни было на одном верстаке.
+        // Хост - единственный подключённый peer, поэтому оба запроса идут от его же LocalPeerId, но сервер всё равно
+        // не делит их на одну сессию (ключ строится из счётчика, не только из имени верстака).
+        var readySessionKeys = new List<string>();
+        void CaptureSessionReady(string sessionKey, string workbenchName, string json) => readySessionKeys.Add(sessionKey);
+        NetHub.Instance.SessionReadyForMe += CaptureSessionReady;
+
+        const string benchName = "WorkbenchLarge";
+        NetHub.Instance.RequestOpenSession(benchName, null);
+        NetHub.Instance.RequestOpenSession(benchName, null);
+        await Frames(host, 1);
+
+        NetHub.Instance.SessionReadyForMe -= CaptureSessionReady;
+        Check(readySessionKeys.Count == 2 && readySessionKeys[0] != readySessionKeys[1],
+            "two Create-vehicle requests on the SAME workbench both succeed, with two distinct session keys (no more 'one session per workbench' limit)",
+            $"keys=[{string.Join(", ", readySessionKeys)}]");
+
+        // Баг, найденный пользователем: раньше "есть активная сессия" рассылалось ОДИН раз (broadcast) в момент
+        // открытия сессии - кто узнал об этом ПОЗЖЕ (например, подключился к сети уже после), никогда не видел,
+        // что можно присоединиться. Обе сессии выше уже открыты К ЭТОМУ МОМЕНТУ - запрос ниже имитирует именно
+        // "узнал о них только сейчас, открыв меню" (см. GameWorld case Key.E) - должен увидеть ОБЕ, не только ту,
+        // что существовала на момент какого-то более раннего broadcast.
+        string[] sessionKeys = Array.Empty<string>();
+        long[] adminIds = Array.Empty<long>();
+        void CaptureSessionList(string wbName, string[] keys, long[] admins)
+        {
+            if (wbName != benchName) return;
+            sessionKeys = keys;
+            adminIds = admins;
+        }
+
+        NetHub.Instance.WorkbenchSessionsForMe += CaptureSessionList;
+        NetHub.Instance.RequestWorkbenchSessions(benchName);
+        await Frames(host, 1);
+        NetHub.Instance.WorkbenchSessionsForMe -= CaptureSessionList;
+
+        Check(sessionKeys.Length == 2 && sessionKeys[0] != sessionKeys[1] && adminIds.Length == 2,
+            "querying the workbench's sessions on demand returns BOTH already-open sessions, not just the one active at some earlier broadcast moment (the actual bug)",
+            $"keys=[{string.Join(", ", sessionKeys)}]");
+        Check(Array.IndexOf(sessionKeys, readySessionKeys[0]) >= 0 && Array.IndexOf(sessionKeys, readySessionKeys[1]) >= 0,
+            "...and the returned keys are exactly the two sessions created above");
+
+        // То же самое через реальный флоу открытия меню верстака (GameWorld.case Key.E): открыть меню, запросить
+        // список, дождаться ответа - Create/Join должны выставиться корректно.
+        world.WorkbenchMenu.Open(benchName);
+        NetHub.Instance.RequestWorkbenchSessions(benchName);
+        await Frames(host, 1);
+        Check(!world.WorkbenchMenu.IsCreateButtonDisabled,
+            "Create vehicle stays enabled on a workbench that already has active sessions (the actual bug - it used to be disabled here)");
+        Check(!world.WorkbenchMenu.IsJoinButtonDisabled && world.WorkbenchMenu.JoinableSessionCount == 2,
+            "Join is enabled and the dropdown lists both sessions, now that the menu has queried the server fresh",
+            $"count={world.WorkbenchMenu.JoinableSessionCount}");
+        world.WorkbenchMenu.Close();
+
         // Регрессия на баг, найденный пользователем: раньше игроки жили ПОД GameWorld - когда хост (сервер, значит
         // авторитативен над самим существованием этих узлов) входил в свой редактор, его собственная пересборка
         // сцены попутно уничтожала ВСЕХ реплицированных игроков у ВСЕХ клиентов разом (серый экран,
@@ -1174,12 +1402,25 @@ public sealed class SelfTest
         firstPlayerNode?.SetActive(false);
         if (NetHub.Instance.PlayersRoot != null) NetHub.Instance.PlayersRoot.Visible = false;
 
+        // Баг, найденный пользователем: и у хоста, и у клиента вращение камеры переставало работать после выхода с
+        // верстака - BuildEditor оставляет мышь видимой (Input.MouseMode.Visible, см. Editor.FlyCamera - СКМ только
+        // на время поворота), а для переиспользованного (не пересозданного) узла игрока ничего не возвращало её в
+        // Captured, от которого зависит Player.Look. Симулируем ровно это состояние перед "возвратом в мир".
+        Input.MouseMode = Input.MouseModeEnum.Visible;
+
         world.QueueFree();
         await Frames(host, 1);
 
         var world2 = new GameWorld { Name = "SelfTestHostedWorld2" };
         host.AddChild(world2);
         await Frames(host, 3);
+
+        // В headless-режиме дисплейный сервер не хранит режим мыши (та же оговорка, что и у теста "holding MMB
+        // captures the mouse..." ниже) - там, где он реально хранится (оконный запуск), это и есть регрессия на
+        // баг пользователя: camera rotation переставала работать после возврата из редактора, пока не нажат Esc.
+        Check(DisplayServer.GetName() == "headless" || Input.MouseMode == Input.MouseModeEnum.Captured,
+            "returning to the networked world re-captures the mouse even for a REUSED player node (bug fix - camera rotation used to stay broken until Esc was pressed)",
+            $"mode={Input.MouseMode}");
 
         Check(world2.Player == firstPlayerNode,
             "returning to the networked world (same peer, e.g. after entering/exiting the editor) reconnects to the SAME persistent player node, not a fresh one");
@@ -1415,6 +1656,27 @@ public sealed class SelfTest
         Check(large?.GetNodeOrNull("Collision") is CollisionShape3D,
             "a workbench has a collision shape (needed for look-based interaction - see GameWorld.RaycastFromCamera)");
 
+        // Баг, найденный пользователем: ожидающий ответа на Join игрок не мог двигаться вообще - плашка ожидания
+        // не должна замораживать WASD, в отличие от остальных модальных окон (меню верстака и т.п.), см.
+        // GameWorld.MovementBlockingModalOpen/AnyModalOpen. Не требует настоящей сети - это чистая проверка того,
+        // какие модалки какой флаг двигают, сама плашка показывается/прячется напрямую.
+        await Frames(editor, 1);
+        Check(world.Player!.MovementEnabled, "movement starts enabled with no modal open");
+
+        world.JoinWaitingUi.Show();
+        await Frames(editor, 2);
+        Check(world.Player!.MovementEnabled, "the join-waiting panel does NOT freeze player movement (bug fix - the player can walk around while waiting for the admin's response)");
+        world.JoinWaitingUi.Hide();
+        await Frames(editor, 2);
+        Check(world.Player!.MovementEnabled, "movement stays enabled once the join-waiting panel closes");
+
+        world.WorkbenchMenu.Open("WorkbenchLarge");
+        await Frames(editor, 2);
+        Check(!world.Player!.MovementEnabled, "the workbench menu itself still freezes movement, unlike the join-waiting panel");
+        world.WorkbenchMenu.Close();
+        await Frames(editor, 2);
+        Check(world.Player!.MovementEnabled, "movement is re-enabled once the workbench menu closes");
+
         world.QueueFree();
         await Frames(editor, 1);
         editor.EditorCamera.Current = true; // world.Player.Camera выше отобрал "текущую" камеру вьюпорта - вернуть редакторскую
@@ -1497,14 +1759,18 @@ public sealed class SelfTest
         state.Borders = true;
 
         int blockCount = BlockCatalog.Instance.All.Count;
-        Check(blockCount == 4, "catalog has 4 shape blocks (block, wedge, pyramid, inverse_pyramid)", $"got {blockCount}");
+        Check(blockCount == 10, "catalog has 10 blocks (4 shape + 6 functional)", $"got {blockCount}");
         int filledSlots = 0;
         for (int i = 0; i < EditorState.HotbarSize; i++)
         {
             if (!string.IsNullOrEmpty(state.GetSlot(i))) filledSlots++;
         }
 
-        Check(filledSlots == blockCount, $"hotbar is pre-filled with all {blockCount} blocks (rest of the 9 slots stay empty)", $"filled={filledSlots}");
+        // 10 блоков > 9 слотов хотбара - один (алфавитно последний функциональный, "shaft") не попадает в хотбар по
+        // умолчанию, но остаётся доступен через полный список блоков (Tab). Первые 4 слота - по-прежнему
+        // block/inverse_pyramid/pyramid/wedge (см. EditorState - резиновые блоки идут в хотбар раньше функциональных).
+        int expectedFilled = Math.Min(blockCount, EditorState.HotbarSize);
+        Check(filledSlots == expectedFilled, $"hotbar is pre-filled with the first {expectedFilled} blocks (shape blocks first, then functional)", $"filled={filledSlots}");
 
         camera.LookAtPoint(new Vector3(1.5f, 2f, 2.5f), new Vector3(0.125f, 0.0f, 0.125f));
         await Frames(editor, 2);
@@ -1828,6 +2094,24 @@ public sealed class SelfTest
             "the placed block bakes in the pending rotation steps");
         editor.World.Construction.Clear();
 
+        // --- баг, найденный пользователем: призрак поворачивался МГНОВЕННО, без анимации, когда на том же верстаке
+        // пользователь попросил именно её (см. BuildEditor._ghostVisualBasis/EditorState.PendingRotationBasis).
+        // PendingRotationBasis обновляется мгновенно (как и раньше PendingRotationSteps), а ВИЗУАЛЬНАЯ ориентация
+        // призрака должна ещё быть "в пути" сразу после нажатия и нагнать цель только спустя какое-то время.
+        await Move(editor, ground); // постройка только что очищена - призрак снова над свободной клеткой
+        var targetBeforeExtraSpin = state.PendingRotationBasis;
+        await PressKeyDown(editor, Godot.Key.J);
+        Check(!state.PendingRotationBasis.IsEqualApprox(targetBeforeExtraSpin),
+            "J updates PendingRotationBasis instantly (the logical/placement value is never animated itself)", $"{state.PendingRotationBasis}");
+        Check(!editor.GhostVisualBasis.IsEqualApprox(state.PendingRotationBasis),
+            "...but the ghost's VISUAL orientation has not caught up yet right after the press - it animates smoothly, not an instant snap",
+            $"visual={editor.GhostVisualBasis} target={state.PendingRotationBasis}");
+        await PressKeyUp(editor, Godot.Key.J);
+        await Frames(editor, 90);
+        Check(editor.GhostVisualBasis.IsEqualApprox(state.PendingRotationBasis),
+            "...and settles exactly on the target orientation after enough time has passed",
+            $"visual={editor.GhostVisualBasis} target={state.PendingRotationBasis}");
+
         // Отражение (U/I/O): переключает EditorState.PendingMirror для СЛЕДУЮЩЕГО ставящегося блока/призрака — как
         // и вращение (J/K/L) выше, а не двигает уже поставленный блок под курсором. Раньше (баг) эти клавиши двигали
         // наведённый блок на +1 клетку вместо отражения вершин — фикс проверяется явно ниже.
@@ -1877,6 +2161,25 @@ public sealed class SelfTest
             "wedge ghost includes its 2 FullCoverage sides (bottom+back, 2 quads = 4 triangles) in addition to the " +
             "4 partial ones (ramp + 2 triangular borts) - not just the partial ones, so its silhouette is solid",
             $"got {ghostTriangles} triangles");
+
+        // --- баг (исправлен, найден пользователем): призрак функционального блока со своей моделью (мотор/вал) не
+        // отображался вообще - UpdateGhostMesh трактовал ЛЮБОЙ блок без BuildingBlockComponent как куб (BoxMesh) и
+        // писал его в editor.Ghost.Mesh, что для настоящей многоузловой glTF-сцены не работает (один MeshInstance3D
+        // не может держать произвольное дерево узлов). Теперь такой блок показывает отдельный узел-призрак
+        // (_ghostModel, см. UpdateGhostModel) с настоящей моделью, а не куб/ничего.
+        // Слот 6 к этому моменту теста уже мог быть переопределён более ранними проверками (например, кликом по
+        // карточке "Wedge" в списке блоков) - выставляем содержимое явно, не полагаясь на дефолтное заполнение хотбара.
+        state.SelectedSlot = 6;
+        state.SetSlot(6, "electric_motor");
+        Check(state.SelectedBlockSlug == "electric_motor", "setup: hotbar slot 6 now holds 'electric_motor'", state.SelectedBlockSlug);
+        await Move(editor, ground);
+        Check(!editor.Ghost.Visible, "electric_motor ghost: the cube/shape ghost (editor.Ghost) is hidden - a real model is shown instead");
+        Check(editor.GhostModelVisible, "electric_motor ghost: the model ghost IS visible over empty ground", $"{editor.GhostModelVisible}");
+
+        state.SelectedSlot = 3; // wedge - обратно на куб/форму, проверить, что призрак модели прячется обратно
+        await Move(editor, ground);
+        Check(editor.Ghost.Visible && !editor.GhostModelVisible,
+            "switching back to a shape block hides the model ghost again and shows the cube/shape ghost");
 
         // --- баг (исправлен): покраска стороны формы, которую она НЕ закрывает целиком (Wedge закрывает только
         // низ/заднюю стенку - "верх", Y+, никогда не FullCoverage), раньше перекрашивала ВЕСЬ экземпляр целиком
@@ -2111,5 +2414,101 @@ public sealed class SelfTest
         if (FileAccess.FileExists(customPalettePath)) DirAccess.RemoveAbsolute(customPalettePath);
         grid.Clear();
         editor.World.RebuildDirty();
+    }
+
+    // ================================================================== дебаг-редактор блоков (--blockeditor)
+
+    /// <summary>
+    /// <see cref="Dev.BlockPrefabEditor"/> — отдельный инструмент (не <see cref="Editor.BuildEditor"/>), поэтому
+    /// добавляется как временный ребёнок уже загруженного <paramref name="editor"/> (та же техника, что и у других
+    /// интеграционных тестов, собирающих свой узел поверх дерева <c>BuildEditor</c> — сцена не обязана быть главной,
+    /// чтобы её можно было собрать и проверить). Главный риск этого инструмента — сериализация в/из XML (UI-часть
+    /// глазами не проверить без живого дисплея), поэтому тест целится именно в неё: загрузка реального
+    /// функционального блока из каталога + полный цикл запись→чтение с диска для нового.
+    /// </summary>
+    private async Task RunBlockPrefabEditorTests(BuildEditor editor)
+    {
+        GD.Print("-- block prefab editor (--blockeditor): load existing + new/save/reload round-trip");
+
+        var tool = new BlockPrefabEditor();
+        editor.AddChild(tool);
+        await Frames(editor, 2);
+
+        // Загрузка существующего функционального блока - поля должны совпасть с blocks/electric_motor.xml (см.
+        // блочные тесты выше: ровно 1 вход Electricity + 1 выход Torque, footprint 1x1x1, scene motor_small.glb).
+        tool.LoadSlug("electric_motor");
+        Check(tool.Ui.Footprint == Vector3I.One, "loading 'electric_motor' reads its footprint (1,1,1)", $"{tool.Ui.Footprint}");
+        Check(tool.Ui.ScenePath == "res://meshes/motor_small.glb", "...and its scene path", tool.Ui.ScenePath);
+        Check(tool.Ui.Behavior == "ElectricMotor", "...and its behavior string", tool.Ui.Behavior);
+
+        // Новый блок + бокс коллизии + сохранение + перечитывание с диска - полный цикл записи/чтения XML (главный
+        // риск этого инструмента, см. class doc) на ОДНОРАЗОВОМ тестовом слаге, не трогающем настоящий каталог.
+        const string testSlug = "selftest_blockprefab_tmp";
+        string path = $"res://blocks/{testSlug}.xml";
+        if (FileAccess.FileExists(path)) DirAccess.RemoveAbsolute(path);
+
+        tool.ResetToDefaults(testSlug);
+        tool.AddCollisionBox();
+        Check(tool.Ui.CollisionBoxes.Count == 1, "AddCollisionBox adds exactly one row", $"{tool.Ui.CollisionBoxes.Count}");
+        tool.Ui.SetModelScaleForTesting(new Vector3(2f, 1f, 1.5f)); // "Model stretch" - должен тоже пережить save+reload
+
+        tool.Save();
+        Check(FileAccess.FileExists(path), "Save() writes blocks/<slug>.xml", path);
+
+        tool.ResetToDefaults(""); // сбросить поля, чтобы следующая загрузка проверяла реально ПРОЧИТАННОЕ, не старое
+        tool.LoadSlug(testSlug);
+        Check(tool.Ui.Footprint == Vector3I.One, "round-trip: footprint (default 1,1,1) survives save+reload", $"{tool.Ui.Footprint}");
+        Check(tool.Ui.CollisionBoxes.Count == 1, "round-trip: the collision box survives save+reload", $"{tool.Ui.CollisionBoxes.Count}");
+        Check(tool.Ui.CollisionBoxes.Count == 1 && tool.Ui.CollisionBoxes[0].Size.IsEqualApprox(new Vector3(0.25f, 0.25f, 0.25f)),
+            "round-trip: the collision box's size (default = footprint in meters) survives exactly",
+            tool.Ui.CollisionBoxes.Count > 0 ? $"{tool.Ui.CollisionBoxes[0].Size}" : "no boxes");
+        Check(tool.Ui.ModelScale.IsEqualApprox(new Vector3(2f, 1f, 1.5f)),
+            "round-trip: the manual 'Model stretch' survives save+reload", $"{tool.Ui.ModelScale}");
+
+        if (FileAccess.FileExists(path)) DirAccess.RemoveAbsolute(path); // не мусорим в blocks/ настоящим файлом
+        tool.QueueFree();
+    }
+
+    /// <summary>
+    /// Баг, найденный пользователем: раньше ЛЮБОЙ блок без собственных боксов коллизии (включая функциональные)
+    /// автоматически получал один бокс на весь экземпляр - у некоторых моделей есть выпирающие за footprint детали,
+    /// которым коллизия не нужна, а автоматический бокс делал "совсем без коллизии" недостижимым. Теперь это
+    /// различается по наличию <see cref="FunctionalBlockComponent"/>: у обычного блока (куб) коллизия по-прежнему
+    /// автоматическая, у функционального (electric_motor, без собственных боксов в каталоге) - её нет вообще.
+    /// </summary>
+    private void RunVehicleSpawnerCollisionTests(Node host)
+    {
+        GD.Print("-- VehicleSpawner collision: ordinary blocks keep the automatic box, functional blocks get EXACTLY their own boxes (no automatic fallback)");
+
+        var grid = new VoxelGrid();
+        var construction = new Construction(grid);
+        var catalog = BlockCatalog.Instance;
+        construction.Place(new Vector3I(0, 0, 0), catalog.Get("block"), Colors.White);
+        construction.Place(new Vector3I(5, 0, 0), catalog.Get("electric_motor"), Colors.White);
+
+        // electric_motor может быть отредактирован через --blockeditor в любой момент (и уже был, в этой же сессии) -
+        // не зашиваем предположение "у него 0 боксов коллизии", а берём РЕАЛЬНОЕ текущее число из каталога.
+        // Проверяемый инвариант не "сколько именно" - а что функциональный блок получает РОВНО столько
+        // CollisionShape3D, сколько у него своих боксов, и ни одного автоматического "на всякий случай" сверху.
+        int motorOwnBoxes = catalog.Get("electric_motor").GetComponent<FunctionalBlockComponent>()?.CollisionBoxes.Count ?? 0;
+
+        string json = ConstructionIO.Serialize(construction);
+        var parent = new Node3D();
+        host.AddChild(parent);
+
+        var body = VehicleSpawner.Spawn(parent, json, Vector3.Zero);
+        int shapeCount = 0;
+        foreach (var child in body.GetChildren())
+        {
+            if (child is CollisionShape3D) shapeCount++;
+        }
+
+        int expected = 1 + motorOwnBoxes; // 1 - автоматический бокс 'block', + сколько реально задано у мотора
+        Check(shapeCount == expected,
+            "'block' gets its automatic box (1) + 'electric_motor' gets EXACTLY its own CollisionBoxes.Count, no automatic fallback on top",
+            $"got {shapeCount}, expected {expected} (1 + electric_motor.CollisionBoxes.Count={motorOwnBoxes})");
+
+        body.QueueFree();
+        parent.QueueFree();
     }
 }

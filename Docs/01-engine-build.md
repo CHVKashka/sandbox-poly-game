@@ -119,12 +119,13 @@ dotnet nuget add source <GODOT_SRC>\bin\GodotSharp\Tools\nupkgs --name GodotDoub
 
 ## 8. Вторая машина разработки
 
-⚠️ **Нужно обновить**: движок там собран как `4.6.3` (см. историю ниже), а проект теперь на `4.7.2`
-(см. `Docs/WORKLOG.md` за 2026-09-27) — там нужно пересобрать движок по этой же инструкции, но с тегом
-`4.7.2-stable` на шаге 2 (клонировать заново или `git fetch --tags` + `git checkout 4.7.2-stable` в уже
-имеющемся `<GODOT_SRC>`), затем повторить шаги 3 целиком (editor, glue, `build_assemblies.py --precision=double`,
-шаблоны). Локальный NuGet-источник `GodotDouble` перерегистрировать не нужно — путь на этой машине не
-меняется, но кэш `%USERPROFILE%\.nuget\packages\godot*` стоит почистить после пересборки (см. п. 6).
+Обновлена до `4.7.2` **2026-10-01**: `git fetch --tags` + `git checkout 4.7.2-stable` в уже имеющемся
+`<GODOT_SRC>` (`D:\Programs\Godot-4.6.3-double` — имя папки осталось историческим, движок внутри теперь 4.7.2),
+затем шаги 3 целиком (editor, glue, `build_assemblies.py --precision=double`, оба шаблона) — все пять команд
+отработали с первого раза, без ошибок. NuGet-источник `GodotDouble` переregistрировать не понадобилось (путь не
+менялся), кэш `%USERPROFILE%\.nuget\packages\godot*` почищен. Проверено: баннер `4.7.2.stable.mono.double.custom_build`;
+SHA256 `GodotSharp.dll` из NuGet-кэша совпал с собранным движком; `dotnet build` — 0 ошибок; самотесты —
+**325 passed, 0 failed**. См. `Docs/WORKLOG.md` за эту дату.
 
 Ниже — как эта машина была собрана изначально (для истории; в целом та же инструкция, только с 4.6.3):
 

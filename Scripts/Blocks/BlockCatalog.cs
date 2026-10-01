@@ -140,6 +140,7 @@ public sealed class BlockCatalog
     {
         BaseComponent.ComponentType => new BaseComponent(),
         BuildingBlockComponent.ComponentType => new BuildingBlockComponent(),
+        FunctionalBlockComponent.ComponentType => new FunctionalBlockComponent(),
         _ => throw new InvalidOperationException($"unknown component type '{type}'"),
     };
 }

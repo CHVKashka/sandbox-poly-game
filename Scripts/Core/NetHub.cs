@@ -24,8 +24,28 @@ namespace SandboxPolyGame.Core;
 /// напрямую (вызов события), другим — тем же <c>RpcId</c>. Такая единая форма ("это я? вызови напрямую — иначе по
 /// сети") не полагается на недокументированные тонкости поведения Godot при `RpcId(self, ...)`.
 /// <para/>
+/// <b>Один верстак — несколько одновременных сессий</b> (см. <see cref="WorkbenchSession"/> class doc, изменено по
+/// запросу пользователя): раньше на одном физическом верстаке одновременно мог идти только ОДИН Create/Open/Join —
+/// остальным Create vehicle был попросту недоступен, пока кто-то другой уже редактировал. Теперь каждый вызов
+/// <see cref="RequestOpenSession"/> начинает СВОЮ, независимую сессию с уникальным ключом (не просто имя верстака —
+/// см. <see cref="ServerOpenSession"/>), и таких сессий на одном верстаке может быть сколько угодно одновременно.
+/// Везде ниже, где раньше параметр назывался <c>workbenchName</c> и служил ключом словаря <see cref="_sessions"/>
+/// (правки/Undo/Redo/закрытие/ответ на Join — методы, работающие с УЖЕ ОТКРЫТОЙ сессией), он переименован в
+/// <c>sessionKey</c>, чтобы не путать с именем ФИЗИЧЕСКОГО верстака (используется только там, где запрос ещё не
+/// привязан ни к какой конкретной сессии — <see cref="RequestOpenSession"/>/<see cref="RequestJoin"/>).
+/// <para/>
+/// <b>Список сессий верстака — по запросу, не по broadcast</b> (см. <see cref="RequestWorkbenchSessions"/>, изменено
+/// по фидбеку пользователя): раньше "на этом верстаке есть активная сессия" рассылалось ОДИН раз в момент
+/// открытия/закрытия сессии всем ТОГДА ПОДКЛЮЧЁННЫМ игрокам — игрок, подключившийся ПОЗЖЕ (уже после рассылки),
+/// никогда не узнавал о уже идущей сессии, и кнопка Join оставалась выключенной навсегда, хотя Join'иться было к
+/// кому. Вместо broadcast+кэш — простой запрос-ответ: <c>World.Ui.WorkbenchMenuUi</c> спрашивает сервер заново
+/// КАЖДЫЙ раз при открытии меню верстака, поэтому не бывает устаревшим ни при каком порядке подключения. Тот же
+/// запрос даёт список ВСЕХ сессий на верстаке (ключ + id админа каждой) — если их несколько, UI показывает
+/// выпадающий список, и <see cref="RequestJoin"/> явно адресует ВЫБРАННУЮ (не "самую новую", как раньше).
+/// <para/>
 /// <b>Не сделано в этом проходе</b> (см. открытые вопросы в 05): пары логин/имя игрока (участники видны только по
-/// numeric peer id), выделенный сервер без локального игрока (архитектурно не мешает, но не проверялся).
+/// numeric peer id — в выпадающем списке Join тоже только "Admin #id"), выделенный сервер без локального игрока
+/// (архитектурно не мешает, но не проверялся).
 /// </summary>
 public partial class NetHub : Node
 {
@@ -33,8 +53,22 @@ public partial class NetHub : Node
 
     public static NetHub Instance { get; private set; } = null!;
 
+    /// <summary>Ключ — не имя верстака, а уникальный ключ сессии (см. class doc и <see cref="ServerOpenSession"/>).</summary>
     private readonly Dictionary<string, WorkbenchSession> _sessions = new();
-    private readonly HashSet<string> _activeSessionNames = new();
+
+    /// <summary>Монотонно растущий счётчик — единственный источник уникальности ключа сессии (см.
+    /// <see cref="ServerOpenSession"/>).</summary>
+    private int _sessionCounter;
+
+    /// <summary>
+    /// Сервер-only: кто (peer id) сейчас ждёт ответа на свой Join, и у кого (админа) висит соответствующий попап —
+    /// нужно, чтобы при внезапном отключении заявителя (вышел в меню/закрыл игру/потерял соединение) попап у админа
+    /// не остался висеть на отключившегося игрока навсегда (см. <see cref="HandlePeerDisconnectedForPendingJoins"/>,
+    /// Docs/05-world-and-vehicle-systems.md, «Мультиплеер»). Явная отмена кнопкой Cancel
+    /// (<see cref="RequestCancelJoin"/>) тоже снимает запись отсюда — это НЕ дублирующий механизм, а тот же самый
+    /// случай "заявка больше не актуальна", только обнаруженный по дисконнекту, а не по явному клику.
+    /// </summary>
+    private readonly Dictionary<long, (long AdminId, string SessionKey)> _pendingJoinRequests = new();
 
     /// <summary>Контейнер заспавненных <see cref="Player"/> — живёт ЗДЕСЬ (автозагрузка), не в
     /// <c>World.GameWorld</c>, см. <see cref="EnsurePlayerReplication"/> class doc.</summary>
@@ -64,23 +98,34 @@ public partial class NetHub : Node
     public event Action? ConnectionFailed;
     public event Action? ServerDisconnected;
 
-    /// <summary>На этом верстаке появилась/пропала активная сессия — драйвит кнопку Join в
-    /// <c>World.Ui.WorkbenchMenuUi</c> у ВСЕХ игроков, не только участников.</summary>
-    public event Action<string, bool>? SessionActiveChanged;
+    /// <summary>Ответ на МОЙ <see cref="RequestWorkbenchSessions"/> — все сессии, сейчас открытые на этом верстаке:
+    /// имя верстака (эхом — для сверки, что ответ ещё относится к открытому меню), параллельные массивы ключей
+    /// сессий и id их админов (одинаковой длины; пусто — ни одной). Запрашивается заново при КАЖДОМ открытии меню
+    /// верстака (см. <c>World.Ui.WorkbenchMenuUi</c>/class doc) — драйвит и доступность кнопки Join, и выпадающий
+    /// список, если сессий несколько.</summary>
+    public event Action<string, string[], long[]>? WorkbenchSessionsForMe;
 
-    /// <summary>Ответ на МОЙ <see cref="RequestOpenSession"/> — пора входить в редактор с этой постройкой.</summary>
-    public event Action<string, string>? SessionReadyForMe;
+    /// <summary>Ответ на МОЙ <see cref="RequestOpenSession"/> — пора входить в редактор с этой постройкой.
+    /// Параметры: уникальный ключ сессии (пойдёт во все дальнейшие <c>RequestEdit</c>/<c>RequestUndo</c>/...),
+    /// имя физического верстака (нужно только чтобы вернуть заспавненную постройку в его зону — не путать с ключом
+    /// сессии, см. class doc), сериализованная постройка.</summary>
+    public event Action<string, string, string>? SessionReadyForMe;
 
-    /// <summary>Я админ этого верстака, кто-то (peer id) просится присоединиться — показать попап принять/отклонить.</summary>
+    /// <summary>Я админ этого верстака, кто-то (peer id) просится присоединиться к МОЕЙ сессии (ключ) — показать
+    /// попап принять/отклонить.</summary>
     public event Action<string, long>? JoinRequestIncoming;
 
-    /// <summary>Админ принял мою заявку — пора входить в редактор с этой постройкой (как и SessionReadyForMe).</summary>
+    /// <summary>Админ принял мою заявку — пора входить в редактор с этой постройкой. Ключ сессии тут — ровно тот,
+    /// что я сам указал в <see cref="RequestJoin"/> (выбран из <see cref="WorkbenchSessionsForMe"/>), поэтому, в
+    /// отличие от <see cref="SessionReadyForMe"/>, эхо имени верстака не нужно — я уже знаю его сам
+    /// (<c>GameWorld._activeWorkbench</c>, тот же верстак, через который открыл меню).</summary>
     public event Action<string, string>? JoinAcceptedForMe;
 
     public event Action<string, string>? JoinRejectedForMe;
 
-    /// <summary>Заявитель отменил свою заявку (кнопка Cancel) — я админ и должен убрать попап, если он ещё
-    /// показывает ИМЕННО эту заявку (см. <see cref="RequestCancelJoin"/>).</summary>
+    /// <summary>Заявитель отменил свою заявку (кнопка Cancel, либо сам отключился от сети — см.
+    /// <see cref="HandlePeerDisconnectedForPendingJoins"/>) — я админ и должен убрать попап, если он ещё показывает
+    /// ИМЕННО эту заявку (см. <see cref="RequestCancelJoin"/>).</summary>
     public event Action<string, long>? JoinCancelled;
 
     /// <summary>Админ завершил сессию (вышел/заспавнил) — участников без предупреждения вышвыривает обратно в мир.</summary>
@@ -112,6 +157,7 @@ public partial class NetHub : Node
         Instance = this;
         Multiplayer.PeerConnected += id => PeerConnected?.Invoke(id);
         Multiplayer.PeerDisconnected += id => PeerDisconnected?.Invoke(id);
+        Multiplayer.PeerDisconnected += HandlePeerDisconnectedForPendingJoins;
         Multiplayer.ConnectedToServer += () => ConnectedToServer?.Invoke();
         Multiplayer.ConnectionFailed += () => ConnectionFailed?.Invoke();
         Multiplayer.ServerDisconnected += () => ServerDisconnected?.Invoke();
@@ -148,7 +194,7 @@ public partial class NetHub : Node
         Multiplayer.MultiplayerPeer = null;
         _isNetworked = false;
         _sessions.Clear();
-        _activeSessionNames.Clear();
+        _pendingJoinRequests.Clear();
 
         PeerConnected -= OnPeerConnectedSpawn;
         PeerDisconnected -= OnPeerDisconnectedDespawn;
@@ -224,9 +270,60 @@ public partial class NetHub : Node
         return player;
     }
 
+    /// <summary>Сервер-only: заявитель (любой peer) отключился от сети, пока ждал ответа на свой Join — убираем
+    /// попап у админа (тот же путь, что и явная Cancel, см. <see cref="ServerCancelJoin"/>) и чистим запись, чтобы
+    /// она не осталась висеть навсегда. Покрывает ЛЮБУЮ причину отключения (Exit to menu → Solo, закрытие игры,
+    /// обрыв связи) — все они одинаково бьют по ENet-соединению, значит одинаково стреляют этим событием.</summary>
+    private void HandlePeerDisconnectedForPendingJoins(long peerId)
+    {
+        if (!IsServer) return;
+        if (!_pendingJoinRequests.Remove(peerId, out var pending)) return;
+
+        if (pending.AdminId == LocalPeerId) JoinCancelled?.Invoke(pending.SessionKey, peerId);
+        else RpcId(pending.AdminId, nameof(RpcJoinCancelled), pending.SessionKey, peerId);
+    }
+
     // ------------------------------------------------------------------------------------------------ сессии — вход
 
-    public bool IsSessionActive(string workbenchName) => _activeSessionNames.Contains(workbenchName);
+    /// <summary>Какие сессии сейчас открыты на этом верстаке — спрашивается заново при каждом открытии меню
+    /// верстака (см. class doc/<see cref="WorkbenchSessionsForMe"/>), не кэшируется клиентом.</summary>
+    public void RequestWorkbenchSessions(string workbenchName)
+    {
+        if (IsServer) ServerListSessions(LocalPeerId, workbenchName);
+        else RpcId(1, nameof(RpcRequestWorkbenchSessions), workbenchName);
+    }
+
+    [Rpc(MultiplayerApi.RpcMode.AnyPeer, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
+    private void RpcRequestWorkbenchSessions(string workbenchName) =>
+        ServerListSessions(Multiplayer.GetRemoteSenderId(), workbenchName);
+
+    private void ServerListSessions(long requesterId, string workbenchName)
+    {
+        var keys = new List<string>();
+        var admins = new List<long>();
+
+        // Сортировка по Ordinal (порядок создания) - детерминированный, стабильный порядок в выпадающем списке,
+        // не зависящий от порядка перечисления словаря.
+        var matches = new List<(int Ordinal, string Key, WorkbenchSession Session)>();
+        foreach (var (key, session) in _sessions)
+        {
+            if (session.WorkbenchName == workbenchName) matches.Add((session.Ordinal, key, session));
+        }
+
+        matches.Sort((a, b) => a.Ordinal.CompareTo(b.Ordinal));
+        foreach (var (_, key, session) in matches)
+        {
+            keys.Add(key);
+            admins.Add(session.AdminPeerId);
+        }
+
+        if (requesterId == LocalPeerId) WorkbenchSessionsForMe?.Invoke(workbenchName, keys.ToArray(), admins.ToArray());
+        else RpcId(requesterId, nameof(RpcWorkbenchSessions), workbenchName, keys.ToArray(), admins.ToArray());
+    }
+
+    [Rpc(MultiplayerApi.RpcMode.Authority, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
+    private void RpcWorkbenchSessions(string workbenchName, string[] sessionKeys, long[] adminPeerIds) =>
+        WorkbenchSessionsForMe?.Invoke(workbenchName, sessionKeys, adminPeerIds);
 
     /// <summary><paramref name="constructionPath"/> — null означает Create vehicle (пустая постройка с корневым
     /// блоком, как и в одиночной игре).</summary>
@@ -241,12 +338,17 @@ public partial class NetHub : Node
     private void RpcOpenSession(string workbenchName, string constructionPath) =>
         ServerOpenSession(Multiplayer.GetRemoteSenderId(), workbenchName, constructionPath);
 
+    /// <summary>
+    /// Раньше здесь была проверка "уже есть сессия на этом верстаке — отказать" (одна сессия на верстак
+    /// одновременно, UI вообще не предлагал бы Create в этом случае). Убрано по запросу пользователя: Create vehicle
+    /// должен работать независимо от того, кто ещё сейчас редактирует через тот же физический верстак — каждый
+    /// вызов начинает СВОЮ, отдельную сессию с уникальным ключом (<paramref name="workbenchName"/> + счётчик), а не
+    /// делит её с чужими и не блокируется их существованием. Сколько угодно игроков может одновременно зайти в свой
+    /// собственный редактор через один и тот же верстак.
+    /// </summary>
     private void ServerOpenSession(long requesterId, string workbenchName, string constructionPath)
     {
-        // Уже идёт сессия на этом верстаке - UI не должен был предложить Create/Open в этом случае (см.
-        // World.Ui.WorkbenchMenuUi), но проверяем и здесь: два конкурирующих Create одновременно не должны создать
-        // вторую сессию поверх первой.
-        if (_sessions.ContainsKey(workbenchName)) return;
+        string sessionKey = $"{workbenchName}#{++_sessionCounter}";
 
         var construction = new Construction(new VoxelGrid());
         if (!string.IsNullOrEmpty(constructionPath) && FileAccess.FileExists(constructionPath))
@@ -258,57 +360,40 @@ public partial class NetHub : Node
             construction.Place(Vector3I.Zero, rootDefinition, rootDefinition.DefaultColor);
         }
 
-        _sessions[workbenchName] = new WorkbenchSession(workbenchName, requesterId, construction);
+        _sessions[sessionKey] = new WorkbenchSession(workbenchName, _sessionCounter, requesterId, construction);
 
-        SendSessionReady(requesterId, workbenchName, construction);
-        BroadcastSessionActive(workbenchName, true);
+        SendSessionReady(requesterId, sessionKey, workbenchName, construction);
     }
 
-    private void SendSessionReady(long targetId, string workbenchName, Construction construction)
+    private void SendSessionReady(long targetId, string sessionKey, string workbenchName, Construction construction)
     {
         string json = ConstructionIO.Serialize(construction);
-        if (targetId == LocalPeerId) SessionReadyForMe?.Invoke(workbenchName, json);
-        else RpcId(targetId, nameof(RpcSessionReady), workbenchName, json);
+        if (targetId == LocalPeerId) SessionReadyForMe?.Invoke(sessionKey, workbenchName, json);
+        else RpcId(targetId, nameof(RpcSessionReady), sessionKey, workbenchName, json);
     }
 
     [Rpc(MultiplayerApi.RpcMode.Authority, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
-    private void RpcSessionReady(string workbenchName, string constructionJson) =>
-        SessionReadyForMe?.Invoke(workbenchName, constructionJson);
-
-    private void BroadcastSessionActive(string workbenchName, bool active)
-    {
-        if (active) _activeSessionNames.Add(workbenchName); else _activeSessionNames.Remove(workbenchName);
-        SessionActiveChanged?.Invoke(workbenchName, active);
-
-        foreach (long peerId in Multiplayer.GetPeers())
-        {
-            RpcId(peerId, nameof(RpcSessionActiveChanged), workbenchName, active);
-        }
-    }
-
-    [Rpc(MultiplayerApi.RpcMode.Authority, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
-    private void RpcSessionActiveChanged(string workbenchName, bool active)
-    {
-        if (active) _activeSessionNames.Add(workbenchName); else _activeSessionNames.Remove(workbenchName);
-        SessionActiveChanged?.Invoke(workbenchName, active);
-    }
+    private void RpcSessionReady(string sessionKey, string workbenchName, string constructionJson) =>
+        SessionReadyForMe?.Invoke(sessionKey, workbenchName, constructionJson);
 
     // ------------------------------------------------------------------------------------------------ Join
 
-    public void RequestJoin(string workbenchName)
+    /// <summary><paramref name="sessionKey"/> — конкретная сессия, выбранная игроком из <see cref="WorkbenchSessionsForMe"/>
+    /// (если на верстаке их несколько — из выпадающего списка в UI; если одна — выбрана автоматически).</summary>
+    public void RequestJoin(string sessionKey)
     {
-        if (IsServer) ServerJoin(LocalPeerId, workbenchName);
-        else RpcId(1, nameof(RpcJoin), workbenchName);
+        if (IsServer) ServerJoin(LocalPeerId, sessionKey);
+        else RpcId(1, nameof(RpcJoin), sessionKey);
     }
 
     [Rpc(MultiplayerApi.RpcMode.AnyPeer, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
-    private void RpcJoin(string workbenchName) => ServerJoin(Multiplayer.GetRemoteSenderId(), workbenchName);
+    private void RpcJoin(string sessionKey) => ServerJoin(Multiplayer.GetRemoteSenderId(), sessionKey);
 
-    private void ServerJoin(long requesterId, string workbenchName)
+    private void ServerJoin(long requesterId, string sessionKey)
     {
-        if (!_sessions.TryGetValue(workbenchName, out var session))
+        if (!_sessions.TryGetValue(sessionKey, out var session))
         {
-            SendJoinRejected(requesterId, workbenchName, "No active session on this workbench.");
+            SendJoinRejected(requesterId, sessionKey, "This session is no longer available.");
             return;
         }
 
@@ -316,144 +401,148 @@ public partial class NetHub : Node
         {
             // Уже участник (двойной клик/переподключение) - просто отдать текущее состояние ещё раз, не спрашивая
             // админа заново.
-            SendJoinAccepted(requesterId, workbenchName, session);
+            SendJoinAccepted(requesterId, sessionKey, session);
             return;
         }
 
-        SendIncomingJoinRequest(session.AdminPeerId, workbenchName, requesterId);
+        _pendingJoinRequests[requesterId] = (session.AdminPeerId, sessionKey);
+        SendIncomingJoinRequest(session.AdminPeerId, sessionKey, requesterId);
     }
 
-    private void SendIncomingJoinRequest(long adminId, string workbenchName, long requesterId)
+    private void SendIncomingJoinRequest(long adminId, string sessionKey, long requesterId)
     {
-        if (adminId == LocalPeerId) JoinRequestIncoming?.Invoke(workbenchName, requesterId);
-        else RpcId(adminId, nameof(RpcIncomingJoinRequest), workbenchName, requesterId);
+        if (adminId == LocalPeerId) JoinRequestIncoming?.Invoke(sessionKey, requesterId);
+        else RpcId(adminId, nameof(RpcIncomingJoinRequest), sessionKey, requesterId);
     }
 
     [Rpc(MultiplayerApi.RpcMode.Authority, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
-    private void RpcIncomingJoinRequest(string workbenchName, long requesterId) =>
-        JoinRequestIncoming?.Invoke(workbenchName, requesterId);
+    private void RpcIncomingJoinRequest(string sessionKey, long requesterId) =>
+        JoinRequestIncoming?.Invoke(sessionKey, requesterId);
 
-    public void RespondToJoin(string workbenchName, long requesterId, bool accepted)
+    public void RespondToJoin(string sessionKey, long requesterId, bool accepted)
     {
-        if (IsServer) ServerRespondToJoin(LocalPeerId, workbenchName, requesterId, accepted);
-        else RpcId(1, nameof(RpcRespondToJoin), workbenchName, requesterId, accepted);
+        if (IsServer) ServerRespondToJoin(LocalPeerId, sessionKey, requesterId, accepted);
+        else RpcId(1, nameof(RpcRespondToJoin), sessionKey, requesterId, accepted);
     }
 
     [Rpc(MultiplayerApi.RpcMode.AnyPeer, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
-    private void RpcRespondToJoin(string workbenchName, long requesterId, bool accepted) =>
-        ServerRespondToJoin(Multiplayer.GetRemoteSenderId(), workbenchName, requesterId, accepted);
+    private void RpcRespondToJoin(string sessionKey, long requesterId, bool accepted) =>
+        ServerRespondToJoin(Multiplayer.GetRemoteSenderId(), sessionKey, requesterId, accepted);
 
-    private void ServerRespondToJoin(long responderId, string workbenchName, long requesterId, bool accepted)
+    private void ServerRespondToJoin(long responderId, string sessionKey, long requesterId, bool accepted)
     {
         // Только админ ЭТОЙ сессии может отвечать на заявки - подмена id отправителем тут не поможет, responderId
         // всегда настоящий (GetRemoteSenderId для удалённых вызовов, LocalPeerId для локального).
-        if (!_sessions.TryGetValue(workbenchName, out var session) || session.AdminPeerId != responderId) return;
+        if (!_sessions.TryGetValue(sessionKey, out var session) || session.AdminPeerId != responderId) return;
+
+        // Заявка разрешилась (тем или иным способом) - больше не "висит", дисконнект заявителя после этого момента
+        // уже ничего не должен отменять (см. HandlePeerDisconnectedForPendingJoins).
+        _pendingJoinRequests.Remove(requesterId);
 
         if (accepted)
         {
             if (!session.Participants.Contains(requesterId)) session.Participants.Add(requesterId);
-            SendJoinAccepted(requesterId, workbenchName, session);
+            SendJoinAccepted(requesterId, sessionKey, session);
         }
         else
         {
-            SendJoinRejected(requesterId, workbenchName, "Admin declined the request.");
+            SendJoinRejected(requesterId, sessionKey, "Admin declined the request.");
         }
     }
 
-    private void SendJoinAccepted(long targetId, string workbenchName, WorkbenchSession session)
+    private void SendJoinAccepted(long targetId, string sessionKey, WorkbenchSession session)
     {
         string json = ConstructionIO.Serialize(session.Construction);
-        if (targetId == LocalPeerId) JoinAcceptedForMe?.Invoke(workbenchName, json);
-        else RpcId(targetId, nameof(RpcJoinAccepted), workbenchName, json);
+        if (targetId == LocalPeerId) JoinAcceptedForMe?.Invoke(sessionKey, json);
+        else RpcId(targetId, nameof(RpcJoinAccepted), sessionKey, json);
     }
 
     [Rpc(MultiplayerApi.RpcMode.Authority, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
-    private void RpcJoinAccepted(string workbenchName, string constructionJson) =>
-        JoinAcceptedForMe?.Invoke(workbenchName, constructionJson);
+    private void RpcJoinAccepted(string sessionKey, string constructionJson) =>
+        JoinAcceptedForMe?.Invoke(sessionKey, constructionJson);
 
-    private void SendJoinRejected(long targetId, string workbenchName, string reason)
+    private void SendJoinRejected(long targetId, string sessionKey, string reason)
     {
-        if (targetId == LocalPeerId) JoinRejectedForMe?.Invoke(workbenchName, reason);
-        else RpcId(targetId, nameof(RpcJoinRejected), workbenchName, reason);
+        if (targetId == LocalPeerId) JoinRejectedForMe?.Invoke(sessionKey, reason);
+        else RpcId(targetId, nameof(RpcJoinRejected), sessionKey, reason);
     }
 
     [Rpc(MultiplayerApi.RpcMode.Authority, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
-    private void RpcJoinRejected(string workbenchName, string reason) => JoinRejectedForMe?.Invoke(workbenchName, reason);
+    private void RpcJoinRejected(string sessionKey, string reason) => JoinRejectedForMe?.Invoke(sessionKey, reason);
 
     /// <summary>Заявитель передумал ждать (кнопка Cancel на "плашке ожидания", см.
     /// <c>World.Ui.JoinWaitingUi</c>) — сервер просто пересылает админу, чтобы тот убрал у себя попап
-    /// (<see cref="JoinCancelled"/>), если он всё ещё показывает именно эту заявку. Ничего не хранит на сервере
-    /// (в <see cref="ServerJoin"/> заявка и так не запоминается — попап у админа появляется сразу, без
-    /// промежуточного состояния) — просто оповещение "эта заявка больше не актуальна".</summary>
-    public void RequestCancelJoin(string workbenchName)
+    /// (<see cref="JoinCancelled"/>), если он всё ещё показывает именно эту заявку. Тот же эффект, что и
+    /// <see cref="HandlePeerDisconnectedForPendingJoins"/>, только по явному клику, а не по дисконнекту. Не требует
+    /// параметра — у каждого peer'а может висеть не больше одной заявки разом (<see cref="_pendingJoinRequests"/>
+    /// ключуется по requesterId).</summary>
+    public void RequestCancelJoin()
     {
-        if (IsServer) ServerCancelJoin(LocalPeerId, workbenchName);
-        else RpcId(1, nameof(RpcRequestCancelJoin), workbenchName);
+        if (IsServer) ServerCancelJoin(LocalPeerId);
+        else RpcId(1, nameof(RpcRequestCancelJoin));
     }
 
     [Rpc(MultiplayerApi.RpcMode.AnyPeer, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
-    private void RpcRequestCancelJoin(string workbenchName) => ServerCancelJoin(Multiplayer.GetRemoteSenderId(), workbenchName);
+    private void RpcRequestCancelJoin() => ServerCancelJoin(Multiplayer.GetRemoteSenderId());
 
-    private void ServerCancelJoin(long requesterId, string workbenchName)
+    private void ServerCancelJoin(long requesterId)
     {
-        if (!_sessions.TryGetValue(workbenchName, out var session)) return;
+        if (!_pendingJoinRequests.Remove(requesterId, out var pending)) return;
 
-        if (session.AdminPeerId == LocalPeerId) JoinCancelled?.Invoke(workbenchName, requesterId);
-        else RpcId(session.AdminPeerId, nameof(RpcJoinCancelled), workbenchName, requesterId);
+        if (pending.AdminId == LocalPeerId) JoinCancelled?.Invoke(pending.SessionKey, requesterId);
+        else RpcId(pending.AdminId, nameof(RpcJoinCancelled), pending.SessionKey, requesterId);
     }
 
     [Rpc(MultiplayerApi.RpcMode.Authority, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
-    private void RpcJoinCancelled(string workbenchName, long requesterId) => JoinCancelled?.Invoke(workbenchName, requesterId);
+    private void RpcJoinCancelled(string sessionKey, long requesterId) => JoinCancelled?.Invoke(sessionKey, requesterId);
 
     // ------------------------------------------------------------------------------------------------ закрытие сессии
 
     /// <summary>Вызывается админом при Exit/Spawn из редактора — сессия ЦЕЛИКОМ закрывается для всех участников
     /// разом (см. class doc, «Не сделано» — раздельного ухода одного не-админ участника без закрытия сессии сейчас
     /// нет: он просто перестаёт слать правки, а сессия остаётся висеть до ухода админа).</summary>
-    public void RequestCloseSession(string workbenchName)
+    public void RequestCloseSession(string sessionKey)
     {
-        if (IsServer) ServerCloseSession(LocalPeerId, workbenchName);
-        else RpcId(1, nameof(RpcCloseSession), workbenchName);
+        if (IsServer) ServerCloseSession(LocalPeerId, sessionKey);
+        else RpcId(1, nameof(RpcCloseSession), sessionKey);
     }
 
     [Rpc(MultiplayerApi.RpcMode.AnyPeer, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
-    private void RpcCloseSession(string workbenchName) => ServerCloseSession(Multiplayer.GetRemoteSenderId(), workbenchName);
+    private void RpcCloseSession(string sessionKey) => ServerCloseSession(Multiplayer.GetRemoteSenderId(), sessionKey);
 
-    private void ServerCloseSession(long requesterId, string workbenchName)
+    private void ServerCloseSession(long requesterId, string sessionKey)
     {
-        if (!_sessions.TryGetValue(workbenchName, out var session) || session.AdminPeerId != requesterId) return;
+        if (!_sessions.TryGetValue(sessionKey, out var session) || session.AdminPeerId != requesterId) return;
 
-        _sessions.Remove(workbenchName);
+        _sessions.Remove(sessionKey);
         foreach (long participantId in session.Participants)
         {
-            if (participantId == LocalPeerId) SessionClosedForMe?.Invoke(workbenchName);
-            else RpcId(participantId, nameof(RpcSessionClosed), workbenchName);
+            if (participantId == LocalPeerId) SessionClosedForMe?.Invoke(sessionKey);
+            else RpcId(participantId, nameof(RpcSessionClosed), sessionKey);
         }
-
-        BroadcastSessionActive(workbenchName, false);
     }
 
     [Rpc(MultiplayerApi.RpcMode.Authority, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
-    private void RpcSessionClosed(string workbenchName) => SessionClosedForMe?.Invoke(workbenchName);
+    private void RpcSessionClosed(string sessionKey) => SessionClosedForMe?.Invoke(sessionKey);
 
     // ------------------------------------------------------------------------------------------------ правки
 
-    public void RequestEdit(string workbenchName, NetEditKind kind, Vector3I cell, Vector3I size, string blockSlug,
+    public void RequestEdit(string sessionKey, NetEditKind kind, Vector3I cell, Vector3I size, string blockSlug,
         Color color, Vector3I rotation, Vector3I mirror, int extraInt = 0, bool extraBool = false)
     {
-        if (IsServer) ServerApplyEdit(LocalPeerId, workbenchName, kind, cell, size, blockSlug, color, rotation, mirror, extraInt, extraBool);
-        else RpcId(1, nameof(RpcRequestEdit), workbenchName, (byte)kind, cell, size, blockSlug, color, rotation, mirror, extraInt, extraBool);
+        if (IsServer) ServerApplyEdit(LocalPeerId, sessionKey, kind, cell, size, blockSlug, color, rotation, mirror, extraInt, extraBool);
+        else RpcId(1, nameof(RpcRequestEdit), sessionKey, (byte)kind, cell, size, blockSlug, color, rotation, mirror, extraInt, extraBool);
     }
 
     [Rpc(MultiplayerApi.RpcMode.AnyPeer, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
-    private void RpcRequestEdit(string workbenchName, byte kind, Vector3I cell, Vector3I size, string blockSlug,
+    private void RpcRequestEdit(string sessionKey, byte kind, Vector3I cell, Vector3I size, string blockSlug,
         Color color, Vector3I rotation, Vector3I mirror, int extraInt, bool extraBool) =>
-        ServerApplyEdit(Multiplayer.GetRemoteSenderId(), workbenchName, (NetEditKind)kind, cell, size, blockSlug, color, rotation, mirror, extraInt, extraBool);
+        ServerApplyEdit(Multiplayer.GetRemoteSenderId(), sessionKey, (NetEditKind)kind, cell, size, blockSlug, color, rotation, mirror, extraInt, extraBool);
 
-    private void ServerApplyEdit(long requesterId, string workbenchName, NetEditKind kind, Vector3I cell, Vector3I size,
+    private void ServerApplyEdit(long requesterId, string sessionKey, NetEditKind kind, Vector3I cell, Vector3I size,
         string blockSlug, Color color, Vector3I rotation, Vector3I mirror, int extraInt, bool extraBool)
     {
-        if (!_sessions.TryGetValue(workbenchName, out var session)) return;
+        if (!_sessions.TryGetValue(sessionKey, out var session)) return;
         if (requesterId != session.AdminPeerId && !session.Participants.Contains(requesterId)) return;
 
         // Снэпшот ДО - тот же UndoHistory, что и в одиночном редактировании, только общий на сессию и с автором
@@ -467,21 +556,21 @@ public partial class NetHub : Node
         if (!NetEditOps.Apply(session.Construction, kind, cell, size, blockSlug, color, rotation, mirror, extraInt, extraBool)) return;
 
         session.UndoHistory.RecordIfChanged(before, session.Construction, requesterId);
-        BroadcastEditApplied(session, workbenchName, kind, cell, size, blockSlug, color, rotation, mirror, extraInt, extraBool);
+        BroadcastEditApplied(session, sessionKey, kind, cell, size, blockSlug, color, rotation, mirror, extraInt, extraBool);
     }
 
-    private void BroadcastEditApplied(WorkbenchSession session, string workbenchName, NetEditKind kind, Vector3I cell,
+    private void BroadcastEditApplied(WorkbenchSession session, string sessionKey, NetEditKind kind, Vector3I cell,
         Vector3I size, string blockSlug, Color color, Vector3I rotation, Vector3I mirror, int extraInt, bool extraBool)
     {
         foreach (long participantId in AllSessionPeers(session))
         {
             if (participantId == LocalPeerId)
             {
-                EditApplied?.Invoke(workbenchName, kind, cell, size, blockSlug, color, rotation, mirror, extraInt, extraBool);
+                EditApplied?.Invoke(sessionKey, kind, cell, size, blockSlug, color, rotation, mirror, extraInt, extraBool);
             }
             else
             {
-                RpcId(participantId, nameof(RpcApplyEdit), workbenchName, (byte)kind, cell, size, blockSlug, color, rotation, mirror, extraInt, extraBool);
+                RpcId(participantId, nameof(RpcApplyEdit), sessionKey, (byte)kind, cell, size, blockSlug, color, rotation, mirror, extraInt, extraBool);
             }
         }
     }
@@ -496,9 +585,9 @@ public partial class NetHub : Node
     }
 
     [Rpc(MultiplayerApi.RpcMode.Authority, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
-    private void RpcApplyEdit(string workbenchName, byte kind, Vector3I cell, Vector3I size, string blockSlug,
+    private void RpcApplyEdit(string sessionKey, byte kind, Vector3I cell, Vector3I size, string blockSlug,
         Color color, Vector3I rotation, Vector3I mirror, int extraInt, bool extraBool) =>
-        EditApplied?.Invoke(workbenchName, (NetEditKind)kind, cell, size, blockSlug, color, rotation, mirror, extraInt, extraBool);
+        EditApplied?.Invoke(sessionKey, (NetEditKind)kind, cell, size, blockSlug, color, rotation, mirror, extraInt, extraBool);
 
     // ------------------------------------------------------------------------------------------------ Undo/Redo
 
@@ -506,96 +595,96 @@ public partial class NetHub : Node
     /// правило "отменяемо только самое верхнее по времени действие, и только его автором", без анализа зависимостей
     /// между действиями чужих игроков). Если кто-то другой уже построил что-то после моего последнего действия —
     /// сервер отклонит (<see cref="UndoRedoRejected"/>), а не откатит чужую правку молча.</summary>
-    public void RequestUndo(string workbenchName)
+    public void RequestUndo(string sessionKey)
     {
-        if (IsServer) ServerUndo(LocalPeerId, workbenchName);
-        else RpcId(1, nameof(RpcRequestUndo), workbenchName);
+        if (IsServer) ServerUndo(LocalPeerId, sessionKey);
+        else RpcId(1, nameof(RpcRequestUndo), sessionKey);
     }
 
     [Rpc(MultiplayerApi.RpcMode.AnyPeer, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
-    private void RpcRequestUndo(string workbenchName) => ServerUndo(Multiplayer.GetRemoteSenderId(), workbenchName);
+    private void RpcRequestUndo(string sessionKey) => ServerUndo(Multiplayer.GetRemoteSenderId(), sessionKey);
 
-    private void ServerUndo(long requesterId, string workbenchName)
+    private void ServerUndo(long requesterId, string sessionKey)
     {
-        if (!_sessions.TryGetValue(workbenchName, out var session)) return;
+        if (!_sessions.TryGetValue(sessionKey, out var session)) return;
         if (requesterId != session.AdminPeerId && !session.Participants.Contains(requesterId)) return;
 
         if (!session.UndoHistory.CanUndo)
         {
-            SendUndoRedoRejected(requesterId, workbenchName, "Nothing to undo.");
+            SendUndoRedoRejected(requesterId, sessionKey, "Nothing to undo.");
             return;
         }
 
         if (session.UndoHistory.PeekUndoAuthor != requesterId)
         {
-            SendUndoRedoRejected(requesterId, workbenchName, "Someone else already built something since your last action - can't undo it.");
+            SendUndoRedoRejected(requesterId, sessionKey, "Someone else already built something since your last action - can't undo it.");
             return;
         }
 
         session.UndoHistory.Undo(session.Construction, BlockCatalog.Instance);
-        BroadcastSessionSync(session, workbenchName);
+        BroadcastSessionSync(session, sessionKey);
     }
 
-    public void RequestRedo(string workbenchName)
+    public void RequestRedo(string sessionKey)
     {
-        if (IsServer) ServerRedo(LocalPeerId, workbenchName);
-        else RpcId(1, nameof(RpcRequestRedo), workbenchName);
+        if (IsServer) ServerRedo(LocalPeerId, sessionKey);
+        else RpcId(1, nameof(RpcRequestRedo), sessionKey);
     }
 
     [Rpc(MultiplayerApi.RpcMode.AnyPeer, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
-    private void RpcRequestRedo(string workbenchName) => ServerRedo(Multiplayer.GetRemoteSenderId(), workbenchName);
+    private void RpcRequestRedo(string sessionKey) => ServerRedo(Multiplayer.GetRemoteSenderId(), sessionKey);
 
-    private void ServerRedo(long requesterId, string workbenchName)
+    private void ServerRedo(long requesterId, string sessionKey)
     {
-        if (!_sessions.TryGetValue(workbenchName, out var session)) return;
+        if (!_sessions.TryGetValue(sessionKey, out var session)) return;
         if (requesterId != session.AdminPeerId && !session.Participants.Contains(requesterId)) return;
 
         if (!session.UndoHistory.CanRedo)
         {
-            SendUndoRedoRejected(requesterId, workbenchName, "Nothing to redo.");
+            SendUndoRedoRejected(requesterId, sessionKey, "Nothing to redo.");
             return;
         }
 
         if (session.UndoHistory.PeekRedoAuthor != requesterId)
         {
-            SendUndoRedoRejected(requesterId, workbenchName, "That undone action isn't yours to redo.");
+            SendUndoRedoRejected(requesterId, sessionKey, "That undone action isn't yours to redo.");
             return;
         }
 
         session.UndoHistory.Redo(session.Construction, BlockCatalog.Instance);
-        BroadcastSessionSync(session, workbenchName);
+        BroadcastSessionSync(session, sessionKey);
     }
 
     /// <summary>Полная ресинхронизация после Undo/Redo — не поштучная правка (см. <see cref="EditApplied"/>), а
     /// снэпшот целиком (<see cref="UndoHistory.Snapshot"/>, включая per-face/region покраску): Undo/Redo снэпшотный,
     /// не операционный (см. <see cref="UndoHistory"/> class doc), поэтому и рассылка результата — тем же снэпшотом,
     /// не набором отдельных правок.</summary>
-    private void BroadcastSessionSync(WorkbenchSession session, string workbenchName)
+    private void BroadcastSessionSync(WorkbenchSession session, string sessionKey)
     {
         var snapshot = session.UndoHistory.Capture(session.Construction);
         foreach (long participantId in AllSessionPeers(session))
         {
             if (participantId == LocalPeerId)
             {
-                SessionSynced?.Invoke(workbenchName, snapshot);
+                SessionSynced?.Invoke(sessionKey, snapshot);
             }
             else
             {
-                RpcId(participantId, nameof(RpcSessionSynced), workbenchName, snapshot.Json, snapshot.Faces, snapshot.Regions);
+                RpcId(participantId, nameof(RpcSessionSynced), sessionKey, snapshot.Json, snapshot.Faces, snapshot.Regions);
             }
         }
     }
 
     [Rpc(MultiplayerApi.RpcMode.Authority, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
-    private void RpcSessionSynced(string workbenchName, string json, string faces, string regions) =>
-        SessionSynced?.Invoke(workbenchName, new UndoHistory.Snapshot(json, faces, regions));
+    private void RpcSessionSynced(string sessionKey, string json, string faces, string regions) =>
+        SessionSynced?.Invoke(sessionKey, new UndoHistory.Snapshot(json, faces, regions));
 
-    private void SendUndoRedoRejected(long targetId, string workbenchName, string reason)
+    private void SendUndoRedoRejected(long targetId, string sessionKey, string reason)
     {
-        if (targetId == LocalPeerId) UndoRedoRejected?.Invoke(workbenchName, reason);
-        else RpcId(targetId, nameof(RpcUndoRedoRejected), workbenchName, reason);
+        if (targetId == LocalPeerId) UndoRedoRejected?.Invoke(sessionKey, reason);
+        else RpcId(targetId, nameof(RpcUndoRedoRejected), sessionKey, reason);
     }
 
     [Rpc(MultiplayerApi.RpcMode.Authority, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
-    private void RpcUndoRedoRejected(string workbenchName, string reason) => UndoRedoRejected?.Invoke(workbenchName, reason);
+    private void RpcUndoRedoRejected(string sessionKey, string reason) => UndoRedoRejected?.Invoke(sessionKey, reason);
 }

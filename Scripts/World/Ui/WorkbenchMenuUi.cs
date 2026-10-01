@@ -11,9 +11,13 @@ namespace SandboxPolyGame.World.Ui;
 /// Меню верстака (см. Docs/05-world-and-vehicle-systems.md, «Вход в редактор через верстак»): открывается при
 /// взаимодействии с <see cref="Workbench"/>, до того, как игрок реально попадёт в редактор.
 /// <list type="bullet">
-/// <item><b>Create vehicle</b> — сразу переход в редактор с пустой (только корневой блок) постройкой.</item>
+/// <item><b>Create vehicle</b> — сразу переход в редактор с пустой (только корневой блок) постройкой; ВСЕГДА
+/// доступна, даже если кто-то ещё уже редактирует через этот же верстак — каждый клик начинает СВОЮ, независимую
+/// сессию (см. <see cref="UpdateNetworkState"/>/<c>NetHub</c> class doc).</item>
 /// <item><b>Join to workbench</b> — присоединиться к уже идущей сессии редактора на этом верстаке (совместное
-/// редактирование, см. Docs); пока всегда недоступна — сети ещё нет, присоединяться не к чему.</item>
+/// редактирование, см. Docs); доступна, только если сеть есть и на этом верстаке сейчас идёт хотя бы одна сессия.
+/// Если их несколько — рядом появляется выпадающий список (<see cref="_joinPicker"/>, "Admin #id" на пункт), Join
+/// адресует выбранную; если сессия всего одна, список скрыт, Join адресует её напрямую (см. <see cref="SetJoinableSessions"/>).</item>
 /// <item>Список сохранённых построек (<see cref="ConstructionStorage.List"/>) — клик по строке показывает её
 /// превью+описание справа, кнопка <b>Open</b> под описанием переходит в редактор с этой постройкой загруженной.</item>
 /// </list>
@@ -31,10 +35,16 @@ public sealed class WorkbenchMenuUi
     private readonly Button _spawnButton;
     private readonly Button _createButton;
     private readonly Button _joinButton;
+    private readonly OptionButton _joinPicker;
     private readonly Label _emptyHint;
 
     private ConstructionStorage.SavedConstruction? _selected;
     private string _workbenchName = "";
+
+    /// <summary>Ключи сессий, которые сейчас можно присоединить на этом верстаке — индексы совпадают с пунктами
+    /// <see cref="_joinPicker"/> (см. <see cref="SetJoinableSessions"/>). Пусто, пока ответ сервера ещё не пришёл
+    /// или сети нет вообще — тогда Join выключена.</summary>
+    private string[] _joinSessionKeys = Array.Empty<string>();
 
     /// <summary>Нажата Create vehicle — открыть редактор пустым.</summary>
     public event Action? CreateVehicleRequested;
@@ -45,8 +55,10 @@ public sealed class WorkbenchMenuUi
     /// <summary>Нажата Spawn для выбранной постройки — заспавнить её в мире, минуя редактор (путь к файлу).</summary>
     public event Action<string>? SpawnConstructionRequested;
 
-    /// <summary>Нажата Join to workbench — попроситься в уже идущую сессию на этом верстаке (см. <see cref="Open"/>).</summary>
-    public event Action? JoinRequested;
+    /// <summary>Нажата Join to workbench — попроситься в уже идущую сессию на этом верстаке (см. <see cref="Open"/>).
+    /// Параметр — ключ ВЫБРАННОЙ сессии (одна — выбрана автоматически; несколько — та, что отмечена в
+    /// <see cref="_joinPicker"/>), см. <see cref="SetJoinableSessions"/>.</summary>
+    public event Action<string>? JoinRequested;
 
     public WorkbenchMenuUi(Control layerRoot)
     {
@@ -82,10 +94,23 @@ public sealed class WorkbenchMenuUi
         _createButton.Pressed += () => CreateVehicleRequested?.Invoke();
         left.AddChild(_createButton);
 
+        // Выпадающий список — виден, только если на верстаке одновременно несколько сессий (см. SetJoinableSessions).
+        // Создан РАНЬШЕ кнопки Join, которая ссылается на него из своего обработчика ниже.
+        _joinPicker = new OptionButton { SizeFlagsHorizontal = Control.SizeFlags.ExpandFill, Visible = false, FocusMode = Control.FocusModeEnum.None };
+
         _joinButton = UiStyle.MakeButton("Join to workbench", new Vector2(0, 36));
         _joinButton.SizeFlagsHorizontal = Control.SizeFlags.ExpandFill;
-        _joinButton.Pressed += () => JoinRequested?.Invoke();
+        _joinButton.Pressed += () =>
+        {
+            if (_joinSessionKeys.Length == 0) return;
+
+            // Одна сессия - выбор не нужен; несколько - берём отмеченный пункт списка (по умолчанию первый).
+            int index = _joinSessionKeys.Length > 1 ? _joinPicker.Selected : 0;
+            if (index < 0 || index >= _joinSessionKeys.Length) index = 0;
+            JoinRequested?.Invoke(_joinSessionKeys[index]);
+        };
         left.AddChild(_joinButton);
+        left.AddChild(_joinPicker);
 
         left.AddChild(new HSeparator());
         left.AddChild(UiStyle.MakeLabel("Saved constructions", 13, UiStyle.TextDim));
@@ -154,16 +179,29 @@ public sealed class WorkbenchMenuUi
 
     public bool IsOpen => _overlay.Visible;
 
-    /// <summary><paramref name="workbenchName"/> — нужен, чтобы понять, есть ли уже сетевая сессия ИМЕННО на этом
-    /// верстаке (<see cref="NetHub.IsSessionActive"/>) и соответственно включить/выключить Join/Create/Open — см.
-    /// <see cref="UpdateNetworkState"/>.</summary>
+    /// <summary>Для самотестов (см. <c>Dev.SelfTest</c>) — проверить, что Create остаётся доступной независимо от
+    /// чужих сессий на этом верстаке, и что Join включается/выключается по ответу сервера (см.
+    /// <see cref="SetJoinableSessions"/>).</summary>
+    public bool IsCreateButtonDisabled => _createButton.Disabled;
+
+    public bool IsJoinButtonDisabled => _joinButton.Disabled;
+
+    /// <summary>Для самотестов — сколько сессий сейчас предлагает выпадающий список Join (0 = кнопка выключена,
+    /// 1 = список скрыт/Join адресует её напрямую, 2+ = список виден).</summary>
+    public int JoinableSessionCount => _joinSessionKeys.Length;
+
+    /// <summary><paramref name="workbenchName"/> — какой верстак открыли (для <see cref="GameWorld"/>: по нему
+    /// запрашивается список сессий, см. <see cref="SetJoinableSessions"/>/class doc). Join выключена, пока ответ
+    /// сервера ещё не пришёл (или сразу и навсегда, если сеть не подключена вообще) — см. <see cref="UpdateOfflineState"/>.</summary>
     public void Open(string workbenchName)
     {
         _workbenchName = workbenchName;
         Refresh();
-        UpdateNetworkState();
+        UpdateOfflineState();
         _overlay.Visible = true;
     }
+
+    public string WorkbenchName => _workbenchName;
 
     public void Close() => _overlay.Visible = false;
 
@@ -195,35 +233,45 @@ public sealed class WorkbenchMenuUi
     }
 
     /// <summary>
-    /// Мультиплеер (см. Docs/05-world-and-vehicle-systems.md, «Мультиплеер», вариант Б): на верстаке одновременно
-    /// может идти только ОДНА сессия редактирования — если она уже есть, Create/Open/Spawn (все они начали бы
-    /// СВОЮ, отдельную от чужой постройку) выключены, доступен только Join. Не подключены к сети вообще — Join,
-    /// наоборот, всегда выключена (присоединяться некуда, как и было раньше).
+    /// Мультиплеер (см. Docs/05-world-and-vehicle-systems.md, «Мультиплеер», вариант Б; <see cref="NetHub"/> class
+    /// doc): раньше на одном верстаке одновременно мог идти только ОДИН Create/Open/Join — остальным Create vehicle
+    /// был попросту недоступен, пока кто-то другой уже редактировал через тот же физический верстак (баг, найденный
+    /// пользователем). Убрано: Create/Open/Spawn/список сохранённых построек ВСЕГДА доступны — каждый клик начинает
+    /// СВОЮ, независимую сессию, и сколько угодно игроков может одновременно зайти в свой собственный редактор через
+    /// один и тот же верстак. Единственное, что по-прежнему зависит от чужих сессий — кнопка <b>Join</b>.
     /// </summary>
-    private void UpdateNetworkState()
+    private void UpdateOfflineState()
     {
+        _joinSessionKeys = Array.Empty<string>();
+        _joinPicker.Clear();
+        _joinPicker.Visible = false;
+
         bool networked = NetHub.Instance.IsNetworked;
-        bool sessionActive = networked && NetHub.Instance.IsSessionActive(_workbenchName);
+        _joinButton.Disabled = true;
+        // Сеть есть - GameWorld вот-вот спросит сервер (NetHub.RequestWorkbenchSessions) и позовёт
+        // SetJoinableSessions с настоящим ответом; "Checking..." - на случай редкой заметной задержки RPC.
+        _joinButton.TooltipText = !networked ? "Not connected to a multiplayer game." : "Checking for active sessions...";
+    }
 
-        _joinButton.Disabled = !sessionActive;
-        _joinButton.TooltipText = !networked
-            ? "Not connected to a multiplayer game."
-            : sessionActive
-                ? "Join the construction currently being edited on this workbench."
-                : "No one is editing on this workbench right now.";
+    /// <summary>Вызывается <see cref="GameWorld"/>, когда пришёл ответ сервера (<c>NetHub.WorkbenchSessionsForMe</c>)
+    /// на запрос, отправленный при открытии этого меню (см. <see cref="Open"/>/<see cref="WorkbenchName"/>) — баг,
+    /// найденный пользователем: раньше состояние "есть активная сессия" рассылалось ОДИН раз в момент её открытия,
+    /// и игрок, подключившийся позже, никогда об этом не узнавал (Join оставалась выключенной навсегда). Теперь
+    /// запрашивается заново при КАЖДОМ открытии меню — не бывает устаревшим. Несколько сессий — показываем
+    /// выпадающий список ("Admin #id" на пункт, порядок — по времени создания); одна — список скрыт, Join адресует
+    /// её напрямую; ни одной — Join выключена.</summary>
+    public void SetJoinableSessions(string[] sessionKeys, long[] adminPeerIds)
+    {
+        _joinSessionKeys = sessionKeys;
+        _joinPicker.Clear();
+        for (int i = 0; i < sessionKeys.Length; i++) _joinPicker.AddItem($"Admin #{adminPeerIds[i]}");
+        _joinPicker.Visible = sessionKeys.Length > 1;
+        if (sessionKeys.Length > 1) _joinPicker.Selected = 0;
 
-        _createButton.Disabled = sessionActive;
-        _createButton.TooltipText = sessionActive ? "Someone is already editing on this workbench - join them instead." : "";
-        foreach (var child in _listColumn.GetChildren())
-        {
-            if (child is Button button) button.Disabled = sessionActive;
-        }
-
-        if (sessionActive)
-        {
-            _openButton.Disabled = true;
-            _spawnButton.Disabled = true;
-        }
+        _joinButton.Disabled = sessionKeys.Length == 0;
+        _joinButton.TooltipText = sessionKeys.Length == 0
+            ? "No one is editing on this workbench right now."
+            : "Join a construction currently being edited on this workbench.";
     }
 
     private void Select(ConstructionStorage.SavedConstruction entry, Button pressedButton)

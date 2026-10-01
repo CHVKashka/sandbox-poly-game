@@ -10,8 +10,12 @@ namespace SandboxPolyGame.World;
 /// мире по сериализованной (<see cref="ConstructionIO.Serialize"/>) постройке — используется кнопкой Spawn в
 /// редакторе (см. <c>Core.EditorHandoff.PendingSpawnJson</c>, читается и сбрасывается <see cref="GameWorld"/> при
 /// входе в мир). Центр масс и масса — по блокам (<see cref="BaseComponent.Mass"/>, "кг на клетку 1x1x1"), коллизия
-/// — один <see cref="BoxShape3D"/> НА ЭКЗЕМПЛЯР (не на клетку — заметно меньше форм на растянутую постройку), визуал
-/// переиспользует <see cref="VoxelWorld"/> (тот же рендер, что и в редакторе, просто под <see cref="RigidBody3D"/>
+/// — для обычного блока (куб/форма) один <see cref="BoxShape3D"/> НА ЭКЗЕМПЛЯР целиком (не на клетку — заметно
+/// меньше форм на растянутую постройку), как и раньше; функциональный блок (<see cref="FunctionalBlockComponent"/>)
+/// получает РОВНО то, что задано в его <see cref="FunctionalBlockComponent.CollisionBoxes"/>
+/// (см. <c>Dev.BlockPrefabEditor</c>) — БЕЗ автоматического общего бокса, пусто означает "блок физически проходим
+/// насквозь целиком" (нарочно — у некоторых моделей есть выпирающие за пределы footprint детали, которым коллизия
+/// не нужна). Визуал переиспользует <see cref="VoxelWorld"/> (тот же рендер, что и в редакторе, просто под <see cref="RigidBody3D"/>
 /// вместо статичного узла), без чёрных границ блоков (тот инструмент — только для редактора). Плавучесть/
 /// аэродинамика сюда сознательно не входят — см. Docs/05-world-and-vehicle-systems.md, «Спавн постройки»: зависят
 /// от ещё не собранного «сборщика сил», добавляются отдельным шагом позже.
@@ -52,11 +56,36 @@ public static class VehicleSpawner
             var instanceCenter = (instanceMin + instanceMax) * 0.5f;
             weightedCenterSum += instanceCenter * (float)instanceMass;
 
-            body.AddChild(new CollisionShape3D
+            var functional = definition.GetComponent<FunctionalBlockComponent>();
+            if (functional != null)
             {
-                Shape = new BoxShape3D { Size = instanceMax - instanceMin },
-                Position = instanceCenter,
-            });
+                // Функциональный блок - коллизия ТОЛЬКО то, что явно задано в его боксах (см. Dev.BlockPrefabEditor),
+                // никакого автоматического бокса на весь экземпляр "на всякий случай" (раньше было иначе - баг,
+                // найденный пользователем: некоторые детали модели нарочно выпирают за пределы footprint и не должны
+                // иметь коллизию вообще - автоматический общий бокс делал это невозможным). Пусто - блок физически
+                // проходим насквозь целиком. Координаты боксов - в ЛОКАЛЬНОЙ системе блока (метры, неповёрнутый),
+                // повёрнуты и сдвинуты тем же трансформом, что и его модель (FunctionalBlockGeometry) -
+                // CollisionShape3D.Transform, не только Position, т.к. поворот тоже нужен (бокс не обязан быть кубом).
+                var rotation = ShapeMeshBuilder.ComposeRotation(instance.RotationSteps);
+                foreach (var box in functional.CollisionBoxes)
+                {
+                    body.AddChild(new CollisionShape3D
+                    {
+                        Shape = new BoxShape3D { Size = box.Size },
+                        Transform = new Transform3D(rotation, instanceMin + rotation * (box.Position + box.Size * 0.5f)),
+                    });
+                }
+            }
+            else
+            {
+                // Обычный блок (куб/форма, BuildingBlockComponent) - как и раньше, один бокс на весь экземпляр
+                // целиком - не затронуто этим изменением, у таких блоков своих боксов коллизии не бывает.
+                body.AddChild(new CollisionShape3D
+                {
+                    Shape = new BoxShape3D { Size = instanceMax - instanceMin },
+                    Position = instanceCenter,
+                });
+            }
         }
 
         if (totalMass <= 0) totalMass = 1; // защита от постройки без единого распознанного блока (не должно происходить)

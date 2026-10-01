@@ -59,6 +59,12 @@ public partial class GameWorld : Node3D
 	private Workbench? _activeWorkbench;
 	private string _pendingSessionWorkbenchName = "";
 
+	// Ключ сессии, выбранной (авто- или из выпадающего списка) при нажатии Join to workbench - см.
+	// RequestJoinActiveWorkbench/OnJoinAcceptedForMe/OnJoinRejectedForMe. В отличие от _pendingSessionWorkbenchName
+	// (имя физического верстака, нужно для Create/Open) этот ключ уже однозначно указывает на сессию - сверять
+	// ответ сервера с ним можно напрямую, без второй координаты.
+	private string _pendingJoinSessionKey = "";
+
 	// Верстак, для которого пришла входящая заявка на Join (см. OnJoinRequestIncoming) - JoinRequestPopupUi не несёт
 	// это имя сама, см. её class doc.
 	private string _incomingJoinWorkbenchName = "";
@@ -76,16 +82,32 @@ public partial class GameWorld : Node3D
 	public IReadOnlyList<VehicleBody> Vehicles => _vehicles;
 	public WorkbenchMenuUi WorkbenchMenu => _workbenchMenu;
 
-	/// <summary>Открыто ЛЮБОЕ модальное окно поверх мира — движение/E/R и подсказка внизу экрана должны молчать,
-	/// пока это так (единая точка, вместо перечисления всех окон в каждом месте по отдельности).</summary>
+	/// <summary>Для самотестов (см. <c>Dev.SelfTest</c>) — проверить, что эта плашка (в отличие от остальных
+	/// модальных окон) не замораживает движение персонажа, см. <see cref="MovementBlockingModalOpen"/>.</summary>
+	public JoinWaitingUi JoinWaitingUi => _joinWaitingUi;
+
+	/// <summary>Открыто ЛЮБОЕ модальное окно поверх мира — E/R и подсказка внизу экрана должны молчать, пока это
+	/// так (единая точка, вместо перечисления всех окон в каждом месте по отдельности). Движение (WASD) НЕ входит
+	/// сюда — см. <see cref="_Process"/>: плашка ожидания Join (<see cref="_joinWaitingUi"/>) сознательно не должна
+	/// замораживать игрока (баг, найденный пользователем — подключающийся игрок не мог ходить, пока ждал ответа
+	/// админа), только показ курсора (нужен, чтобы было чем нажать Cancel — см. <see cref="RequestJoinActiveWorkbench"/>).</summary>
 	private bool AnyModalOpen => _workbenchMenu.IsOpen || _joinPopup.IsOpen || _joinWaitingUi.IsOpen || _pauseMenu.IsOpen;
+
+	/// <summary>Подмножество <see cref="AnyModalOpen"/>, которое ДОЛЖНО останавливать движение персонажа — всё,
+	/// кроме плашки ожидания Join (см. её doc выше).</summary>
+	private bool MovementBlockingModalOpen => _workbenchMenu.IsOpen || _joinPopup.IsOpen || _pauseMenu.IsOpen;
 
 	public override void _Ready()
 	{
 		if (GetTree().CurrentScene == this && OS.GetCmdlineUserArgs().Length > 0)
 		{
 			_handingOff = true;
-			GoToBuildEditor();
+			// --blockeditor - отдельный инструмент (Dev.BlockPrefabEditor), не часть обычного BuildEditor (другая
+			// камера/UI/цель), поэтому у него своя сцена вместо общего для всех остальных дев-аргументов перехода
+			// на BuildEditor.tscn (см. class doc).
+			bool blockEditor = Array.Exists(OS.GetCmdlineUserArgs(), a => a == "--blockeditor" || a.StartsWith("--blockeditor="));
+			if (blockEditor) Callable.From(() => GetTree().ChangeSceneToFile("res://Scenes/BlockPrefabEditor.tscn")).CallDeferred();
+			else GoToBuildEditor();
 			return;
 		}
 
@@ -190,7 +212,13 @@ public partial class GameWorld : Node3D
 	/// не более чем no-op (узел и так активен по умолчанию). Камера переактивируется явно — если это возврат из
 	/// редактора, узел не пересоздавался (значит и <see cref="Player._EnterTree"/>, где камера обычно становится
 	/// текущей, не запускался заново), а редакторская `FlyCamera` за это время успела стать текущей и уже уехала
-	/// вместе со своей сценой — без этого вернувшийся в мир игрок увидел бы пустой вьюпорт без активной камеры.</summary>
+	/// вместе со своей сценой — без этого вернувшийся в мир игрок увидел бы пустой вьюпорт без активной камеры.
+	/// Мышь по той же причине захватывается явно, не только в <see cref="Player._EnterTree"/> — баг, найденный
+	/// пользователем: и у хоста, и у клиента вращение камеры переставало работать после выхода с верстака, потому
+	/// что в редакторе мышь обычно видима (СКМ только на время поворота — см. <see cref="Editor.FlyCamera"/>), а
+	/// <see cref="Player._Input"/> крутит камеру, только пока <see cref="Input.MouseMode"/> == Captured; для
+	/// переиспользованного узла (мультиплеер) ничего не возвращало его в Captured само — "чинило" это только
+	/// открытие/закрытие меню паузы (Esc), которое попутно и выставляет Captured.</summary>
 	private void HandleSpawnedPlayer(Player player)
 	{
 		if (!player.IsMultiplayerAuthority()) return;
@@ -198,6 +226,7 @@ public partial class GameWorld : Node3D
 		_player = player;
 		player.SetActive(true);
 		player.Camera.Current = true;
+		Input.MouseMode = Input.MouseModeEnum.Captured;
 		ApplyPendingPose();
 	}
 
@@ -271,7 +300,7 @@ public partial class GameWorld : Node3D
 		_joinWaitingUi = new JoinWaitingUi(_uiRoot);
 		_joinWaitingUi.CancelRequested += () =>
 		{
-			NetHub.Instance.RequestCancelJoin(_pendingSessionWorkbenchName);
+			NetHub.Instance.RequestCancelJoin();
 			_joinWaitingUi.Hide();
 			Input.MouseMode = Input.MouseModeEnum.Captured;
 		};
@@ -327,12 +356,15 @@ public partial class GameWorld : Node3D
 		}
 	}
 
-	private void RequestJoinActiveWorkbench()
+	/// <summary><paramref name="sessionKey"/> — какую именно сессию выбрал игрок в <see cref="WorkbenchMenuUi"/>
+	/// (одна на верстаке — выбрана автоматически; несколько — из выпадающего списка, см.
+	/// <see cref="WorkbenchMenuUi.SetJoinableSessions"/>).</summary>
+	private void RequestJoinActiveWorkbench(string sessionKey)
 	{
 		if (_activeWorkbench == null) return;
 
-		_pendingSessionWorkbenchName = _activeWorkbench.Name;
-		NetHub.Instance.RequestJoin(_activeWorkbench.Name);
+		_pendingJoinSessionKey = sessionKey;
+		NetHub.Instance.RequestJoin(sessionKey);
 		_workbenchMenu.Close();
 		_joinWaitingUi.Show();
 		// Мышь остаётся видимой (не Captured) - иначе по кнопке Cancel на плашке нечем было бы кликнуть. Ответ
@@ -344,6 +376,7 @@ public partial class GameWorld : Node3D
 
 	private void SubscribeNetworking()
 	{
+		NetHub.Instance.WorkbenchSessionsForMe += OnWorkbenchSessionsForMe;
 		NetHub.Instance.SessionReadyForMe += OnSessionReadyForMe;
 		NetHub.Instance.JoinRequestIncoming += OnJoinRequestIncoming;
 		NetHub.Instance.JoinAcceptedForMe += OnJoinAcceptedForMe;
@@ -354,6 +387,7 @@ public partial class GameWorld : Node3D
 
 	private void UnsubscribeNetworking()
 	{
+		NetHub.Instance.WorkbenchSessionsForMe -= OnWorkbenchSessionsForMe;
 		NetHub.Instance.SessionReadyForMe -= OnSessionReadyForMe;
 		NetHub.Instance.JoinRequestIncoming -= OnJoinRequestIncoming;
 		NetHub.Instance.JoinAcceptedForMe -= OnJoinAcceptedForMe;
@@ -363,12 +397,26 @@ public partial class GameWorld : Node3D
 		NetHub.Instance.PlayerSpawned -= OnPlayerSpawned;
 	}
 
-	private void OnSessionReadyForMe(string workbenchName, string constructionJson)
+	/// <summary>Ответ на запрос, отправленный при открытии меню верстака (см. <c>case Key.E</c> в <see cref="_Input"/>)
+	/// — применяем, только если меню всё ещё открыто и всё ещё про ТОТ ЖЕ верстак (игрок мог успеть закрыть меню
+	/// или открыть другое, пока ответ летел по сети).</summary>
+	private void OnWorkbenchSessionsForMe(string workbenchName, string[] sessionKeys, long[] adminPeerIds)
+	{
+		if (!_workbenchMenu.IsOpen || _workbenchMenu.WorkbenchName != workbenchName) return;
+		_workbenchMenu.SetJoinableSessions(sessionKeys, adminPeerIds);
+	}
+
+	/// <summary><paramref name="sessionKey"/> — уникальный ключ ИМЕННО МОЕЙ новой сессии (несколько игроков могут
+	/// одновременно открыть свои на этом же верстаке, см. <see cref="NetHub"/> class doc) — идёт в
+	/// <see cref="EditorHandoff.NetworkedWorkbenchName"/>, им редактор будет адресовать все дальнейшие правки/Undo.
+	/// <paramref name="workbenchName"/> — имя физического верстака (то, что я и запрашивал), нужно только чтобы
+	/// вернуть постройку в его зону спавна — см. <see cref="EditorHandoff.PendingSpawnWorkbenchName"/>.</summary>
+	private void OnSessionReadyForMe(string sessionKey, string workbenchName, string constructionJson)
 	{
 		if (workbenchName != _pendingSessionWorkbenchName) return;
 
 		EditorHandoff.PendingConstructionPath = null;
-		EditorHandoff.NetworkedWorkbenchName = workbenchName;
+		EditorHandoff.NetworkedWorkbenchName = sessionKey;
 		EditorHandoff.PendingNetworkedConstructionJson = constructionJson;
 		EditorHandoff.IsSessionAdmin = true;
 		EditorHandoff.PendingSpawnWorkbenchName = workbenchName;
@@ -377,24 +425,28 @@ public partial class GameWorld : Node3D
 		EnterEditor();
 	}
 
-	private void OnJoinAcceptedForMe(string workbenchName, string constructionJson)
+	/// <summary>Приняли мою заявку на <paramref name="sessionKey"/> (ровно та, что я выбрал в
+	/// <see cref="RequestJoinActiveWorkbench"/> — сравниваем с ней напрямую, workbenchName сервер тут уже не
+	/// присылает, он мне и не нужен: <see cref="_activeWorkbench"/> уже указывает на тот же физический верстак,
+	/// через который я и открывал меню Join).</summary>
+	private void OnJoinAcceptedForMe(string sessionKey, string constructionJson)
 	{
-		if (workbenchName != _pendingSessionWorkbenchName) return;
+		if (sessionKey != _pendingJoinSessionKey) return;
 
 		_joinWaitingUi.Hide();
 		EditorHandoff.PendingConstructionPath = null;
-		EditorHandoff.NetworkedWorkbenchName = workbenchName;
+		EditorHandoff.NetworkedWorkbenchName = sessionKey;
 		EditorHandoff.PendingNetworkedConstructionJson = constructionJson;
 		EditorHandoff.IsSessionAdmin = false;
-		EditorHandoff.PendingSpawnWorkbenchName = workbenchName;
+		EditorHandoff.PendingSpawnWorkbenchName = _activeWorkbench?.Name;
 		EditorHandoff.PendingPlayerPosition = _player.GlobalPosition;
 		EditorHandoff.PendingPlayerYaw = _player.Yaw;
 		EnterEditor();
 	}
 
-	private void OnJoinRejectedForMe(string workbenchName, string reason)
+	private void OnJoinRejectedForMe(string sessionKey, string reason)
 	{
-		if (workbenchName != _pendingSessionWorkbenchName) return;
+		if (sessionKey != _pendingJoinSessionKey) return;
 		_joinWaitingUi.Hide();
 		Input.MouseMode = Input.MouseModeEnum.Captured;
 		_prompt.Text = $"Join request declined: {reason}";
@@ -423,8 +475,8 @@ public partial class GameWorld : Node3D
 
 	/// <summary>Spawn прямо из меню верстака (кнопка рядом с Open) — не заходя в редактор: читает JSON постройки
 	/// с диска и сразу материализует её в зоне спавна <see cref="_activeWorkbench"/> (тот верстак, через который
-	/// открыли меню — см. <see cref="_activeWorkbench"/> doc). Как и Create/Open, недоступна, пока на верстаке уже
-	/// идёт сетевая сессия (см. <see cref="WorkbenchMenuUi.UpdateNetworkState"/> — кнопка выключена ещё в UI).</summary>
+	/// открыли меню — см. <see cref="_activeWorkbench"/> doc). Доступна всегда, независимо от чужих сессий на этом
+	/// верстаке (см. <c>WorkbenchMenuUi</c> class doc).</summary>
 	private void SpawnFromWorkbenchMenu(string path)
 	{
 		using var file = FileAccess.Open(path, FileAccess.ModeFlags.Read);
@@ -453,6 +505,11 @@ public partial class GameWorld : Node3D
 			case Key.E when !AnyModalOpen && RaycastFromCamera(InteractDistance) is Workbench workbench:
 				_activeWorkbench = workbench;
 				_workbenchMenu.Open(workbench.Name);
+				// Список сессий на этом верстаке запрашивается заново при КАЖДОМ открытии меню (не кэшируется) -
+				// баг, найденный пользователем: игрок, подключившийся к сети ПОСЛЕ того, как сессию уже открыли,
+				// раньше никогда не узнавал о ней (старый broadcast-механизм уведомлял только тех, кто уже был на
+				// связи в момент открытия) - см. NetHub class doc/OnWorkbenchSessionsForMe.
+				if (NetHub.Instance.IsNetworked) NetHub.Instance.RequestWorkbenchSessions(workbench.Name);
 				Input.MouseMode = Input.MouseModeEnum.Visible;
 				GetViewport().SetInputAsHandled();
 				break;
@@ -499,7 +556,7 @@ public partial class GameWorld : Node3D
 	{
 		if (_handingOff || _player == null || !IsInstanceValid(_player)) return;
 
-		_player.MovementEnabled = !AnyModalOpen;
+		_player.MovementEnabled = !MovementBlockingModalOpen;
 		_debugLabel.Text = _debugCollisionView ? "Debug: collision view (F1)" : "";
 
 		if (AnyModalOpen)

@@ -81,11 +81,18 @@ public sealed class Construction
     /// <summary>
     /// Какие из 6 осевых сторон клетки этот блок закрывает ЦЕЛИКОМ, с учётом его поворота/отражения — передаётся
     /// в <see cref="VoxelGrid.TrySet"/>, чтобы <see cref="ChunkMesher"/> мог отсекать/склеивать эти стороны с
-    /// соседями наравне с кубами (см. <see cref="ShapeMeshBuilder.FullCoverageMask"/>). Куб (или блок без
-    /// <see cref="BuildingBlockComponent"/>) закрыт целиком со всех 6 сторон.
+    /// соседями наравне с кубами (см. <see cref="ShapeMeshBuilder.FullCoverageMask"/>). Куб (или функциональный блок
+    /// без собственной модели, см. <see cref="FunctionalBlockComponent"/>) закрыт целиком со всех 6 сторон — рисуется
+    /// как куб-плейсхолдер. Функциональный блок С моделью (<see cref="FunctionalBlockComponent.ScenePath"/> задан) —
+    /// 0 (ничего не закрывает): его рисует не <see cref="ChunkMesher"/>, а отдельный узел на экземпляр
+    /// (<see cref="Editor.FunctionalBlockView"/>, как и <see cref="Editor.ShapeInstanceView"/> для процедурных форм) —
+    /// без этого под настоящей моделью продолжал бы просвечивать цветной куб.
     /// </summary>
     private static byte FullCoverageMask(BlockDefinition definition, Vector3I rotationSteps, Vector3I mirror)
     {
+        var functional = definition.GetComponent<FunctionalBlockComponent>();
+        if (functional != null) return string.IsNullOrEmpty(functional.ScenePath) ? (byte)0b111111 : (byte)0;
+
         var building = definition.GetComponent<BuildingBlockComponent>();
         if (building == null || building.Shape == BlockShape.Cube) return 0b111111;
         return ShapeMeshBuilder.FullCoverageMask(building.Shape, rotationSteps, mirror);

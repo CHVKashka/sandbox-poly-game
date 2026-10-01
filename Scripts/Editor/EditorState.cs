@@ -1,6 +1,8 @@
 using System;
+using System.Collections.Generic;
 using Godot;
 using SandboxPolyGame.Blocks;
+using SandboxPolyGame.Core;
 
 namespace SandboxPolyGame.Editor;
 
@@ -39,9 +41,14 @@ public sealed class EditorState
     public EditorState()
     {
         Array.Fill(_hotbar, "");
-        // Хотбар по умолчанию заполнен первыми блоками каталога.
+        // Хотбар по умолчанию заполнен первыми блоками каталога — обычные (резиновые) блоки идут первыми, затем
+        // функциональные (каждая группа в своём алфавитном порядке) - иначе добавление новых функциональных блоков
+        // в каталог молча вытесняло бы из хотбара уже привычные базовые формы (block/wedge/pyramid/inverse_pyramid).
         var all = BlockCatalog.Instance.All;
-        for (int i = 0; i < HotbarSize && i < all.Count; i++) _hotbar[i] = all[i].Slug;
+        var ordered = new List<BlockDefinition>(all.Count);
+        foreach (var definition in all) if (!definition.HasComponent<FunctionalBlockComponent>()) ordered.Add(definition);
+        foreach (var definition in all) if (definition.HasComponent<FunctionalBlockComponent>()) ordered.Add(definition);
+        for (int i = 0; i < HotbarSize && i < ordered.Count; i++) _hotbar[i] = ordered[i].Slug;
     }
 
     public int SelectedSlot
@@ -65,6 +72,10 @@ public sealed class EditorState
     {
         if (slot < 0 || slot >= HotbarSize || _hotbar[slot] == blockSlug) return;
         _hotbar[slot] = blockSlug;
+        // Если это переопределило СЕЙЧАС выбранный слот - размер призрака может быть не годен для нового блока
+        // (например, слот держал резиновый блок с PendingSize 5x5x5, переназначен на функциональный блок с
+        // фиксированным footprint 1x1x1) - пересчитать сразу, не дожидаясь следующей смены слота.
+        if (slot == _selectedSlot) _pendingSize = ClampToSelectedBlock(_pendingSize);
         Changed?.Invoke();
     }
 
@@ -114,10 +125,26 @@ public sealed class EditorState
         }
     }
 
+    /// <summary>Фиксированные мировые оси вращения — ИНДЕКС совпадает с осью (0=X/J, 1=Y/K, 2=Z/L), сам вектор
+    /// НЕ зависит от текущей ориентации блока (см. <see cref="RotatePending"/> class doc).</summary>
+    private static readonly Vector3[] GlobalRotationAxes = { Vector3.Right, Vector3.Up, new Vector3(0, 0, 1) };
+
+    /// <summary>
+    /// Накопленная ориентация блока, который встанет следующим на ЛКМ — авторитетное представление (см.
+    /// <see cref="RotatePending"/>); <see cref="PendingRotationSteps"/> ниже — лишь его проекция на формат хранения
+    /// <see cref="Core.BlockInstance.RotationSteps"/>. Используется плавной анимацией довода призрака на J/K/L (см.
+    /// <c>Editor.BuildEditor</c>, <c>_ghostVisualBasis</c>) — ей нужна ТОЧНАЯ целевая ориентация для интерполяции
+    /// (Slerp), а не производные три числа 0..3.
+    /// </summary>
+    public Basis PendingRotationBasis { get; private set; } = Basis.Identity;
+
     /// <summary>
     /// Ориентация блока, который встанет следующим на ЛКМ (см. <c>BuildEditor.PlaceAtHover</c>) — три четверть-поворота
-    /// вокруг X/Y/Z (см. <see cref="Core.BlockInstance.RotationSteps"/>). Меняется клавишами J (X) / K (Y) / L (Z)
-    /// и сохраняется между установками, пока не изменена снова. На уже поставленные блоки не влияет.
+    /// вокруг X/Y/Z (см. <see cref="Core.BlockInstance.RotationSteps"/>/<see cref="Core.ShapeMeshBuilder.ComposeRotation"/>),
+    /// подобранные так, чтобы ВОСПРОИЗВОДИТЬ <see cref="PendingRotationBasis"/> (см. <see cref="FindStepsFor"/>) —
+    /// именно ЭТО значение в итоге сохраняется в <see cref="Core.BlockInstance.RotationSteps"/> при установке, формат
+    /// хранения/сериализации не меняется. Меняется клавишами J (X) / K (Y) / L (Z) и сохраняется между установками,
+    /// пока не изменена снова. На уже поставленные блоки не влияет.
     /// </summary>
     public Vector3I PendingRotationSteps { get; private set; } = Vector3I.Zero;
 
@@ -125,12 +152,56 @@ public sealed class EditorState
     public void RotatePendingY() => RotatePending(1);
     public void RotatePendingZ() => RotatePending(2);
 
+    /// <summary>
+    /// Поворот ВСЕГДА вокруг глобальной (мировой, фиксированной) оси — новый поворот ПРЕДУМНОЖАЕТСЯ на уже
+    /// накопленный (<c>new Basis(axis, angle) * PendingRotationBasis</c>), а не вокруг текущей, уже повёрнутой
+    /// ЛОКАЛЬНОЙ оси блока (что дало бы послеумножение, <c>PendingRotationBasis * new Basis(axis, angle)</c>).
+    /// <para/>
+    /// Раньше (баг, найденный пользователем, 2026-10-01 (8)) ориентация не накапливалась инкрементально вообще —
+    /// каждый вызов пересобирал её ЗАНОВО из трёх НЕЗАВИСИМЫХ счётчиков в ФИКСИРОВАННОМ порядке X→Y→Z
+    /// (<c>Rz(z)·Ry(y)·Rx(x)</c>), независимо от РЕАЛЬНОГО порядка нажатий. Пока нажимались клавиши одной оси подряд
+    /// или строго в порядке X,Y,Z — результат случайно совпадал с ожидаемым; как только оси чередовались (например,
+    /// K, затем J) — пересборка в фиксированном порядке давала СОВСЕМ другую ориентацию, чем "доверни ещё на 90°
+    /// вокруг мировой X от того, что уже есть" — внешне это выглядело так, будто кнопки вращения "меняются местами".
+    /// Теперь ориентация — ЕДИНСТВЕННЫЙ накапливаемый <see cref="Basis"/>, обновляемый строго в порядке реальных
+    /// нажатий; <see cref="PendingRotationSteps"/> лишь подбирается ПОД него для хранения/сериализации, никогда не
+    /// участвует в вычислении самой ориентации.
+    /// </summary>
     private void RotatePending(int axis)
     {
-        var r = PendingRotationSteps;
-        r[axis] = (r[axis] + 1) % 4;
-        PendingRotationSteps = r;
+        PendingRotationBasis = new Basis(GlobalRotationAxes[axis], Mathf.Pi / 2f) * PendingRotationBasis;
+        PendingRotationSteps = FindStepsFor(PendingRotationBasis);
         Changed?.Invoke();
+    }
+
+    /// <summary>
+    /// Подбирает (x,y,z) в 0..3, при котором <see cref="Core.ShapeMeshBuilder.ComposeRotation(Vector3I)"/> ближе
+    /// всего к <paramref name="target"/> (скалярное произведение кватернионов по модулю, 1 — идеальное совпадение).
+    /// Совпадение гарантированно существует: любая композиция 90°-поворотов вокруг мировых X/Y/Z — всегда элемент
+    /// группы вращений куба (24 элемента), а полный перебор (x,y,z) как раз её и перечисляет (64 варианта с
+    /// повторами на 24 уникальных) — "ближайший", а не точное равенство, для устойчивости к накоплению погрешности
+    /// float после многих нажатий подряд.
+    /// </summary>
+    private static Vector3I FindStepsFor(Basis target)
+    {
+        var targetQuat = new Quaternion(target);
+        var best = Vector3I.Zero;
+        var bestDot = -1.0;
+
+        for (int x = 0; x < 4; x++)
+        for (int y = 0; y < 4; y++)
+        for (int z = 0; z < 4; z++)
+        {
+            var candidate = new Quaternion(ShapeMeshBuilder.ComposeRotation(new Vector3I(x, y, z)));
+            var dot = Math.Abs(targetQuat.Dot(candidate));
+            if (dot > bestDot)
+            {
+                bestDot = dot;
+                best = new Vector3I(x, y, z);
+            }
+        }
+
+        return best;
     }
 
     /// <summary>
@@ -195,12 +266,21 @@ public sealed class EditorState
         PendingSize = ClampToSelectedBlock(size);
     }
 
+    /// <summary>
+    /// Блок с <see cref="FunctionalBlockComponent"/> игнорирует запрошенный размер целиком и всегда возвращает свой
+    /// фиксированный <see cref="FunctionalBlockComponent.Footprint"/> - такие блоки не резинятся (нет
+    /// <see cref="BuildingBlockComponent"/>, см. <see cref="Core.Construction.TrySetSize"/>), Resize-панель на
+    /// тулбаре для них не действует ни на одну из осей.
+    /// </summary>
     private Vector3I ClampToSelectedBlock(Vector3I size)
     {
         var min = Vector3I.One;
         var max = new Vector3I(8, 8, 8);
         if (BlockCatalog.Instance.TryGetBySlug(SelectedBlockSlug, out var definition))
         {
+            var functional = definition.GetComponent<FunctionalBlockComponent>();
+            if (functional != null) return functional.Footprint;
+
             var building = definition.GetComponent<BuildingBlockComponent>();
             if (building != null)
             {

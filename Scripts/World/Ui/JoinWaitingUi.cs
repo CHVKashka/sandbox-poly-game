@@ -9,9 +9,11 @@ namespace SandboxPolyGame.World.Ui;
 /// (<see cref="GameWorld.RequestJoinActiveWorkbench"/>), пока не придёт <c>Core.NetHub.JoinAcceptedForMe</c>/
 /// <c>JoinRejectedForMe</c>, либо пока сам заявитель не передумает (кнопка Cancel — шлёт
 /// <c>Core.NetHub.RequestCancelJoin</c>, см. <see cref="CancelRequested"/>). Не полноэкранный модал, как
-/// <see cref="JoinRequestPopupUi"/> у админа — маленькая плашка сверху экрана, ждать можно и продолжая смотреть по
-/// сторонам (WASD всё же выключен на время ожидания — см. <see cref="GameWorld"/> — чтобы случайно не открыть ещё
-/// один верстак поверх).
+/// <see cref="JoinRequestPopupUi"/> у админа — маленькая плашка сверху экрана: WASD специально ОСТАЁТСЯ включённым
+/// на время ожидания (баг, найденный пользователем — раньше ожидающий игрок вообще не мог ходить, см.
+/// <see cref="GameWorld.MovementBlockingModalOpen"/>), мышь при этом всё равно видима (не Captured) — иначе по
+/// кнопке Cancel было бы нечем кликнуть; E/R по-прежнему заблокированы (см. <see cref="GameWorld.AnyModalOpen"/>),
+/// чтобы не открыть ещё один верстак поверх, пока заявка висит.
 /// </summary>
 public sealed class JoinWaitingUi
 {

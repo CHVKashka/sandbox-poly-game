@@ -16,9 +16,17 @@ namespace SandboxPolyGame.Core;
 /// </summary>
 public static class ShapeMeshBuilder
 {
-    public static (ArrayMesh? Solid, ArrayMesh? Wire, ArrayMesh? Border) Build(BlockShape shape, Vector3I size, Vector3I rotationSteps, Vector3I mirror, Color color, byte occludedMask = 0, bool includeFullCoverageFaces = false, IReadOnlyDictionary<int, uint>? regionColors = null)
+    public static (ArrayMesh? Solid, ArrayMesh? Wire, ArrayMesh? Border) Build(BlockShape shape, Vector3I size, Vector3I rotationSteps, Vector3I mirror, Color color, byte occludedMask = 0, bool includeFullCoverageFaces = false, IReadOnlyDictionary<int, uint>? regionColors = null) =>
+        Build(shape, size, ComposeRotation(rotationSteps), mirror, color, occludedMask, includeFullCoverageFaces, regionColors);
+
+    /// <summary>Та же сборка, но поворот — уже готовый произвольный <see cref="Basis"/>, а не 0..3 ступени вокруг
+    /// X/Y/Z. Единственный потребитель произвольного базиса — анимация поворота призрака (см. <c>Editor.BuildEditor</c>,
+    /// плавный довод между двумя ориентациями через <see cref="Basis.Slerp"/>) — у настоящих поставленных блоков
+    /// поворот всегда одна из 0..3 ступеней (<see cref="Core.BlockInstance.RotationSteps"/>), для них по-прежнему
+    /// используется перегрузка выше.</summary>
+    public static (ArrayMesh? Solid, ArrayMesh? Wire, ArrayMesh? Border) Build(BlockShape shape, Vector3I size, Basis rotation, Vector3I mirror, Color color, byte occludedMask = 0, bool includeFullCoverageFaces = false, IReadOnlyDictionary<int, uint>? regionColors = null)
     {
-        var data = BuildData(shape, size, rotationSteps, mirror, color, occludedMask, includeFullCoverageFaces, regionColors);
+        var data = BuildData(shape, size, rotation, mirror, color, occludedMask, includeFullCoverageFaces, regionColors);
         return data == null ? (null, null, null) : (data.CreateSolidMesh(), data.CreateWireMesh(), data.CreateBorderMesh());
     }
 
@@ -40,12 +48,16 @@ public static class ShapeMeshBuilder
     /// <see cref="BlockGeometry"/>, СТАБИЛЬНА независимо от поворота/отражения/размера — это позиция В ДАННЫХ, а не
     /// в мировых осях), переопределяющий <paramref name="color"/> только для этой грани. null или отсутствие ключа —
     /// грань красится в общий <paramref name="color"/> экземпляра, как раньше.</summary>
-    public static ChunkMeshData? BuildData(BlockShape shape, Vector3I size, Vector3I rotationSteps, Vector3I mirror, Color color, byte occludedMask = 0, bool includeFullCoverageFaces = false, IReadOnlyDictionary<int, uint>? regionColors = null)
+    public static ChunkMeshData? BuildData(BlockShape shape, Vector3I size, Vector3I rotationSteps, Vector3I mirror, Color color, byte occludedMask = 0, bool includeFullCoverageFaces = false, IReadOnlyDictionary<int, uint>? regionColors = null) =>
+        BuildData(shape, size, ComposeRotation(rotationSteps), mirror, color, occludedMask, includeFullCoverageFaces, regionColors);
+
+    /// <summary>Та же сборка, но поворот — уже готовый произвольный <see cref="Basis"/> — см. doc-комментарий
+    /// соответствующей перегрузки <see cref="Build(BlockShape,Vector3I,Basis,Vector3I,Color,byte,bool,IReadOnlyDictionary{int,uint})"/>.</summary>
+    public static ChunkMeshData? BuildData(BlockShape shape, Vector3I size, Basis rotation, Vector3I mirror, Color color, byte occludedMask = 0, bool includeFullCoverageFaces = false, IReadOnlyDictionary<int, uint>? regionColors = null)
     {
         if (!BlockGeometry.TryGet(shape, out var localVertices, out var faces)) return null;
 
         var extent = new Vector3(size.X, size.Y, size.Z) * BuildSpace.CellSize;
-        var rotation = ComposeRotation(rotationSteps);
         var unitCenter = new Vector3(0.5f, 0.5f, 0.5f);
 
         // Поворот/отражение применяются НАД НОРМАЛИЗОВАННЫМ единичным кубом (вокруг его центра 0.5,0.5,0.5) —
@@ -377,7 +389,11 @@ public static class ShapeMeshBuilder
         }
     }
 
-    /// <summary>Три четверть-поворота (0..3 каждый) вокруг X, Y, Z, применённые в этом порядке.</summary>
+    /// <summary>Три четверть-поворота (0..3 каждый) вокруг X, Y, Z, применённые в этом порядке — ФИКСИРОВАННЫЙ
+    /// порядок осей внутри ОДНОГО вызова (не зависит от того, в каком порядке их меняли снаружи, см.
+    /// <see cref="Editor.EditorState.PendingRotationBasis"/> class doc про то, почему для РЕДАКТИРУЕМОЙ, пошагово
+    /// накапливаемой ориентации этого недостаточно — здесь же, для УЖЕ готовой тройки конкретного поставленного
+    /// блока, однозначность не нужна, нужна только воспроизводимость).</summary>
     public static Basis ComposeRotation(Vector3I steps)
     {
         var basis = Basis.Identity;

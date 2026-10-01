@@ -35,6 +35,12 @@ public partial class BuildEditor : Node3D
     private StandardMaterial3D _ghostMaterial = null!;
     private StandardMaterial3D _outlineMaterial = null!;
 
+    // Призрак функционального блока со своей моделью (мотор/вал, см. FunctionalBlockComponent.ScenePath) - вместо
+    // _ghost (BoxMesh/ShapeMeshBuilder, см. UpdateGhostMesh), т.к. настоящая glTF-сцена не укладывается в один
+    // MeshInstance3D.Mesh. Создаётся лениво, пересоздаётся только при смене самой сцены (см. UpdateGhostModel).
+    private Node3D? _ghostModel;
+    private PackedScene? _ghostModelScene;
+
     private Vector2 _mousePosition;
     private bool _looking;
     private bool _toolButtonDown;
@@ -59,9 +65,23 @@ public partial class BuildEditor : Node3D
 
     // Кэш последней собранной формы призрака — чтобы не пересобирать меш каждый кадр без нужды.
     private string? _ghostSlug;
-    private Vector3I _ghostRotation;
+    private Basis _ghostRotation = Basis.Identity;
     private Vector3I _ghostMirror;
     private Vector3I _ghostSize;
+
+    // Плавная анимация поворота призрака на J/K/L (чисто визуальная — EditorState.PendingRotationSteps/
+    // PendingRotationBasis меняются мгновенно, как и раньше, и уходят в реальную установку блока по ЛКМ напрямую,
+    // см. PlaceAtHover). _ghostVisualBasis — текущая ОТОБРАЖАЕМАЯ ориентация призрака, плавно доводится (Slerp) от
+    // той, что была ДО последнего изменения EditorState.PendingRotationBasis, к НОВОЙ целевой — за GhostRotationAnimDuration
+    // секунд (см. _Process/OnStateChanged). Нужна отдельная от EditorState анимация (не меняем саму
+    // PendingRotationBasis постепенно) — иначе реальная установка блока ЛКМ в середине анимации ставила бы его
+    // под "недовёрнутым" углом.
+    private const double GhostRotationAnimDuration = 1.0 / 6.0; // секунд на один довод (90°)
+    private Basis _ghostVisualBasis = Basis.Identity;
+    private Basis _ghostRotationFrom = Basis.Identity;
+    private Basis _ghostRotationTo = Basis.Identity;
+    private double _ghostRotationElapsed;
+    private Basis _lastPendingRotationBasis = Basis.Identity;
 
     public EditorState State => _state;
     public UndoHistory Undo => _undo;
@@ -70,6 +90,14 @@ public partial class BuildEditor : Node3D
     public EditorUi Ui => _ui;
     public RayHit Hover => _hover;
     public MeshInstance3D Ghost => _ghost;
+
+    /// <summary>Виден ли сейчас призрак функционального блока со своей моделью (см. <see cref="_ghostModel"/>) —
+    /// для самотестов; в обычном одиночном/кубическом/формо-призраке (<see cref="Ghost"/>) всегда false.</summary>
+    public bool GhostModelVisible => _ghostModel is { Visible: true };
+
+    /// <summary>Текущая (возможно, ещё анимирующаяся) визуальная ориентация призрака — для самотестов, см.
+    /// <see cref="_ghostVisualBasis"/>.</summary>
+    public Basis GhostVisualBasis => _ghostVisualBasis;
 
     public override void _Ready()
     {
@@ -688,6 +716,9 @@ public partial class BuildEditor : Node3D
     public override void _Process(double delta)
     {
         _camera.MovementEnabled = !_ui.IsModalOpen;
+        _ghostRotationElapsed += delta;
+        var rotationT = Mathf.Clamp(_ghostRotationElapsed / GhostRotationAnimDuration, 0.0, 1.0);
+        _ghostVisualBasis = _ghostRotationFrom.Slerp(_ghostRotationTo, rotationT);
         UpdateHover();
 
         // Удержание кнопки инструмента: он применяется к каждому новому блоку под курсором, но только если мышь сдвинулась —
@@ -727,8 +758,26 @@ public partial class BuildEditor : Node3D
         // размещения только сбивал бы с толку, поэтому скрыт целиком, а не просто "показывает недоступную клетку".
         bool canPlace = _state.Tool == ToolMode.None && _hover.Found && definition != null
                         && CanPlaceFootprint(_hover.PlaceCell, _state.PendingSize);
-        _ghost.Visible = canPlace;
-        if (canPlace)
+
+        // Функциональный блок со своей моделью (мотор/вал) не укладывается в один MeshInstance3D.Mesh (см.
+        // _ghostModel doc) - призрак ставится отдельным узлом вместо куба/формы _ghost, та же подгонка
+        // (FunctionalBlockGeometry), что и у уже размещённых блоков (FunctionalBlockView)/иконки (BlockIconView).
+        var functional = definition?.GetComponent<FunctionalBlockComponent>();
+        (PackedScene? scene, Aabb aabb) ghostScene = default;
+        if (canPlace && functional != null && !string.IsNullOrEmpty(functional.ScenePath))
+        {
+            ghostScene = FunctionalBlockGeometry.GetOrLoadScene(functional.ScenePath);
+        }
+
+        bool showModel = ghostScene.scene != null;
+        _ghost.Visible = canPlace && !showModel;
+        if (_ghostModel != null) _ghostModel.Visible = showModel;
+
+        if (showModel)
+        {
+            UpdateGhostModel(ghostScene.scene!, ghostScene.aabb, functional!.ModelScale);
+        }
+        else if (canPlace)
         {
             UpdateGhostMesh(definition!, slug);
             _ghostMaterial.AlbedoColor = definition!.DefaultColor;
@@ -766,11 +815,16 @@ public partial class BuildEditor : Node3D
     /// размером во весь Size (без склейки соседних граней, как у настоящих кубов в постройке, но снаружи выглядит
     /// так же — одна сплошная область без швов); меш остальных форм строится той же <c>ShapeMeshBuilder</c>, что и
     /// уже поставленные блоки (координаты — от угла клетки, см. <see cref="ShapeInstanceView"/>).
+    /// <para/>
+    /// Поворот берётся из <see cref="_ghostVisualBasis"/> (плавно доводится, Slerp, до <see cref="EditorState.PendingRotationBasis"/>
+    /// на J/K/L, см. его doc-комментарий), не напрямую из <see cref="EditorState"/> — во время анимации это
+    /// промежуточная, не кратная 90° ориентация, поэтому меш пересобирается каждый кадр, пока анимация не осядет на
+    /// целевой (сравнение ниже естественно перестаёт совпадать, пока поворот ещё "в пути").
     /// </summary>
     private void UpdateGhostMesh(BlockDefinition definition, string slug)
     {
         var building = definition.GetComponent<BuildingBlockComponent>();
-        var rotation = _state.PendingRotationSteps;
+        var rotation = _ghostVisualBasis;
         var mirror = _state.PendingMirror;
         var size = _state.PendingSize;
         bool isCube = building == null || building.Shape == BlockShape.Cube;
@@ -799,10 +853,51 @@ public partial class BuildEditor : Node3D
         _ghostSize = size;
     }
 
+    /// <summary>
+    /// Призрак функционального блока со своей моделью (мотор/вал) — узел пересоздаётся, только если сменилась сама
+    /// сцена (разные типы блока или блок без модели вообще, см. <see cref="UpdateCursorVisuals"/>), трансформ
+    /// (позиция/масштаб/поворот) пересчитывается каждый вызов, как и у куба/формы в <see cref="UpdateGhostMesh"/> —
+    /// дёшево, это просто присваивание <see cref="Node3D.Transform"/>, без пересборки меша. Подгонка под размер
+    /// клетки — та же <see cref="FunctionalBlockGeometry"/>, что и у уже поставленных блоков
+    /// (<see cref="FunctionalBlockView"/>), поворот — <see cref="_ghostVisualBasis"/> (как у куба/формы в
+    /// <see cref="UpdateGhostMesh"/> — плавный довод, Slerp, не мгновенный <see cref="EditorState.PendingRotationBasis"/>);
+    /// <see cref="EditorState.PendingMirror"/> для настоящих моделей не поддерживается (см. <see cref="FunctionalBlockGeometry"/>
+    /// class doc) — призрак его тоже игнорирует, ровно как и уже поставленный блок.
+    /// </summary>
+    private void UpdateGhostModel(PackedScene scene, Aabb aabb, Vector3 modelScale)
+    {
+        if (_ghostModelScene != scene)
+        {
+            _ghostModel?.QueueFree();
+            _ghostModel = scene.Instantiate<Node3D>();
+            AddChild(_ghostModel);
+            _ghostModelScene = scene;
+        }
+
+        var size = _state.PendingSize;
+        var targetExtent = new Vector3(size.X, size.Y, size.Z) * BuildSpace.CellSize;
+        var targetCenter = BuildSpace.CellMin(_hover.PlaceCell) + targetExtent * 0.5f;
+        _ghostModel!.Transform = FunctionalBlockGeometry.ComputeFitTransform(aabb, targetExtent, targetCenter, _ghostVisualBasis, modelScale);
+    }
+
     private void OnStateChanged()
     {
         _world.WireframeOn = _state.Wireframe;
         _world.BordersOn = _state.Borders;
+
+        // Призрак доворачивается к НОВОЙ целевой ориентации (см. _ghostVisualBasis doc) каждый раз, когда
+        // PendingRotationBasis реально меняется (J/K/L, в т.ч. вызванные напрямую в самотестах, не только настоящей
+        // клавишей) - отправная точка довода - ТЕКУЩЕЕ отображаемое положение (которое само может быть ещё
+        // "в пути" от предыдущего нажатия), не обязательно уже осевшее на прошлой цели - частые нажатия подряд не
+        // дёргают призрак рывками.
+        if (_state.PendingRotationBasis != _lastPendingRotationBasis)
+        {
+            _ghostRotationFrom = _ghostVisualBasis;
+            _ghostRotationTo = _state.PendingRotationBasis;
+            _ghostRotationElapsed = 0.0;
+            _lastPendingRotationBasis = _state.PendingRotationBasis;
+        }
+
         UpdateCursorVisuals();
     }
 

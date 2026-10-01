@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Block id="shaft" name="Shaft">
+  <Color>#6b6f73</Color>
+  <Component type="BaseComponent">{ "mass": 15, "durability": 90, "damageResistance": 0.15 }</Component>
+  <Component type="FunctionalBlock">{
+    "footprint": [1, 1, 1],
+    "behavior": "Shaft",
+    "scene": "res://meshes/shaft_straight.glb",
+    "ports": [
+      { "id": "torque_in", "resource": "Torque", "direction": "In" },
+      { "id": "torque_out", "resource": "Torque", "direction": "Out" }
+    ]
+  }</Component>
+</Block>

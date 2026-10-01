@@ -34,6 +34,7 @@ public partial class VoxelWorld : Node3D
     private bool _wireframe;
     private bool _borders = true;
     private ShapeInstanceView _shapes = null!;
+    private FunctionalBlockView _functionalBlocks = null!;
 
     public VoxelGrid Grid { get; } = new();
 
@@ -99,6 +100,10 @@ public partial class VoxelWorld : Node3D
         _shapes = new ShapeInstanceView { Name = "Shapes" };
         AddChild(_shapes);
         Construction.Changed += () => _shapes.Sync(Construction);
+
+        _functionalBlocks = new FunctionalBlockView { Name = "FunctionalBlocks" };
+        AddChild(_functionalBlocks);
+        Construction.Changed += () => _functionalBlocks.Sync(Construction);
 
         Grid.CellChanged += OnCellChanged;
         ApplyVisibility();

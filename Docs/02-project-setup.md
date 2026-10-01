@@ -7,7 +7,7 @@
 после чистки `.godot`/`obj`/`bin` (см. «Заметки по окружению» ниже).
 
 Движок ищется **автоматически**, без правки скриптов и без переменных окружения — `run.bat`/`test.bat`/`edit.bat`/
-`export.bat` вызывают `Tools\find-godot-engine.ps1`, который проверяет по очереди: `GODOT_SRC` (если задана и
+`export.bat`/`blockeditor.bat` вызывают `Tools\find-godot-engine.ps1`, который проверяет по очереди: `GODOT_SRC` (если задана и
 движок там реально есть) → кэш из прошлого успешного поиска (`.godot-engine-path.txt` в корне репозитория, в
 `.gitignore`, свой на каждой машине) → список типичных путей (`C:\Godot\godot-src`, `D:\Godot\godot-src` и т.п.) →
 полное сканирование локальных дисков как крайний случай (медленно, но результат кэшируется, так что происходит
@@ -23,6 +23,7 @@
 | `edit.bat` | Сборка + открыть проект в GUI-редакторе Godot (`-e`) |
 | `test.bat` | Сборка + самотесты headless (см. [04-testing.md](04-testing.md)); код выхода 0 = всё прошло |
 | `export.bat [аргументы]` | Обёртка над `Tools\export-windows.ps1` — собирает отдельный `.exe` игры (см. ниже) |
+| `blockeditor.bat [slug]` | Сборка + дебаг-редактор функциональных блоков (`--blockeditor`, см. [05](05-world-and-vehicle-systems.md) «Дебаг-редактор блоков»); необязательный `slug` сразу открывает существующий блок, например `blockeditor.bat electric_motor` |
 
 ## Структура репозитория
 
@@ -31,7 +32,7 @@ sandbox-poly-game/
 ├─ project.godot            настройки проекта (главная сцена, окно 1600x900, MSAA 2x, метка Double Precision)
 ├─ sandbox-poly-game.csproj / .sln   C#-проект (Godot.NET.Sdk 4.7.2, net8.0, GodotFloat64=true)
 ├─ nuget.config             привязка пакетов Godot* к локальному источнику GodotDouble (см. ниже)
-├─ build.bat / run.bat / edit.bat / test.bat / export.bat   быстрый старт (см. выше)
+├─ build.bat / run.bat / edit.bat / test.bat / export.bat / blockeditor.bat   быстрый старт (см. выше)
 ├─ blocks/                  data-driven описания блоков, по одному XML-файлу на блок (см. 03)
 ├─ meshes/                  статичные глб-модели мира (верстак и т.п.) — см. 05, «Формат моделей»
 ├─ Scenes/

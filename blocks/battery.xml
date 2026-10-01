@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Block id="battery" name="Electric Battery">
+  <Color>#d9a53c</Color>
+  <Component type="BaseComponent">{ "mass": 40, "durability": 120, "damageResistance": 0.1 }</Component>
+  <Component type="FunctionalBlock">{
+    "footprint": [1, 1, 1],
+    "behavior": "Battery",
+    "capacity": 100,
+    "ports": [
+      { "id": "power_port", "resource": "Electricity", "direction": "Out" }
+    ]
+  }</Component>
+</Block>
