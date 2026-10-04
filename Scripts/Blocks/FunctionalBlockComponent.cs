@@ -29,9 +29,11 @@ namespace SandboxPolyGame.Blocks;
 /// JSON-параметры:
 /// <c>{ "footprint": [1,1,1], "behavior": "ElectricMotor", "capacity": 100, "scene": "res://meshes/x.glb",
 ///   "collision": [ { "position": [0,0,0], "size": [0.25,0.25,0.25] } ], "ports": [
-///   { "id": "power_in", "resource": "Electricity", "direction": "In" } ] }</c>. Все, кроме <c>footprint</c>,
-/// опциональны. <c>behavior</c> — строковый ключ будущего поведения (пока только хранится, ни на что не
-/// влияет — см. class doc).
+///   { "id": "power_in", "resource": "Electricity", "direction": "In", "face": "NegZ", "position": [0,0] } ] }</c>.
+/// Все, кроме <c>footprint</c>, опциональны. <c>behavior</c> — строковый ключ будущего поведения (пока только
+/// хранится, ни на что не влияет — см. class doc). У порта <c>face</c>/<c>position</c> тоже опциональны (старые,
+/// написанные руками до появления этих полей блоки по-прежнему парсятся — см. <see cref="ResourcePort.Face"/>/
+/// <see cref="ResourcePort.FaceCell"/> про значения по умолчанию).
 /// </remarks>
 public sealed class FunctionalBlockComponent : BlockComponent
 {
@@ -114,7 +116,20 @@ public sealed class FunctionalBlockComponent : BlockComponent
         string id = json.GetProperty("id").GetString() ?? "";
         var resource = Enum.Parse<ResourceType>(json.GetProperty("resource").GetString()!, ignoreCase: true);
         var direction = Enum.Parse<PortDirection>(json.GetProperty("direction").GetString()!, ignoreCase: true);
-        return new ResourcePort { Id = id, Resource = resource, Direction = direction };
+
+        var face = json.TryGetProperty("face", out var faceJson) && faceJson.ValueKind == JsonValueKind.String
+            ? Enum.Parse<BlockFace>(faceJson.GetString()!, ignoreCase: true)
+            : BlockFace.PosZ;
+
+        var faceCell = Vector2I.Zero;
+        if (json.TryGetProperty("position", out var positionJson) && positionJson.ValueKind == JsonValueKind.Array
+            && positionJson.GetArrayLength() == 2)
+        {
+            var items = positionJson.EnumerateArray().ToArray();
+            faceCell = new Vector2I(items[0].GetInt32(), items[1].GetInt32());
+        }
+
+        return new ResourcePort { Id = id, Resource = resource, Direction = direction, Face = face, FaceCell = faceCell };
     }
 
     private static Vector3I ReadVector(JsonElement array, Vector3I fallback)

@@ -53,9 +53,20 @@ public partial class FlyCamera : Camera3D
     /// WASD, просто по колесу и с своим шагом на "щелчок".</summary>
     public void Zoom(double steps) => GlobalPosition -= GlobalTransform.Basis.Z * (float)(steps * ZoomStep);
 
+    /// <summary>
+    /// Баг, найденный пользователем: WASD печатался в сфокусированное текстовое поле И ОДНОВРЕМЕННО двигал камеру -
+    /// <see cref="Input.IsPhysicalKeyPressed"/> ниже читает физическое состояние клавиши НАПРЯМУЮ, не глядя на фокус
+    /// UI (в отличие от текста, который Godot доставляет ОТДЕЛЬНО сфокусированному <see cref="LineEdit"/>). Раньше
+    /// от этого защищал только клик мышью (снимал фокус ДО печати, см. <c>Dev.BlockPrefabEditor._Input</c>/
+    /// <c>Editor.BuildEditor</c> про Ctrl+Z/Y) - не помогало, если поле было сфокусировано и с него просто печатали,
+    /// ни разу не кликнув заново в 3D-вид. Явная проверка фокуса здесь закрывает именно этот случай, в одном месте
+    /// сразу для обоих инструментов, использующих эту камеру (<c>BuildEditor</c>/<c>Dev.BlockPrefabEditor</c>).
+    /// </summary>
+    private bool IsTypingIntoField() => GetViewport().GuiGetFocusOwner() is LineEdit;
+
     public override void _Process(double delta)
     {
-        if (!MovementEnabled) return;
+        if (!MovementEnabled || IsTypingIntoField()) return;
 
         var basis = GlobalTransform.Basis;
         var direction = Vector3.Zero;

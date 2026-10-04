@@ -11,8 +11,8 @@
       { "position": [0, 0, 0], "size": [0.25, 0.25, 0.25] }
     ],
     "ports": [
-      { "id": "power_in", "resource": "Electricity", "direction": "In" },
-      { "id": "shaft_out", "resource": "Torque", "direction": "Out" }
+      { "id": "power_in", "resource": "Electricity", "direction": "In", "face": "NegY", "position": [0, 0] },
+      { "id": "shaft_out", "resource": "Torque", "direction": "Out", "face": "PosY", "position": [0, 0] }
     ]
   }</Component>
 </Block>

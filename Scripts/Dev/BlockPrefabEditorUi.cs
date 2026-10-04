@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.Linq;
 using Godot;
 using SandboxPolyGame.Blocks;
 using SandboxPolyGame.Editor.Ui;
@@ -23,6 +24,18 @@ public sealed class BlockPrefabEditorUi
     public event Action? AddCollisionBoxRequested;
     public event Action<int>? RemoveCollisionBoxRequested;
     public event Action? CollisionBoxesChanged;
+    public event Action? AddPortRequested;
+    public event Action<int>? RemovePortRequested;
+    public event Action? PortsChanged;
+
+    /// <summary>
+    /// Фокус вошёл в любое редактируемое поле (текст/дропдаун) — ПЕРЕД тем, как пользователь успел что-то в нём
+    /// поменять (см. <see cref="BindUndoCapture"/>). <see cref="BlockPrefabEditor"/> снимает снэпшот ДО изменения
+    /// именно по этому событию, а не по <see cref="FieldsChanged"/>/<see cref="CollisionBoxesChanged"/>/
+    /// <see cref="PortsChanged"/> — те стреляют уже ПОСЛЕ того, как Godot применил новое значение к полю (по Enter/
+    /// потере фокуса), то есть "состояние до правки" к этому моменту уже потеряно.
+    /// </summary>
+    public event Action? EditSessionStarting;
 
     private readonly LineEdit _slugField;
     private readonly LineEdit _nameField;
@@ -37,10 +50,18 @@ public sealed class BlockPrefabEditorUi
     private readonly LineEdit _behaviorField;
     private readonly LineEdit _capacityField;
     private readonly VBoxContainer _collisionList;
+    private readonly VBoxContainer _portList;
     private readonly Label _status;
 
     private readonly List<(LineEdit[] Position, LineEdit[] Size)> _collisionRows = new();
     private bool _suppressCollisionEvents;
+
+    private readonly List<(LineEdit Id, OptionButton Resource, OptionButton Direction, OptionButton Face, LineEdit[] FaceCell)> _portRows = new();
+    private bool _suppressPortEvents;
+
+    private static readonly ResourceType[] ResourceValues = (ResourceType[])Enum.GetValues(typeof(ResourceType));
+    private static readonly PortDirection[] DirectionValues = (PortDirection[])Enum.GetValues(typeof(PortDirection));
+    private static readonly BlockFace[] FaceValues = (BlockFace[])Enum.GetValues(typeof(BlockFace));
 
     public BlockPrefabEditorUi(Control layerRoot)
     {
@@ -89,11 +110,14 @@ public sealed class BlockPrefabEditorUi
         column.AddChild(Separator());
         column.AddChild(UiStyle.MakeLabel("Model", 13, UiStyle.TextDim));
         var sceneRow = new HBoxContainer();
-        _sceneField = new LineEdit { CustomMinimumSize = new Vector2(360, 28), PlaceholderText = "res://meshes/....glb" };
+        _sceneField = new LineEdit { CustomMinimumSize = new Vector2(260, 28), PlaceholderText = "res://meshes/....glb" };
         _sceneField.TextSubmitted += _ => ReloadSceneRequested?.Invoke();
         _sceneField.FocusExited += () => ReloadSceneRequested?.Invoke();
         sceneRow.AddChild(_sceneField);
-        var reloadButton = UiStyle.MakeButton("Reload", new Vector2(80, 28));
+        var browseButton = UiStyle.MakeButton("Browse...", new Vector2(90, 28));
+        browseButton.Pressed += BrowseForModel;
+        sceneRow.AddChild(browseButton);
+        var reloadButton = UiStyle.MakeButton("Reload", new Vector2(70, 28));
         reloadButton.Pressed += () => ReloadSceneRequested?.Invoke();
         sceneRow.AddChild(reloadButton);
         column.AddChild(sceneRow);
@@ -128,11 +152,23 @@ public sealed class BlockPrefabEditorUi
         column.AddChild(scaleHint);
 
         column.AddChild(Separator());
-        var portsHint = UiStyle.MakeLabel("Ресурсы (необязательно - ports не редактируются здесь, см. XML руками)", 12, UiStyle.TextDim);
-        portsHint.AutowrapMode = TextServer.AutowrapMode.WordSmart;
-        column.AddChild(portsHint);
         _behaviorField = AddTextRow(column, "Behavior", "");
         _capacityField = AddNumericRow(column, "Capacity", "0");
+
+        column.AddChild(Separator());
+        var portsHeader = new HBoxContainer();
+        var portsHeaderLabel = UiStyle.MakeLabel("Ports (ресурсные входы/выходы; несколько портов могут сидеть в одном месте)", 13, UiStyle.TextDim);
+        portsHeaderLabel.AutowrapMode = TextServer.AutowrapMode.WordSmart;
+        portsHeaderLabel.CustomMinimumSize = new Vector2(360, 0);
+        portsHeader.AddChild(portsHeaderLabel);
+        var addPortButton = UiStyle.MakeButton("+ Add port", new Vector2(100, 26));
+        addPortButton.Pressed += () => AddPortRequested?.Invoke();
+        portsHeader.AddChild(addPortButton);
+        column.AddChild(portsHeader);
+
+        _portList = new VBoxContainer();
+        _portList.AddThemeConstantOverride("separation", 10);
+        column.AddChild(_portList);
 
         column.AddChild(Separator());
         var collisionHeader = new HBoxContainer();
@@ -157,12 +193,89 @@ public sealed class BlockPrefabEditorUi
 
         layerRoot.AddChild(panel);
 
-        // Каждое базовое поле (кроме slug/collision, у которых своя логика) помечает превью как "грязное".
+        // Каждое базовое поле (кроме slug/collision, у которых своя логика) помечает превью как "грязное" И снимает
+        // снэпшот для Undo/Redo (см. BindUndoCapture) ПРИ ВХОДЕ фокуса в поле - до того, как значение изменится.
         foreach (var field in new[] { _nameField, _colorField, _massField, _durabilityField, _damageField, _behaviorField, _capacityField })
         {
             field.TextSubmitted += _ => FieldsChanged?.Invoke();
             field.FocusExited += () => FieldsChanged?.Invoke();
+            BindUndoCapture(field);
         }
+        BindUndoCapture(_sceneField);
+        foreach (var field in _footprintFields) BindUndoCapture(field);
+        foreach (var field in _modelScaleFields) BindUndoCapture(field);
+    }
+
+    /// <summary>Снимает Undo-снэпшот, когда фокус ВХОДИТ в это поле/дропдаун — ДО того, как пользователь успеет что-то
+    /// в нём поменять (см. <see cref="EditSessionStarting"/> doc про то, почему не на событии "значение изменилось").</summary>
+    private void BindUndoCapture(Control control) => control.FocusEntered += () => EditSessionStarting?.Invoke();
+
+    /// <summary>
+    /// Открывает НАТИВНЫЙ диалог выбора файла ОС (<see cref="DisplayServer.FileDialogShow"/> — на Windows это и есть
+    /// обычный проводник, а не свой `Control`-диалог Godot) для выбора `.glb`/`.gltf`, по запросу пользователя
+    /// ("подгрузка моделей через проводник Windows"), вместо печати пути в <see cref="_sceneField"/> руками.
+    /// <para/>
+    /// Выбранный файл ВНЕ папки проекта скопировать НЕЛЬЗЯ сослаться на него через <c>res://</c> напрямую (движок
+    /// пакует только то, что лежит внутри проекта) — поэтому такой файл копируется в <c>res://meshes/</c>
+    /// (<see cref="DirAccess.CopyAbsolute"/>, тем же именем файла, перезаписывая одноимённый, если уже есть). Файл,
+    /// уже лежащий где-то ВНУТРИ проекта, просто используется по месту (<see cref="ProjectSettings.LocalizePath"/>
+    /// возвращает для него настоящий <c>res://...</c>, без копирования).
+    /// <para/>
+    /// Модель видна в превью СРАЗУ, без `--import`/перезапуска — <see cref="FunctionalBlockGeometry.GetOrLoadScene"/>
+    /// при отсутствии кэша импорта (свежескопированный/никогда не импортировавшийся файл) читает `.glb`/`.gltf`
+    /// напрямую через <see cref="GltfDocument"/>, в обход конвейера импорта редактора (см. его doc-комментарий).
+    /// </summary>
+    private void BrowseForModel()
+    {
+        if (!DisplayServer.HasFeature(DisplayServer.Feature.NativeDialogFile))
+        {
+            SetStatus("native file dialog not supported on this platform/display server - type the res:// path manually");
+            return;
+        }
+
+        string startDir = ProjectSettings.GlobalizePath("res://meshes");
+        var filters = new[] { "*.glb,*.gltf;3D Model (glTF)" };
+
+        DisplayServer.FileDialogShow(
+            "Select a 3D model (.glb/.gltf)", startDir, "", false, DisplayServer.FileDialogMode.OpenFile, filters,
+            Callable.From((bool status, string[] selectedPaths, long _) =>
+            {
+                if (!status || selectedPaths.Length == 0) return;
+                ApplyChosenModelPath(selectedPaths[0]);
+            }));
+    }
+
+    private void ApplyChosenModelPath(string nativePath)
+    {
+        string localized = ProjectSettings.LocalizePath(nativePath);
+        string resPath;
+        bool copied = false;
+
+        if (localized.StartsWith("res://"))
+        {
+            resPath = localized;
+        }
+        else
+        {
+            // Файл вне проекта - res:// на него сослаться не может, копируем в meshes/ под тем же именем.
+            string fileName = nativePath.Replace('\\', '/').Split('/')[^1];
+            resPath = $"res://meshes/{fileName}";
+            var err = DirAccess.CopyAbsolute(nativePath, resPath);
+            if (err != Error.Ok)
+            {
+                SetStatus($"failed to copy '{nativePath}' into res://meshes/: {err}");
+                return;
+            }
+
+            copied = true;
+        }
+
+        // Порядок важен: ставим СВОЙ статус ДО перезагрузки, а не после - если сцена реально не прочитается (битый
+        // файл и т.п.), RefreshPreview сам перезапишет его настоящей ошибкой ("scene not found/failed to load: ...",
+        // см. Dev.BlockPrefabEditor.RefreshPreview) - наш "скопировано"/"установлено" не должен эту ошибку скрывать.
+        _sceneField.Text = resPath;
+        SetStatus(copied ? $"copied into {resPath}" : $"model set to {resPath}");
+        ReloadSceneRequested?.Invoke();
     }
 
     private static Control Separator() => new HSeparator { CustomMinimumSize = new Vector2(0, 4) };
@@ -218,6 +331,20 @@ public sealed class BlockPrefabEditorUi
         for (int axis = 0; axis < 3; axis++) _modelScaleFields[axis].Text = scale[axis].ToString(CultureInfo.InvariantCulture);
     }
 
+    /// <summary>Для самотестов — заполняет поля УЖЕ СУЩЕСТВУЮЩЕГО ряда порта (добавленного через
+    /// <see cref="AddPortRequested"/>/<see cref="SetPortRows"/>) напрямую, без события <see cref="PortsChanged"/> —
+    /// обычный UI правит их руками по одному полю за раз, тестам нужно выставить все сразу.</summary>
+    public void SetPortForTesting(int index, string id, ResourceType resource, PortDirection direction, BlockFace face, Vector2I faceCell)
+    {
+        var row = _portRows[index];
+        row.Id.Text = id;
+        row.Resource.Selected = Array.IndexOf(ResourceValues, resource);
+        row.Direction.Selected = Array.IndexOf(DirectionValues, direction);
+        row.Face.Selected = Array.IndexOf(FaceValues, face);
+        row.FaceCell[0].Text = faceCell.X.ToString(CultureInfo.InvariantCulture);
+        row.FaceCell[1].Text = faceCell.Y.ToString(CultureInfo.InvariantCulture);
+    }
+
     public string Name => string.IsNullOrWhiteSpace(_nameField.Text) ? Slug : _nameField.Text.Trim();
     public string ScenePath => _sceneField.Text.Trim();
     public string Behavior => _behaviorField.Text.Trim();
@@ -259,10 +386,34 @@ public sealed class BlockPrefabEditorUi
         }
     }
 
+    /// <summary>Та же "жить читается из живых полей" идея, что и у <see cref="CollisionBoxes"/> — порт собирается
+    /// заново при каждом обращении, УЖЕ ОТРАЖАЯ поля ряда (Id/Resource/Direction/Face/FaceCell).</summary>
+    public IReadOnlyList<ResourcePort> Ports
+    {
+        get
+        {
+            var result = new List<ResourcePort>(_portRows.Count);
+            foreach (var row in _portRows)
+            {
+                result.Add(new ResourcePort
+                {
+                    Id = row.Id.Text.Trim(),
+                    Resource = ResourceValues[row.Resource.Selected],
+                    Direction = DirectionValues[row.Direction.Selected],
+                    Face = FaceValues[row.Face.Selected],
+                    FaceCell = new Vector2I(ParseIntOrZero(row.FaceCell[0].Text), ParseIntOrZero(row.FaceCell[1].Text)),
+                });
+            }
+
+            return result;
+        }
+    }
+
     // ------------------------------------------------------------------ запись полей (загрузка существующего/нового блока)
 
     public void LoadFields(string slug, string name, Color color, float mass, float durability, float damage,
-        string scenePath, Vector3I footprint, Vector3 modelScale, string behavior, float capacity, IReadOnlyList<CollisionBox> collisionBoxes)
+        string scenePath, Vector3I footprint, Vector3 modelScale, string behavior, float capacity,
+        IReadOnlyList<CollisionBox> collisionBoxes, IReadOnlyList<ResourcePort> ports)
     {
         _slugField.Text = slug;
         _nameField.Text = name;
@@ -278,6 +429,7 @@ public sealed class BlockPrefabEditorUi
         _capacityField.Text = capacity.ToString(CultureInfo.InvariantCulture);
 
         SetCollisionBoxRows(collisionBoxes);
+        SetPortRows(ports);
     }
 
     /// <summary>Перестраивает список рядов коллизии с нуля — вызывается при загрузке блока и при Add/Remove
@@ -319,6 +471,7 @@ public sealed class BlockPrefabEditorUi
             var field = new LineEdit { CustomMinimumSize = new Vector2(60, 26), Text = box.Position[axis].ToString(CultureInfo.InvariantCulture) };
             field.TextSubmitted += _ => NotifyCollisionChanged();
             field.FocusExited += () => NotifyCollisionChanged();
+            BindUndoCapture(field);
             posRow.AddChild(field);
             positionFields[axis] = field;
         }
@@ -331,6 +484,7 @@ public sealed class BlockPrefabEditorUi
             var field = new LineEdit { CustomMinimumSize = new Vector2(60, 26), Text = box.Size[axis].ToString(CultureInfo.InvariantCulture) };
             field.TextSubmitted += _ => NotifyCollisionChanged();
             field.FocusExited += () => NotifyCollisionChanged();
+            BindUndoCapture(field);
             sizeRow.AddChild(field);
             sizeFields[axis] = field;
         }
@@ -346,6 +500,90 @@ public sealed class BlockPrefabEditorUi
         if (!_suppressCollisionEvents) CollisionBoxesChanged?.Invoke();
     }
 
+    // ------------------------------------------------------------------ ресурсные порты (тот же приём "список рядов", что и коллизия выше)
+
+    /// <summary>Перестраивает список рядов портов с нуля — тот же приём, что и <see cref="SetCollisionBoxRows"/>.</summary>
+    public void SetPortRows(IReadOnlyList<ResourcePort> ports)
+    {
+        _suppressPortEvents = true;
+        foreach (var child in _portList.GetChildren()) child.QueueFree();
+        _portRows.Clear();
+
+        for (int i = 0; i < ports.Count; i++) AddPortRow(ports[i], i);
+
+        _suppressPortEvents = false;
+    }
+
+    private static OptionButton MakeEnumDropdown(IEnumerable<string> names, int selectedIndex)
+    {
+        var dropdown = new OptionButton { CustomMinimumSize = new Vector2(110, 26) };
+        foreach (string name in names) dropdown.AddItem(name);
+        dropdown.Selected = selectedIndex;
+        return dropdown;
+    }
+
+    private void AddPortRow(ResourcePort port, int index)
+    {
+        var entry = new VBoxContainer();
+        entry.AddThemeConstantOverride("separation", 2);
+
+        var header = new HBoxContainer();
+        header.AddChild(UiStyle.MakeLabel($"Port #{index}", 12, UiStyle.TextDim));
+        int capturedIndex = index;
+        var removeButton = UiStyle.MakeButton("Remove", new Vector2(70, 24));
+        removeButton.Pressed += () => RemovePortRequested?.Invoke(capturedIndex);
+        header.AddChild(removeButton);
+        entry.AddChild(header);
+
+        var idRow = new HBoxContainer();
+        idRow.AddChild(UiStyle.MakeLabel("id", 11, UiStyle.TextDim));
+        var idField = new LineEdit { CustomMinimumSize = new Vector2(140, 26), Text = port.Id };
+        idField.TextSubmitted += _ => NotifyPortChanged();
+        idField.FocusExited += () => NotifyPortChanged();
+        BindUndoCapture(idField);
+        idRow.AddChild(idField);
+
+        var resourceDropdown = MakeEnumDropdown(ResourceValues.Select(r => r.ToString()), Array.IndexOf(ResourceValues, port.Resource));
+        resourceDropdown.ItemSelected += _ => NotifyPortChanged();
+        BindUndoCapture(resourceDropdown);
+        idRow.AddChild(resourceDropdown);
+
+        var directionDropdown = MakeEnumDropdown(DirectionValues.Select(d => d.ToString()), Array.IndexOf(DirectionValues, port.Direction));
+        directionDropdown.ItemSelected += _ => NotifyPortChanged();
+        BindUndoCapture(directionDropdown);
+        idRow.AddChild(directionDropdown);
+        entry.AddChild(idRow);
+
+        var placementRow = new HBoxContainer();
+        placementRow.AddChild(UiStyle.MakeLabel("face", 11, UiStyle.TextDim));
+        var faceDropdown = MakeEnumDropdown(FaceValues.Select(f => f.ToString()), Array.IndexOf(FaceValues, port.Face));
+        faceDropdown.ItemSelected += _ => NotifyPortChanged();
+        BindUndoCapture(faceDropdown);
+        placementRow.AddChild(faceDropdown);
+
+        placementRow.AddChild(UiStyle.MakeLabel("cell", 11, UiStyle.TextDim));
+        var faceCellFields = new LineEdit[2];
+        for (int axis = 0; axis < 2; axis++)
+        {
+            var field = new LineEdit { CustomMinimumSize = new Vector2(44, 26), Text = port.FaceCell[axis].ToString(CultureInfo.InvariantCulture) };
+            field.TextSubmitted += _ => NotifyPortChanged();
+            field.FocusExited += () => NotifyPortChanged();
+            BindUndoCapture(field);
+            placementRow.AddChild(field);
+            faceCellFields[axis] = field;
+        }
+        entry.AddChild(placementRow);
+
+        _portList.AddChild(entry);
+        _portList.AddChild(new HSeparator());
+        _portRows.Add((idField, resourceDropdown, directionDropdown, faceDropdown, faceCellFields));
+    }
+
+    private void NotifyPortChanged()
+    {
+        if (!_suppressPortEvents) PortsChanged?.Invoke();
+    }
+
     public void SetStatus(string message) => _status.Text = message;
 
     private static bool TryParseColor(string text, out Color color)
@@ -355,6 +593,10 @@ public sealed class BlockPrefabEditorUi
     }
 
     private static int ParseIntOr(string text, int fallback) => int.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out int value) && value > 0 ? value : fallback;
+
+    /// <summary>Как <see cref="ParseIntOr"/>, но без "floor at 1" — координата клетки на грани (<see cref="ResourcePort.FaceCell"/>)
+    /// законно равна 0 (угол грани), в отличие от footprint'а/размера, у которых 0 бессмысленно.</summary>
+    private static int ParseIntOrZero(string text) => int.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out int value) ? value : 0;
 
     private static float ParseFloatOr(string text, float fallback) => float.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out float value) ? value : fallback;
 }

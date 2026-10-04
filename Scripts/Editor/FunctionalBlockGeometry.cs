@@ -1,5 +1,7 @@
+using System;
 using System.Collections.Generic;
 using Godot;
+using SandboxPolyGame.Blocks;
 using SandboxPolyGame.Core;
 
 namespace SandboxPolyGame.Editor;
@@ -30,12 +32,18 @@ public static class FunctionalBlockGeometry
     /// пробный узел и сразу синхронно освобождает (<see cref="Node.Free"/>, не <see cref="Node.QueueFree"/> —
     /// пробный узел никогда не входит в дерево сцены). <c>Scene == null</c> — файл не найден/не загрузился
     /// (залогировано один раз, при первом обращении к этому пути).
+    /// <para/>
+    /// Если <see cref="GD.Load{T}(string)"/> не нашёл готовый импорт (<c>res://.godot/imported/*.scn</c> ещё не
+    /// создан движком — свежескопированный файл, например через <c>Dev.BlockPrefabEditorUi.BrowseForModel</c>,
+    /// до ближайшего <c>--import</c>/перезапуска), запасным путём разбираем `.glb`/`.gltf` НАПРЯМУЮ через
+    /// <see cref="LoadGltfDirectly"/>, в обход конвейера импорта редактора — это и даёт "горячую" загрузку модели
+    /// сразу по выбору файла, по запросу пользователя, без ожидания импорта.
     /// </summary>
     public static (PackedScene? Scene, Aabb Aabb) GetOrLoadScene(string path)
     {
         if (SceneCache.TryGetValue(path, out var cached)) return cached;
 
-        var scene = GD.Load<PackedScene>(path);
+        var scene = GD.Load<PackedScene>(path) ?? LoadGltfDirectly(path);
         if (scene == null)
         {
             GD.PrintErr($"[functional-block] scene not found: {path}");
@@ -51,6 +59,30 @@ public static class FunctionalBlockGeometry
 
         SceneCache[path] = cached;
         return cached;
+    }
+
+    /// <summary>
+    /// Разбирает <c>.glb</c>/<c>.gltf</c> напрямую по байтам файла через <see cref="GltfDocument"/>/<see cref="GltfState"/>
+    /// (тот же класс, которым ПОЛЬЗУЕТСЯ САМ импортёр редактора внутри — доступен и без него) — минует кэш импорта
+    /// <c>res://.godot/imported/*.scn</c> полностью, поэтому работает для файла, который движок ещё НИ РАЗУ не
+    /// импортировал (включая только что скопированный `.glb`, который физически лежит в <c>res://meshes/</c>, но не
+    /// успел получить `.import`-кэш). <see cref="GltfDocument.AppendFromFile"/> читает <paramref name="path"/> через
+    /// обычный <see cref="FileAccess"/>, поэтому принимает и <c>res://...</c>, и нативный OS-путь одинаково.
+    /// <see cref="GltfDocument.GenerateScene"/> возвращает уже готовый, проставленный <see cref="Node.Owner"/> по
+    /// всему поддереву узел (сам генератор так и делает — ровно то, что нужно <see cref="PackedScene.Pack"/>, иначе
+    /// упаковались бы не все дочерние узлы). <c>null</c> — не удалось прочитать/разобрать файл (не глтф/битый файл).
+    /// </summary>
+    private static PackedScene? LoadGltfDirectly(string path)
+    {
+        using var document = new GltfDocument();
+        using var state = new GltfState();
+        if (document.AppendFromFile(path, state) != Error.Ok) return null;
+
+        var root = document.GenerateScene(state);
+        var packed = new PackedScene();
+        bool packedOk = packed.Pack(root) == Error.Ok;
+        root.QueueFree(); // уже упакован в PackedScene - сам живой узел больше не нужен
+        return packedOk ? packed : null;
     }
 
     /// <summary>
@@ -122,5 +154,51 @@ public static class FunctionalBlockGeometry
         var modelCenter = modelAabb.Position + size * 0.5f;
         var origin = targetCenter - basis * modelCenter;
         return new Transform3D(basis, origin);
+    }
+
+    /// <summary>
+    /// Для стороны <paramref name="face"/> НЕповёрнутого footprint'а размером <paramref name="footprint"/> (в
+    /// клетках) — размер (ширина, высота) её собственной 2D-сетки, в которой задаётся <see cref="ResourcePort.FaceCell"/>.
+    /// X/Y/Z-грани (±X) используют (Y,Z) footprint'а, Y-грани (±Y) — (X,Z), Z-грани (±Z) — (X,Y): на каждой стороне
+    /// "ширина/высота" — это два измерения footprint'а, ЛЕЖАЩИЕ В ПЛОСКОСТИ этой стороны (ось, перпендикулярную ей,
+    /// координата порта не имеет — порт сидит прямо НА плоскости грани).
+    /// </summary>
+    public static (int Width, int Height) FaceDimensions(BlockFace face, Vector3I footprint) => face switch
+    {
+        BlockFace.NegX or BlockFace.PosX => (footprint.Y, footprint.Z),
+        BlockFace.NegY or BlockFace.PosY => (footprint.X, footprint.Z),
+        _ => (footprint.X, footprint.Y),
+    };
+
+    /// <summary>
+    /// Переводит (<see cref="ResourcePort.Face"/>, <see cref="ResourcePort.FaceCell"/>) в точку (локальные координаты
+    /// НЕповёрнутого блока, метры, от минимального угла footprint'а — та же конвенция, что и <see cref="Blocks.CollisionBox.Position"/>)
+    /// и направленную наружу нормаль этой стороны. <paramref name="faceCell"/> КЛАМПИТСЯ в границы реальной сетки
+    /// грани (<see cref="FaceDimensions"/>) на случай, если footprint блока уменьшили ПОСЛЕ того, как порт разместили
+    /// на клетке, которой больше не существует — само сохранённое значение при этом не меняется (клампится только
+    /// вычисляемая точка, не данные), чтобы не терять позицию порта молча при временном несоответствии в редакторе.
+    /// Намеренно не проверяет и не мешает НЕСКОЛЬКИМ портам иметь одну и ту же (Face, FaceCell) — см.
+    /// <see cref="ResourcePort"/> class doc.
+    /// </summary>
+    public static (Vector3 Position, Vector3 Normal) ComputePortAnchor(BlockFace face, Vector2I faceCell, Vector3I footprint, float cellSize)
+    {
+        var (width, height) = FaceDimensions(face, footprint);
+        int cx = Math.Clamp(faceCell.X, 0, Math.Max(width - 1, 0));
+        int cy = Math.Clamp(faceCell.Y, 0, Math.Max(height - 1, 0));
+        var a = (cx + 0.5f) * cellSize;
+        var b = (cy + 0.5f) * cellSize;
+        var maxX = footprint.X * cellSize;
+        var maxY = footprint.Y * cellSize;
+        var maxZ = footprint.Z * cellSize;
+
+        return face switch
+        {
+            BlockFace.NegX => (new Vector3(0, a, b), new Vector3(-1, 0, 0)),
+            BlockFace.PosX => (new Vector3(maxX, a, b), new Vector3(1, 0, 0)),
+            BlockFace.NegY => (new Vector3(a, 0, b), new Vector3(0, -1, 0)),
+            BlockFace.PosY => (new Vector3(a, maxY, b), new Vector3(0, 1, 0)),
+            BlockFace.NegZ => (new Vector3(a, b, 0), new Vector3(0, 0, -1)),
+            _ => (new Vector3(a, b, maxZ), new Vector3(0, 0, 1)),
+        };
     }
 }

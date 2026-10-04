@@ -28,15 +28,26 @@ namespace SandboxPolyGame.Dev;
 /// равномерная автоподгонка не годится), настроить коллизию как набор боксов (<see cref="CollisionBox"/>,
 /// позиция+размер в метрах, см. <see cref="World.VehicleSpawner"/> — пусто означает, что у блока коллизии нет
 /// ВООБЩЕ, никакого автоматического бокса "на всякий случай": некоторые модели нарочно выпирают деталями за
-/// footprint, которым коллизия не нужна). "Save" пишет/перезаписывает <c>res://blocks/&lt;slug&gt;.xml</c>
-/// целиком; поля, которые этот инструмент не редактирует (<c>ports</c>), при загрузке существующего блока
-/// сохраняются как есть (сырой JSON-текст, см. <see cref="_preservedPortsJson"/>), а не теряются.
+/// footprint, которым коллизия не нужна), и назначить ресурсные порты (<see cref="ResourcePort"/> — вход/выход
+/// конкретного <see cref="ResourceType"/>, на конкретной стороне footprint'а и клетке этой стороны, см.
+/// <see cref="FunctionalBlockGeometry.ComputePortAnchor"/>; несколько портов МОГУТ сидеть в одном и том же месте —
+/// не ошибка, см. <see cref="ResourcePort"/> class doc). "Save" пишет/перезаписывает <c>res://blocks/&lt;slug&gt;.xml</c>
+/// целиком.
 /// </summary>
 public partial class BlockPrefabEditor : Node3D
 {
     private static readonly Color FootprintBoxColor = new(0.55f, 0.88f, 1.0f);
     private static readonly Color CollisionBoxColor = new(1.0f, 0.35f, 0.25f, 0.35f);
     private static readonly Color SkyColor = Color.FromHtml("#808080");
+
+    /// <summary>Цвет маркера порта по типу ресурса (см. <see cref="ResourceType"/>) — для визуального отличия ВИДА
+    /// ресурса в превью, не часть данных блока (та же роль, что и <see cref="CollisionBoxColor"/> для коллизии).</summary>
+    private static readonly Dictionary<ResourceType, Color> PortColors = new()
+    {
+        [ResourceType.Electricity] = new Color(1.0f, 0.85f, 0.2f),
+        [ResourceType.Fluid] = new Color(0.25f, 0.6f, 1.0f),
+        [ResourceType.Torque] = new Color(1.0f, 0.5f, 0.15f),
+    };
     private static readonly Color GridColor = new(1f, 1f, 1f, 0.22f);
     private static readonly Color AxisColorX = new(1f, 0.3f, 0.3f);
     private static readonly Color AxisColorY = new(0.35f, 1f, 0.35f);
@@ -49,13 +60,28 @@ public partial class BlockPrefabEditor : Node3D
     private MeshInstance3D _footprintWire = null!;
     private Node3D _collisionVisuals = null!;
     private StandardMaterial3D _collisionMaterial = null!;
+    private Node3D _portVisuals = null!;
 
     private Vector2 _mousePosition;
     private bool _looking;
 
-    // "ports" этим инструментом не редактируется - при загрузке существующего функционального блока сохраняем его
-    // JSON как есть (см. class doc) и просто переносим в сохранённый файл неизменным.
-    private string _preservedPortsJson = "[]";
+    /// <summary>
+    /// Undo/Redo (Ctrl+Z/Ctrl+Y, по запросу пользователя) — снэпшот ВСЕХ редактируемых полей разом (не только
+    /// списков), т.к. это простой инструмент с одним "документом" на экране, а не дерево независимых объектов
+    /// (как блоки в <c>Editor.BuildEditor</c>/<see cref="Core.UndoHistory"/>, с которым это НЕ связано и не
+    /// переиспользует его). <see cref="PushUndoPoint"/> снимает снэпшот ДО изменения — для Add/Remove порта/бокса
+    /// коллизии вызывается явно (см. <see cref="AddCollisionBox"/> и соседние), для правки любого текстового поля —
+    /// по <see cref="BlockPrefabEditorUi.EditSessionStarting"/> (фокус ВОШЁЛ в поле, см. его doc про то, почему не
+    /// по событию "значение изменилось" — к тому моменту старое значение уже потеряно).
+    /// </summary>
+    private readonly record struct Snapshot(
+        string Slug, string Name, Color Color, float Mass, float Durability, float DamageResistance,
+        string ScenePath, Vector3I Footprint, Vector3 ModelScale, string Behavior, float Capacity,
+        IReadOnlyList<CollisionBox> CollisionBoxes, IReadOnlyList<ResourcePort> Ports);
+
+    private const int MaxUndoDepth = 50; // разумный потолок, не бесконечно растущий список
+    private readonly List<Snapshot> _undoStack = new();
+    private readonly List<Snapshot> _redoStack = new();
 
     /// <summary>Для самотестов (см. <c>SelfTest.RunBlockPrefabEditorTests</c>) — сама панель полей/кнопок.</summary>
     public BlockPrefabEditorUi Ui => _ui;
@@ -103,6 +129,9 @@ public partial class BlockPrefabEditor : Node3D
         _collisionVisuals = new Node3D();
         AddChild(_collisionVisuals);
 
+        _portVisuals = new Node3D();
+        AddChild(_portVisuals);
+
         var uiLayer = new CanvasLayer();
         AddChild(uiLayer);
         var root = new Control();
@@ -119,6 +148,10 @@ public partial class BlockPrefabEditor : Node3D
         _ui.AddCollisionBoxRequested += AddCollisionBox;
         _ui.RemoveCollisionBoxRequested += RemoveCollisionBox;
         _ui.CollisionBoxesChanged += RefreshCollisionVisuals;
+        _ui.AddPortRequested += AddPort;
+        _ui.RemovePortRequested += RemovePort;
+        _ui.PortsChanged += RefreshPortVisuals;
+        _ui.EditSessionStarting += PushUndoPoint;
 
         string? startupSlug = ReadStartupSlug();
         if (startupSlug != null) LoadSlug(startupSlug);
@@ -250,6 +283,17 @@ public partial class BlockPrefabEditor : Node3D
                 when anyButton.ButtonIndex is MouseButton.Left or MouseButton.Middle or MouseButton.Right:
                 GetViewport().GuiReleaseFocus();
                 break;
+
+            // Undo/Redo - тот же принцип, что и у Ctrl+Z/Y в Editor.BuildEditor: не перехватывать, пока фокус на
+            // текстовом поле (иначе отменяли бы правку полей вместо родного текстового undo самого LineEdit внутри
+            // него - у Godot LineEdit есть свой Ctrl+Z на уровне редактирования текста, трогать его не нужно).
+            case InputEventKey { Pressed: true, Keycode: Key.Z, CtrlPressed: true } when GetViewport().GuiGetFocusOwner() is not LineEdit:
+                Undo();
+                break;
+
+            case InputEventKey { Pressed: true, Keycode: Key.Y, CtrlPressed: true } when GetViewport().GuiGetFocusOwner() is not LineEdit:
+                Redo();
+                break;
         }
 
         switch (e)
@@ -264,7 +308,10 @@ public partial class BlockPrefabEditor : Node3D
                 Input.MouseMode = Input.MouseModeEnum.Visible;
                 break;
 
-            case InputEventMouseButton { ButtonIndex: MouseButton.Middle, Pressed: true }:
+            // Та же причина, что и у зума колесом ниже (курсор над панелью -> не трогаем камеру) - раньше СКМ
+            // над панелью ВСЁ РАВНО запускала вращение камеры (эта ветка ничего не проверяла про курсор), хотя
+            // сама панель на СКМ никак не реагирует - баг, найденный пользователем вместе с WASD-в-поле выше.
+            case InputEventMouseButton { ButtonIndex: MouseButton.Middle, Pressed: true } when GetViewport().GuiGetHoveredControl() == null:
                 _looking = true;
                 Input.MouseMode = Input.MouseModeEnum.Captured;
                 break;
@@ -294,12 +341,77 @@ public partial class BlockPrefabEditor : Node3D
         }
     }
 
+    // ------------------------------------------------------------------ Undo/Redo (Ctrl+Z/Ctrl+Y, см. class doc)
+
+    private Snapshot CaptureSnapshot() => new(
+        _ui.Slug, _ui.Name, _ui.Color, _ui.Mass, _ui.Durability, _ui.DamageResistance, _ui.ScenePath,
+        _ui.Footprint, _ui.ModelScale, _ui.Behavior, _ui.Capacity, _ui.CollisionBoxes, _ui.Ports);
+
+    private void RestoreSnapshot(Snapshot s)
+    {
+        _ui.LoadFields(s.Slug, s.Name, s.Color, s.Mass, s.Durability, s.DamageResistance, s.ScenePath,
+            s.Footprint, s.ModelScale, s.Behavior, s.Capacity, s.CollisionBoxes, s.Ports);
+        RefreshPreview();
+    }
+
+    /// <summary>Снимает снэпшот ДО изменения — см. вызовы ниже (Add/Remove) и подписку на
+    /// <see cref="BlockPrefabEditorUi.EditSessionStarting"/> в <c>_Ready</c>. Любое новое действие после Undo
+    /// стирает "будущее" (Redo) — обычная семантика undo/redo, как и у <see cref="Core.UndoHistory"/>.</summary>
+    private void PushUndoPoint()
+    {
+        _undoStack.Add(CaptureSnapshot());
+        if (_undoStack.Count > MaxUndoDepth) _undoStack.RemoveAt(0);
+        _redoStack.Clear();
+    }
+
+    /// <summary>Начинать редактирование нового блока (Load/New) — это НЕ действие, которое логично "отменять"
+    /// отменой правок ДРУГОГО, уже закрытого блока (та же логика, что у большинства редакторов текста — переключение
+    /// документа не трогает чужую историю undo) — каждая загрузка начинает Undo/Redo с чистого листа.</summary>
+    private void ClearUndoHistory()
+    {
+        _undoStack.Clear();
+        _redoStack.Clear();
+    }
+
+    /// <summary>Публичный (не <c>private</c>) — как и <see cref="AddCollisionBox"/>/<see cref="AddPort"/> рядом,
+    /// чтобы напрямую вызывался из <c>SelfTest</c>, без симуляции реального нажатия Ctrl+Z.</summary>
+    public void Undo()
+    {
+        if (_undoStack.Count == 0)
+        {
+            _ui.SetStatus("nothing to undo");
+            return;
+        }
+
+        _redoStack.Add(CaptureSnapshot());
+        var snapshot = _undoStack[^1];
+        _undoStack.RemoveAt(_undoStack.Count - 1);
+        RestoreSnapshot(snapshot);
+        _ui.SetStatus("undone");
+    }
+
+    public void Redo()
+    {
+        if (_redoStack.Count == 0)
+        {
+            _ui.SetStatus("nothing to redo");
+            return;
+        }
+
+        _undoStack.Add(CaptureSnapshot());
+        var snapshot = _redoStack[^1];
+        _redoStack.RemoveAt(_redoStack.Count - 1);
+        RestoreSnapshot(snapshot);
+        _ui.SetStatus("redone");
+    }
+
     // ------------------------------------------------------------------ загрузка/сброс
 
     public void ResetToDefaults(string slug)
     {
-        _preservedPortsJson = "[]";
-        _ui.LoadFields(slug, "", Colors.White, 10f, 100f, 0.1f, "", Vector3I.One, Vector3.One, "", 0f, Array.Empty<CollisionBox>());
+        ClearUndoHistory();
+        _ui.LoadFields(slug, "", Colors.White, 10f, 100f, 0.1f, "", Vector3I.One, Vector3.One, "", 0f,
+            Array.Empty<CollisionBox>(), Array.Empty<ResourcePort>());
         _ui.SetStatus(string.IsNullOrEmpty(slug) ? "new block (not yet saved)" : $"new block '{slug}' (not yet saved)");
         RefreshPreview();
     }
@@ -332,7 +444,7 @@ public partial class BlockPrefabEditor : Node3D
             var footprint = Vector3I.One;
             var modelScale = Vector3.One;
             var collisionBoxes = new List<CollisionBox>();
-            _preservedPortsJson = "[]";
+            var ports = new List<ResourcePort>();
             bool hasFunctionalBlock = false;
 
             foreach (var componentNode in root.Elements("Component"))
@@ -367,7 +479,26 @@ public partial class BlockPrefabEditor : Node3D
                         modelScale = new Vector3(items[0].GetSingle(), items[1].GetSingle(), items[2].GetSingle());
                     }
 
-                    if (element.TryGetProperty("ports", out var ports)) _preservedPortsJson = ports.GetRawText();
+                    if (element.TryGetProperty("ports", out var portsJson) && portsJson.ValueKind == JsonValueKind.Array)
+                    {
+                        foreach (var portJson in portsJson.EnumerateArray())
+                        {
+                            string id = portJson.GetProperty("id").GetString() ?? "";
+                            var resource = Enum.Parse<ResourceType>(portJson.GetProperty("resource").GetString()!, ignoreCase: true);
+                            var direction = Enum.Parse<PortDirection>(portJson.GetProperty("direction").GetString()!, ignoreCase: true);
+                            var face = portJson.TryGetProperty("face", out var faceJson) && faceJson.ValueKind == JsonValueKind.String
+                                ? Enum.Parse<BlockFace>(faceJson.GetString()!, ignoreCase: true)
+                                : BlockFace.PosZ;
+                            var faceCell = Vector2I.Zero;
+                            if (portJson.TryGetProperty("position", out var posJson) && posJson.ValueKind == JsonValueKind.Array && posJson.GetArrayLength() == 2)
+                            {
+                                var items = posJson.EnumerateArray().ToArray();
+                                faceCell = new Vector2I(items[0].GetInt32(), items[1].GetInt32());
+                            }
+
+                            ports.Add(new ResourcePort { Id = id, Resource = resource, Direction = direction, Face = face, FaceCell = faceCell });
+                        }
+                    }
 
                     if (element.TryGetProperty("collision", out var collision) && collision.ValueKind == JsonValueKind.Array)
                     {
@@ -385,7 +516,8 @@ public partial class BlockPrefabEditor : Node3D
                 }
             }
 
-            _ui.LoadFields(slug, name, color, mass, durability, damage, scenePath, footprint, modelScale, behavior, capacity, collisionBoxes);
+            ClearUndoHistory();
+            _ui.LoadFields(slug, name, color, mass, durability, damage, scenePath, footprint, modelScale, behavior, capacity, collisionBoxes, ports);
             _ui.SetStatus(hasFunctionalBlock
                 ? $"loaded '{slug}'"
                 : $"loaded '{slug}' - no FunctionalBlock component yet, saving will add one");
@@ -437,6 +569,7 @@ public partial class BlockPrefabEditor : Node3D
         }
 
         RefreshCollisionVisuals();
+        RefreshPortVisuals();
     }
 
     private void RefreshCollisionVisuals()
@@ -459,6 +592,7 @@ public partial class BlockPrefabEditor : Node3D
 
     public void AddCollisionBox()
     {
+        PushUndoPoint();
         var footprint = _ui.Footprint;
         var defaultSize = new Vector3(footprint.X, footprint.Y, footprint.Z) * BuildSpace.CellSize;
         var boxes = new List<CollisionBox>(_ui.CollisionBoxes) { new() { Position = Vector3.Zero, Size = defaultSize } };
@@ -470,9 +604,79 @@ public partial class BlockPrefabEditor : Node3D
     {
         var boxes = new List<CollisionBox>(_ui.CollisionBoxes);
         if (index < 0 || index >= boxes.Count) return;
+        PushUndoPoint();
         boxes.RemoveAt(index);
         _ui.SetCollisionBoxRows(boxes);
         RefreshCollisionVisuals();
+    }
+
+    /// <summary>
+    /// Маленький цветной шар (цвет — по <see cref="ResourceType"/>, см. <see cref="PortColors"/>) чуть НАД
+    /// поверхностью footprint'а (сдвинут по нормали грани на небольшое фиксированное расстояние — иначе маркер
+    /// наполовину тонет в кубе/модели и его плохо видно) плюс подпись <c>Id (Direction)</c> рядом — тот же приём
+    /// центрирования превью на начале координат (<see cref="RefreshPreview"/> doc), что и у коллизии/footprint'а.
+    /// Позиция считается через <see cref="FunctionalBlockGeometry.ComputePortAnchor"/> — ту же геометрию, которой
+    /// позже будет пользоваться любой код соединений портов (ещё не реализован, см. <see cref="ResourcePort"/> class doc).
+    /// </summary>
+    private void RefreshPortVisuals()
+    {
+        foreach (var child in _portVisuals.GetChildren()) child.QueueFree();
+
+        var footprint = _ui.Footprint;
+        var previewOffset = -new Vector3(footprint.X, footprint.Y, footprint.Z) * BuildSpace.CellSize * 0.5f;
+        const float markerOffset = 0.03f;
+
+        foreach (var port in _ui.Ports)
+        {
+            var (localPosition, normal) = FunctionalBlockGeometry.ComputePortAnchor(port.Face, port.FaceCell, footprint, BuildSpace.CellSize);
+            var color = PortColors.GetValueOrDefault(port.Resource, Colors.White);
+
+            _portVisuals.AddChild(new MeshInstance3D
+            {
+                Mesh = new SphereMesh { Radius = 0.035f, Height = 0.07f },
+                MaterialOverride = new StandardMaterial3D
+                {
+                    ShadingMode = BaseMaterial3D.ShadingModeEnum.Unshaded,
+                    AlbedoColor = color,
+                    EmissionEnabled = true,
+                    Emission = color,
+                    EmissionEnergyMultiplier = 0.6f,
+                },
+                Position = localPosition + previewOffset + normal * markerOffset,
+            });
+
+            _portVisuals.AddChild(new Label3D
+            {
+                Text = $"{port.Id} ({port.Direction})",
+                FontSize = 28,
+                PixelSize = 0.0022f,
+                Billboard = BaseMaterial3D.BillboardModeEnum.Enabled,
+                NoDepthTest = true,
+                Modulate = color,
+                Position = localPosition + previewOffset + normal * (markerOffset + 0.05f),
+            });
+        }
+    }
+
+    public void AddPort()
+    {
+        PushUndoPoint();
+        var ports = new List<ResourcePort>(_ui.Ports)
+        {
+            new() { Id = $"port_{_ui.Ports.Count + 1}", Resource = ResourceType.Electricity, Direction = PortDirection.In, Face = BlockFace.PosZ, FaceCell = Vector2I.Zero },
+        };
+        _ui.SetPortRows(ports);
+        RefreshPortVisuals();
+    }
+
+    public void RemovePort(int index)
+    {
+        var ports = new List<ResourcePort>(_ui.Ports);
+        if (index < 0 || index >= ports.Count) return;
+        PushUndoPoint();
+        ports.RemoveAt(index);
+        _ui.SetPortRows(ports);
+        RefreshPortVisuals();
     }
 
     /// <summary>Каркас-коробка (12 рёбер) от (0,0,0) до <paramref name="extent"/> — тот же визуальный язык, что и
@@ -574,7 +778,12 @@ public partial class BlockPrefabEditor : Node3D
             functionalFields.Add($"\"collision\": [\n      {boxesJson}\n    ]");
         }
 
-        functionalFields.Add($"\"ports\": {_preservedPortsJson}");
+        var ports = _ui.Ports;
+        string portsJson = ports.Count == 0
+            ? "[]"
+            : "[\n      " + string.Join(",\n      ", ports.Select(p =>
+                $"{{ \"id\": \"{p.Id}\", \"resource\": \"{p.Resource}\", \"direction\": \"{p.Direction}\", \"face\": \"{p.Face}\", \"position\": [{p.FaceCell.X}, {p.FaceCell.Y}] }}")) + "\n    ]";
+        functionalFields.Add($"\"ports\": {portsJson}");
 
         var xml = new StringBuilder();
         xml.AppendLine("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");

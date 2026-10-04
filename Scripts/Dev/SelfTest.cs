@@ -900,6 +900,81 @@ public sealed class SelfTest
         Check(stretchedMinCorner.IsEqualApprox(expectedStretchedMinCorner),
             "ComputeFitTransform: extraScale stretches a single axis on top of the uniform fit, independently of the others",
             $"got={stretchedMinCorner} expected={expectedStretchedMinCorner}");
+
+        RunResourcePortGeometryTests();
+        RunHotModelLoadTest();
+    }
+
+    /// <summary>
+    /// <see cref="FunctionalBlockGeometry.GetOrLoadScene"/> должен загрузить модель даже БЕЗ готового кэша импорта
+    /// (<c>res://.godot/imported/*.scn</c>) — именно это и даёт "горячую" загрузку сразу по выбору файла в
+    /// <c>Dev.BlockPrefabEditorUi.BrowseForModel</c> (по запросу пользователя), без ожидания `--import`/перезапуска.
+    /// Копируем РЕАЛЬНЫЙ `.glb` под заведомо НОВЫМ именем (ни разу не виденным движком, значит у него точно нет
+    /// `.import`-кэша) и проверяем, что <c>GD.Load</c> внутри промахнётся, а запасной путь через
+    /// <see cref="GltfDocument"/> (см. <see cref="FunctionalBlockGeometry"/> doc) всё равно вернёт настоящую модель
+    /// с ПРАВДОПОДОБНЫМ bounding box'ом (не единичный куб-заглушка на пустую/битую сцену).
+    /// </summary>
+    private void RunHotModelLoadTest()
+    {
+        GD.Print("-- hot model loading: GetOrLoadScene reads a never-imported .glb directly via GltfDocument");
+
+        const string tempPath = "res://meshes/selftest_hotload_tmp.glb";
+        if (FileAccess.FileExists(tempPath)) DirAccess.RemoveAbsolute(tempPath);
+        var copyErr = DirAccess.CopyAbsolute("res://meshes/motor_small.glb", tempPath);
+        Check(copyErr == Error.Ok, "setup: copied motor_small.glb under a brand-new filename (no .import cache possible for it yet)", $"{copyErr}");
+
+        var (scene, aabb) = FunctionalBlockGeometry.GetOrLoadScene(tempPath);
+        Check(scene != null, "a never-imported .glb still loads (GltfDocument fallback, not just GD.Load)");
+        Check(aabb.Size.Length() > 0.5f, "...with a real bounding box from its actual geometry, not the empty-scene unit-cube fallback", $"{aabb.Size}");
+
+        if (FileAccess.FileExists(tempPath)) DirAccess.RemoveAbsolute(tempPath);
+    }
+
+    /// <summary>
+    /// <see cref="FunctionalBlockGeometry.ComputePortAnchor"/>/<see cref="FunctionalBlockGeometry.FaceDimensions"/> —
+    /// чистая математика размещения порта на стороне footprint'а, см. <see cref="ResourcePort"/> class doc: footprint
+    /// НЕ ограничен 1x1x1 (проверяем явно на 2x3x1), порт может сидеть на любой из 6 сторон в любой клетке этой
+    /// стороны, и несколько портов МОГУТ делить одну и ту же (Face, FaceCell) без ошибок/дедупликации.
+    /// </summary>
+    private void RunResourcePortGeometryTests()
+    {
+        GD.Print("-- resource port placement: ComputePortAnchor/FaceDimensions for non-cubic footprints");
+
+        var footprint = new Vector3I(2, 3, 1); // не кубический - X и Y разного размера, Z = 1 (плоский)
+        const float cell = BuildSpace.CellSize;
+
+        // FaceDimensions: ±X используют (Y,Z) footprint'а, ±Y используют (X,Z), ±Z используют (X,Y).
+        Check(FunctionalBlockGeometry.FaceDimensions(BlockFace.PosX, footprint) == (3, 1), "FaceDimensions: ±X face uses (footprint.Y, footprint.Z)");
+        Check(FunctionalBlockGeometry.FaceDimensions(BlockFace.PosY, footprint) == (2, 1), "FaceDimensions: ±Y face uses (footprint.X, footprint.Z)");
+        Check(FunctionalBlockGeometry.FaceDimensions(BlockFace.PosZ, footprint) == (2, 3), "FaceDimensions: ±Z face uses (footprint.X, footprint.Y)");
+
+        // ComputePortAnchor: клетка (0,0) на PosZ (передняя грань, X/Y-сетка) - центр первой клетки, на самой
+        // плоскости z=footprint.Z (в метрах), нормаль наружу (0,0,1).
+        var (posZOrigin, posZNormal) = FunctionalBlockGeometry.ComputePortAnchor(BlockFace.PosZ, Vector2I.Zero, footprint, cell);
+        Check(posZOrigin.IsEqualApprox(new Vector3(cell * 0.5f, cell * 0.5f, cell * footprint.Z)) && posZNormal.IsEqualApprox(new Vector3(0, 0, 1)),
+            "ComputePortAnchor: PosZ face, cell (0,0) sits at the center of the first X/Y cell, on the z=footprint.Z plane, normal (0,0,1)",
+            $"pos={posZOrigin} normal={posZNormal}");
+
+        // Последняя клетка на NegX (боковая грань, Y/Z-сетка размером 3x1) - cell (2,0), на плоскости x=0.
+        var (negXOrigin, negXNormal) = FunctionalBlockGeometry.ComputePortAnchor(BlockFace.NegX, new Vector2I(2, 0), footprint, cell);
+        Check(negXOrigin.IsEqualApprox(new Vector3(0, cell * 2.5f, cell * 0.5f)) && negXNormal.IsEqualApprox(new Vector3(-1, 0, 0)),
+            "ComputePortAnchor: NegX face, last Y cell (index 2 of 3) sits on the x=0 plane, normal (-1,0,0)",
+            $"pos={negXOrigin} normal={negXNormal}");
+
+        // Клетка за пределами реальной сетки грани (PosY грань тут только 2x1, индекс 5 не существует) клампится в
+        // границы, а не кидает исключение/вылетает за пределы footprint'а - позиция, а не сами данные, см. doc.
+        var (clampedOrigin, _) = FunctionalBlockGeometry.ComputePortAnchor(BlockFace.PosY, new Vector2I(5, 0), footprint, cell);
+        var (lastValidOrigin, _) = FunctionalBlockGeometry.ComputePortAnchor(BlockFace.PosY, new Vector2I(1, 0), footprint, cell);
+        Check(clampedOrigin.IsEqualApprox(lastValidOrigin),
+            "ComputePortAnchor: an out-of-range face cell clamps to the face's actual last cell instead of extrapolating past it",
+            $"clamped={clampedOrigin} lastValid={lastValidOrigin}");
+
+        // Несколько портов делят одну и ту же (Face, FaceCell) - не ошибка, просто одна и та же точка дважды.
+        var portA = new ResourcePort { Id = "a", Resource = ResourceType.Electricity, Direction = PortDirection.In, Face = BlockFace.PosZ, FaceCell = new Vector2I(1, 1) };
+        var portB = new ResourcePort { Id = "b", Resource = ResourceType.Fluid, Direction = PortDirection.Out, Face = BlockFace.PosZ, FaceCell = new Vector2I(1, 1) };
+        var (anchorA, _) = FunctionalBlockGeometry.ComputePortAnchor(portA.Face, portA.FaceCell, footprint, cell);
+        var (anchorB, _) = FunctionalBlockGeometry.ComputePortAnchor(portB.Face, portB.FaceCell, footprint, cell);
+        Check(anchorA.IsEqualApprox(anchorB), "two ports sharing the same (Face, FaceCell) resolve to the exact same point - allowed, not an error");
     }
 
     // ================================================================== точечная покраска наклонных/треугольных граней
@@ -2441,6 +2516,33 @@ public sealed class SelfTest
         Check(tool.Ui.ScenePath == "res://meshes/motor_small.glb", "...and its scene path", tool.Ui.ScenePath);
         Check(tool.Ui.Behavior == "ElectricMotor", "...and its behavior string", tool.Ui.Behavior);
 
+        // Сколько именно портов и их типы/направления у electric_motor - это РЕАЛЬНЫЕ данные каталога, не меняются
+        // этим фиксом; НО конкретные face/position могут быть отредактированы пользователем через сам --blockeditor
+        // в любой момент (та же ловушка, что уже была с коллизией electric_motor - см. RunVehicleSpawnerCollisionTests
+        // doc), поэтому НЕ зашиваем предположение "без face/position" про этот живой файл каталога.
+        Check(tool.Ui.Ports.Count == 2, "...and its 2 ports (power_in In Electricity, shaft_out Out Torque)", $"{tool.Ui.Ports.Count}");
+
+        // Обратная совместимость со старым форматом (без "face"/"position") проверяется на ОДНОРАЗОВОМ файле,
+        // который сам тест пишет и чистит - не на редактируемом пользователем blocks/electric_motor.xml.
+        const string legacySlug = "selftest_blockprefab_legacy_ports";
+        string legacyPath = $"res://blocks/{legacySlug}.xml";
+        using (var legacyFile = FileAccess.Open(legacyPath, FileAccess.ModeFlags.Write))
+        {
+            legacyFile.StoreString(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" +
+                $"<Block id=\"{legacySlug}\" name=\"Legacy\">\n" +
+                "  <Color>#ffffff</Color>\n" +
+                "  <Component type=\"FunctionalBlock\">{ \"footprint\": [1,1,1], \"ports\": [ " +
+                "{ \"id\": \"p\", \"resource\": \"Electricity\", \"direction\": \"In\" } ] }</Component>\n" +
+                "</Block>\n");
+        }
+
+        tool.LoadSlug(legacySlug);
+        Check(tool.Ui.Ports.Count == 1 && tool.Ui.Ports[0].Face == BlockFace.PosZ && tool.Ui.Ports[0].FaceCell == Vector2I.Zero,
+            "a port without 'face'/'position' in the XML (old hand-written format) defaults to (PosZ, (0,0))",
+            tool.Ui.Ports.Count > 0 ? $"{tool.Ui.Ports[0].Face}/{tool.Ui.Ports[0].FaceCell}" : "no ports");
+        if (FileAccess.FileExists(legacyPath)) DirAccess.RemoveAbsolute(legacyPath);
+
         // Новый блок + бокс коллизии + сохранение + перечитывание с диска - полный цикл записи/чтения XML (главный
         // риск этого инструмента, см. class doc) на ОДНОРАЗОВОМ тестовом слаге, не трогающем настоящий каталог.
         const string testSlug = "selftest_blockprefab_tmp";
@@ -2451,6 +2553,17 @@ public sealed class SelfTest
         tool.AddCollisionBox();
         Check(tool.Ui.CollisionBoxes.Count == 1, "AddCollisionBox adds exactly one row", $"{tool.Ui.CollisionBoxes.Count}");
         tool.Ui.SetModelScaleForTesting(new Vector3(2f, 1f, 1.5f)); // "Model stretch" - должен тоже пережить save+reload
+
+        // Два порта на РАЗНЫХ сторонах + два порта, делящие ОДНУ И ТУ ЖЕ (Face, FaceCell) - проверяем именно то, что
+        // запросил пользователь: несколько ресурсов/портов, несколько портов в одном месте, порт не только на одной
+        // стороне. AddPort() добавляет ряд с заглушками по умолчанию; SetPortForTesting заполняет его целевыми значениями.
+        tool.AddPort();
+        tool.AddPort();
+        tool.AddPort();
+        Check(tool.Ui.Ports.Count == 3, "AddPort adds exactly one row each call", $"{tool.Ui.Ports.Count}");
+        tool.Ui.SetPortForTesting(0, "power_in", ResourceType.Electricity, PortDirection.In, BlockFace.NegX, new Vector2I(0, 0));
+        tool.Ui.SetPortForTesting(1, "shaft_out", ResourceType.Torque, PortDirection.Out, BlockFace.PosZ, new Vector2I(1, 2));
+        tool.Ui.SetPortForTesting(2, "shaft_out_2", ResourceType.Torque, PortDirection.Out, BlockFace.PosZ, new Vector2I(1, 2)); // той же (Face, FaceCell), что и предыдущий - намеренно
 
         tool.Save();
         Check(FileAccess.FileExists(path), "Save() writes blocks/<slug>.xml", path);
@@ -2464,6 +2577,45 @@ public sealed class SelfTest
             tool.Ui.CollisionBoxes.Count > 0 ? $"{tool.Ui.CollisionBoxes[0].Size}" : "no boxes");
         Check(tool.Ui.ModelScale.IsEqualApprox(new Vector3(2f, 1f, 1.5f)),
             "round-trip: the manual 'Model stretch' survives save+reload", $"{tool.Ui.ModelScale}");
+
+        Check(tool.Ui.Ports.Count == 3, "round-trip: all 3 ports survive save+reload", $"{tool.Ui.Ports.Count}");
+        var reloadedPowerIn = tool.Ui.Ports.FirstOrDefault(p => p.Id == "power_in");
+        Check(reloadedPowerIn != null && reloadedPowerIn.Resource == ResourceType.Electricity && reloadedPowerIn.Direction == PortDirection.In
+            && reloadedPowerIn.Face == BlockFace.NegX && reloadedPowerIn.FaceCell == Vector2I.Zero,
+            "round-trip: a port's resource/direction/face/cell all survive exactly", reloadedPowerIn == null ? "not found" : $"{reloadedPowerIn.Resource}/{reloadedPowerIn.Direction}/{reloadedPowerIn.Face}/{reloadedPowerIn.FaceCell}");
+
+        var sharedLocationPorts = tool.Ui.Ports.Where(p => p.Face == BlockFace.PosZ && p.FaceCell == new Vector2I(1, 2)).ToList();
+        Check(sharedLocationPorts.Count == 2 && sharedLocationPorts.Select(p => p.Id).ToHashSet().SetEquals(new[] { "shaft_out", "shaft_out_2" }),
+            "round-trip: two ports sharing the same (Face, FaceCell) both survive - no dedup/overwrite",
+            $"{sharedLocationPorts.Count} ports at that spot: {string.Join(",", sharedLocationPorts.Select(p => p.Id))}");
+
+        // --- Undo/Redo (Ctrl+Z/Ctrl+Y), по запросу пользователя - снимок ДО действия, восстанавливается целиком.
+        int portsBeforeAdd = tool.Ui.Ports.Count; // 3, с перезагрузки выше
+        tool.AddPort();
+        Check(tool.Ui.Ports.Count == portsBeforeAdd + 1, "setup: AddPort adds a 4th port", $"{tool.Ui.Ports.Count}");
+        tool.Undo();
+        Check(tool.Ui.Ports.Count == portsBeforeAdd && tool.Ui.Ports.Any(p => p.Id == "power_in"),
+            "Ctrl+Z undoes AddPort - back to exactly the 3 ports from before, not just the same COUNT by accident",
+            $"{tool.Ui.Ports.Count}: {string.Join(",", tool.Ui.Ports.Select(p => p.Id))}");
+        tool.Redo();
+        Check(tool.Ui.Ports.Count == portsBeforeAdd + 1, "Ctrl+Y redoes it", $"{tool.Ui.Ports.Count}");
+
+        int boxesBeforeAdd = tool.Ui.CollisionBoxes.Count; // 1, из AddCollisionBox выше
+        tool.AddCollisionBox();
+        tool.Undo();
+        Check(tool.Ui.CollisionBoxes.Count == boxesBeforeAdd, "Ctrl+Z also undoes AddCollisionBox (same Undo stack, not a separate one per list)", $"{tool.Ui.CollisionBoxes.Count}");
+
+        Check(tool.Ui.ModelScale.IsEqualApprox(new Vector3(2f, 1f, 1.5f)),
+            "...and fields untouched by either action (Model stretch from earlier) survive the round trip through the snapshot unchanged", $"{tool.Ui.ModelScale}");
+
+        // Загрузка ДРУГОГО блока (Load/New) начинает Undo/Redo с чистого листа - нельзя "отменой" дотянуться до
+        // правок уже закрытого документа.
+        tool.LoadSlug("electric_motor");
+        var footprintAfterLoad = tool.Ui.Footprint;
+        tool.Undo(); // стек пуст после ClearUndoHistory в LoadSlug - должен быть no-op, не откатывать к testSlug
+        Check(tool.Ui.Footprint == footprintAfterLoad && tool.Ui.ScenePath == "res://meshes/motor_small.glb",
+            "loading a different block (LoadSlug) clears Undo/Redo history - Ctrl+Z here is a no-op, not a jump back into the previous block's edits",
+            $"{tool.Ui.Footprint} {tool.Ui.ScenePath}");
 
         if (FileAccess.FileExists(path)) DirAccess.RemoveAbsolute(path); // не мусорим в blocks/ настоящим файлом
         tool.QueueFree();
