@@ -11,8 +11,11 @@
       { "position": [0, 0, 0], "size": [0.25, 0.25, 0.25] }
     ],
     "ports": [
-      { "id": "power_in", "resource": "Electricity", "direction": "In", "face": "NegY", "position": [0, 0] },
       { "id": "shaft_out", "resource": "Torque", "direction": "Out", "face": "PosY", "position": [0, 0] }
+    ],
+    "nodes": [
+      { "id": "power_in", "type": "Electricity", "direction": "In", "position": [0, 0, 0] },
+      { "id": "signal_in", "type": "Number", "direction": "In", "position": [0, 0, 0] }
     ]
   }</Component>
 </Block>

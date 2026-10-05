@@ -87,7 +87,7 @@ internal static class BlockIconView
             if (scene != null)
             {
                 var instance = scene.Instantiate<Node3D>();
-                instance.Transform = FunctionalBlockGeometry.ComputeFitTransform(aabb, Vector3.One, Vector3.Zero, Vector3I.Zero, functional.ModelScale);
+                instance.Transform = FunctionalBlockGeometry.ComputeFitTransform(aabb, Vector3.One, Vector3.Zero, Vector3I.Zero, functional.ModelScale, functional.ModelOffset);
                 return instance;
             }
         }

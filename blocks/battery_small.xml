@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Block id="battery_small" name="Small battery">
+  <Color>#ffffff</Color>
+  <Component type="BaseComponent">{ "mass": 10, "durability": 100, "damageResistance": 0.10000000149011612 }</Component>
+  <Component type="FunctionalBlock">{
+    "footprint": [2, 1, 1],
+    "scene": "res://meshes/battary_small.glb",
+    "collision": [
+      { "position": [0, 0, 0], "size": [0.5, 0.25, 0.25] }
+    ],
+    "ports": [],
+    "nodes": [
+      { "id": "charge_in", "type": "Electricity", "direction": "In", "position": [0, 0, 0] },
+      { "id": "charge_out", "type": "Electricity", "direction": "Out", "position": [1, 0, 0] },
+      { "id": "charge_level", "type": "Number", "direction": "Out", "position": [0, 0, 0] }
+    ]
+  }</Component>
+</Block>

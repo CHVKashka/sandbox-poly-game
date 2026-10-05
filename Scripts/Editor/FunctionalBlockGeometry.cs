@@ -136,14 +136,16 @@ public static class FunctionalBlockGeometry
     /// модель меньше целевого размера, просто не касаются границ (центрировано, не растянуто).
     /// <paramref name="extraScale"/> — ручная поправка ПОВЕРХ этого равномерного масштаба, покомпонентно
     /// (см. <see cref="Blocks.FunctionalBlockComponent.ModelScale"/>) — <see cref="Vector3.One"/> ничего не меняет.
+    /// <paramref name="modelOffset"/> — ручной сдвиг модели внутри клетки в МЕТРАХ, в осях НЕповёрнутого блока (см.
+    /// <see cref="Blocks.FunctionalBlockComponent.ModelOffset"/>), поворачивается вместе с блоком; по умолчанию ноль.
     /// </summary>
-    public static Transform3D ComputeFitTransform(Aabb modelAabb, Vector3 targetExtent, Vector3 targetCenter, Vector3I rotationSteps, Vector3 extraScale) =>
-        ComputeFitTransform(modelAabb, targetExtent, targetCenter, ShapeMeshBuilder.ComposeRotation(rotationSteps), extraScale);
+    public static Transform3D ComputeFitTransform(Aabb modelAabb, Vector3 targetExtent, Vector3 targetCenter, Vector3I rotationSteps, Vector3 extraScale, Vector3 modelOffset = default) =>
+        ComputeFitTransform(modelAabb, targetExtent, targetCenter, ShapeMeshBuilder.ComposeRotation(rotationSteps), extraScale, modelOffset);
 
     /// <summary>То же самое, но поворот — уже готовый произвольный <see cref="Basis"/>, не только 0..3 ступени —
     /// используется анимацией поворота призрака (см. <c>Editor.BuildEditor</c>, плавный довод через
     /// <see cref="Basis.Slerp"/>), настоящие поставленные блоки всегда используют целую перегрузку выше.</summary>
-    public static Transform3D ComputeFitTransform(Aabb modelAabb, Vector3 targetExtent, Vector3 targetCenter, Basis rotation, Vector3 extraScale)
+    public static Transform3D ComputeFitTransform(Aabb modelAabb, Vector3 targetExtent, Vector3 targetCenter, Basis rotation, Vector3 extraScale, Vector3 modelOffset = default)
     {
         var size = modelAabb.Size;
         // var, не float - сборка движка double-precision (real_t = double), Mathf.Min(double, double) возвращает double.
@@ -152,8 +154,40 @@ public static class FunctionalBlockGeometry
         var basis = rotation * Basis.Identity.Scaled(new Vector3(scale, scale, scale) * extraScale);
 
         var modelCenter = modelAabb.Position + size * 0.5f;
-        var origin = targetCenter - basis * modelCenter;
+        // Сдвиг задан в осях неповёрнутого блока и не зависит от масштаба модели - поворачивается как сам блок.
+        var origin = targetCenter + rotation * modelOffset - basis * modelCenter;
         return new Transform3D(basis, origin);
+    }
+
+    /// <summary>
+    /// «Рамка» блока с фиксированным footprint'ом, который крутится вокруг КОРНЕВОЙ клетки (см. <see cref="BlockFootprint"/>):
+    /// переводит локальные координаты неповёрнутого блока (метры от минимального угла footprint'а = угла корневой клетки) в мир.
+    /// Корневая клетка (<paramref name="rootCell"/>) стоит на месте, остальное поворачивается вокруг её ЦЕНТРА. Принимает
+    /// произвольный <see cref="Basis"/>, а не только кратный 90° — по ней призрак установки плавно доворачивается на J/K/L
+    /// (см. <c>Editor.BuildEditor</c>), жёстко вращаясь вокруг корня; всё локальное (модель, коллизия, ноды, порты) задаётся
+    /// в неповёрнутом блоке и просто умножается на эту рамку.
+    /// </summary>
+    public static Transform3D RootFrame(Vector3I rootCell, Basis rotation)
+    {
+        var pivot = new Vector3(0.5f, 0.5f, 0.5f) * BuildSpace.CellSize; // центр корневой клетки в локальных метрах
+        return new Transform3D(rotation, BuildSpace.CellCenter(rootCell) - rotation * pivot);
+    }
+
+    /// <summary>
+    /// Та же рамка для УЖЕ поставленного экземпляра: считается от занятого бокса (<paramref name="origin"/>/<paramref name="size"/> —
+    /// <see cref="Core.BlockInstance.Origin"/>/<see cref="Core.BlockInstance.Size"/>, для повёрнутого блока это повёрнутый бокс),
+    /// <paramref name="footprint"/> — неповёрнутый footprint из определения блока. Поворот на 90° переводит бокс в бокс, поэтому
+    /// центр занятого бокса — это и есть центр повёрнутого footprint'а: рамка совпадает с <see cref="RootFrame"/> того блока, что
+    /// ставился через <see cref="BlockFootprint.PlaceBox"/> (проверяется самотестом). Считается по центру бокса, а не по корню,
+    /// намеренно: так же отображается и экземпляр из старого сохранения, где <c>Size</c> ещё не повёрнут (он остаётся там же, где
+    /// был, не прыгает).
+    /// </summary>
+    public static Transform3D InstanceFrame(Vector3I origin, Vector3I size, Vector3I footprint, Vector3I rotationSteps)
+    {
+        var rotation = ShapeMeshBuilder.ComposeRotation(rotationSteps);
+        var boxCenter = (BuildSpace.CellMin(origin) + BuildSpace.CellMin(origin + size)) * 0.5f;
+        var footprintCenter = new Vector3(footprint.X, footprint.Y, footprint.Z) * BuildSpace.CellSize * 0.5f;
+        return new Transform3D(rotation, boxCenter - rotation * footprintCenter);
     }
 
     /// <summary>
@@ -169,6 +203,20 @@ public static class FunctionalBlockGeometry
         BlockFace.NegY or BlockFace.PosY => (footprint.X, footprint.Z),
         _ => (footprint.X, footprint.Y),
     };
+
+    /// <summary>
+    /// Точка логической ноды (<see cref="Blocks.LogicNode"/>): ЦЕНТР её клетки <paramref name="cell"/> в локальных координатах
+    /// НЕповёрнутого блока (метры, от минимального угла footprint'а — как <see cref="Blocks.CollisionBox.Position"/>). В отличие от
+    /// <see cref="ComputePortAnchor"/> нода сидит внутри блока, а не на грани. Клетка КЛАМПИТСЯ к footprint'у (сохранённые данные
+    /// не меняются) — как и у портов, на случай если footprint уменьшили после размещения ноды.
+    /// </summary>
+    public static Vector3 ComputeNodeAnchor(Vector3I cell, Vector3I footprint, float cellSize)
+    {
+        int cx = Math.Clamp(cell.X, 0, Math.Max(footprint.X - 1, 0));
+        int cy = Math.Clamp(cell.Y, 0, Math.Max(footprint.Y - 1, 0));
+        int cz = Math.Clamp(cell.Z, 0, Math.Max(footprint.Z - 1, 0));
+        return new Vector3(cx + 0.5f, cy + 0.5f, cz + 0.5f) * cellSize;
+    }
 
     /// <summary>
     /// Переводит (<see cref="ResourcePort.Face"/>, <see cref="ResourcePort.FaceCell"/>) в точку (локальные координаты

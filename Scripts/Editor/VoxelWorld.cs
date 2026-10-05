@@ -36,6 +36,9 @@ public partial class VoxelWorld : Node3D
     private ShapeInstanceView _shapes = null!;
     private FunctionalBlockView _functionalBlocks = null!;
 
+    /// <summary>Слой моделей функциональных блоков — мир (<see cref="World.VehicleSpawner"/>) подключает к нему рантайм для анимации.</summary>
+    public FunctionalBlockView FunctionalBlocks => _functionalBlocks;
+
     public VoxelGrid Grid { get; } = new();
 
     /// <summary>Слой размещённых блоков (позиция/размер/тип) поверх <see cref="Grid"/> — см. <see cref="Construction"/>.</summary>

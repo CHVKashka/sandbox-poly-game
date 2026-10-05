@@ -195,10 +195,14 @@ public sealed class Construction
         var building = definition.GetComponent<BuildingBlockComponent>();
         if (building == null) return false;
 
-        newSize = new Vector3I(
-            Math.Clamp(newSize.X, Math.Max(1, building.MinSize.X), Math.Max(1, building.MaxSize.X)),
-            Math.Clamp(newSize.Y, Math.Max(1, building.MinSize.Y), Math.Max(1, building.MaxSize.Y)),
-            Math.Clamp(newSize.Z, Math.Max(1, building.MinSize.Z), Math.Max(1, building.MaxSize.Z)));
+        // newSize - размер ЗАНЯТОГО бокса (оси мира); MinSize/MaxSize заданы в ЛОКАЛЬНЫХ осях блока, поэтому у повёрнутого блока
+        // зажимаем локальный размер и переводим обратно (без поворота - то же, что и раньше).
+        var local = BlockFootprint.UnrotatedSize(newSize, instance.RotationSteps);
+        local = new Vector3I(
+            Math.Clamp(local.X, Math.Max(1, building.MinSize.X), Math.Max(1, building.MaxSize.X)),
+            Math.Clamp(local.Y, Math.Max(1, building.MinSize.Y), Math.Max(1, building.MaxSize.Y)),
+            Math.Clamp(local.Z, Math.Max(1, building.MinSize.Z), Math.Max(1, building.MaxSize.Z)));
+        newSize = BlockFootprint.RotatedSize(local, instance.RotationSteps);
         if (newSize == instance.Size) return false;
 
         var oldCells = new HashSet<Vector3I>(CellsOf(instance));

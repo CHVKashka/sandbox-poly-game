@@ -44,9 +44,15 @@ public partial class BlockPrefabEditor : Node3D
     /// ресурса в превью, не часть данных блока (та же роль, что и <see cref="CollisionBoxColor"/> для коллизии).</summary>
     private static readonly Dictionary<ResourceType, Color> PortColors = new()
     {
-        [ResourceType.Electricity] = new Color(1.0f, 0.85f, 0.2f),
         [ResourceType.Fluid] = new Color(0.25f, 0.6f, 1.0f),
         [ResourceType.Torque] = new Color(1.0f, 0.5f, 0.15f),
+    };
+    /// <summary>Цвет маркера логической ноды по типу (<see cref="NodeType"/>) — только для превью, не часть данных блока.</summary>
+    private static readonly Dictionary<NodeType, Color> NodeColors = new()
+    {
+        [NodeType.Electricity] = new Color(1.0f, 0.85f, 0.2f),
+        [NodeType.Boolean] = new Color(0.45f, 1.0f, 0.5f),
+        [NodeType.Number] = new Color(0.8f, 0.55f, 1.0f),
     };
     private static readonly Color GridColor = new(1f, 1f, 1f, 0.22f);
     private static readonly Color AxisColorX = new(1f, 0.3f, 0.3f);
@@ -76,8 +82,8 @@ public partial class BlockPrefabEditor : Node3D
     /// </summary>
     private readonly record struct Snapshot(
         string Slug, string Name, Color Color, float Mass, float Durability, float DamageResistance,
-        string ScenePath, Vector3I Footprint, Vector3 ModelScale, string Behavior, float Capacity,
-        IReadOnlyList<CollisionBox> CollisionBoxes, IReadOnlyList<ResourcePort> Ports);
+        string ScenePath, Vector3I Footprint, Vector3 ModelScale, Vector3 ModelOffset, string Behavior, float Capacity,
+        IReadOnlyList<CollisionBox> CollisionBoxes, IReadOnlyList<ResourcePort> Ports, IReadOnlyList<LogicNode> Nodes, string ParamsJson);
 
     private const int MaxUndoDepth = 50; // разумный потолок, не бесконечно растущий список
     private readonly List<Snapshot> _undoStack = new();
@@ -151,6 +157,9 @@ public partial class BlockPrefabEditor : Node3D
         _ui.AddPortRequested += AddPort;
         _ui.RemovePortRequested += RemovePort;
         _ui.PortsChanged += RefreshPortVisuals;
+        _ui.AddNodeRequested += AddNode;
+        _ui.RemoveNodeRequested += RemoveNode;
+        _ui.NodesChanged += RefreshPortVisuals;
         _ui.EditSessionStarting += PushUndoPoint;
 
         string? startupSlug = ReadStartupSlug();
@@ -287,11 +296,11 @@ public partial class BlockPrefabEditor : Node3D
             // Undo/Redo - тот же принцип, что и у Ctrl+Z/Y в Editor.BuildEditor: не перехватывать, пока фокус на
             // текстовом поле (иначе отменяли бы правку полей вместо родного текстового undo самого LineEdit внутри
             // него - у Godot LineEdit есть свой Ctrl+Z на уровне редактирования текста, трогать его не нужно).
-            case InputEventKey { Pressed: true, Keycode: Key.Z, CtrlPressed: true } when GetViewport().GuiGetFocusOwner() is not LineEdit:
+            case InputEventKey { Pressed: true, Keycode: Key.Z, CtrlPressed: true } when GetViewport().GuiGetFocusOwner() is not LineEdit and not TextEdit:
                 Undo();
                 break;
 
-            case InputEventKey { Pressed: true, Keycode: Key.Y, CtrlPressed: true } when GetViewport().GuiGetFocusOwner() is not LineEdit:
+            case InputEventKey { Pressed: true, Keycode: Key.Y, CtrlPressed: true } when GetViewport().GuiGetFocusOwner() is not LineEdit and not TextEdit:
                 Redo();
                 break;
         }
@@ -345,12 +354,12 @@ public partial class BlockPrefabEditor : Node3D
 
     private Snapshot CaptureSnapshot() => new(
         _ui.Slug, _ui.Name, _ui.Color, _ui.Mass, _ui.Durability, _ui.DamageResistance, _ui.ScenePath,
-        _ui.Footprint, _ui.ModelScale, _ui.Behavior, _ui.Capacity, _ui.CollisionBoxes, _ui.Ports);
+        _ui.Footprint, _ui.ModelScale, _ui.ModelOffset, _ui.Behavior, _ui.Capacity, _ui.CollisionBoxes, _ui.Ports, _ui.Nodes, _ui.ParamsJson);
 
     private void RestoreSnapshot(Snapshot s)
     {
         _ui.LoadFields(s.Slug, s.Name, s.Color, s.Mass, s.Durability, s.DamageResistance, s.ScenePath,
-            s.Footprint, s.ModelScale, s.Behavior, s.Capacity, s.CollisionBoxes, s.Ports);
+            s.Footprint, s.ModelScale, s.ModelOffset, s.Behavior, s.Capacity, s.CollisionBoxes, s.Ports, s.Nodes, s.ParamsJson);
         RefreshPreview();
     }
 
@@ -410,8 +419,8 @@ public partial class BlockPrefabEditor : Node3D
     public void ResetToDefaults(string slug)
     {
         ClearUndoHistory();
-        _ui.LoadFields(slug, "", Colors.White, 10f, 100f, 0.1f, "", Vector3I.One, Vector3.One, "", 0f,
-            Array.Empty<CollisionBox>(), Array.Empty<ResourcePort>());
+        _ui.LoadFields(slug, "", Colors.White, 10f, 100f, 0.1f, "", Vector3I.One, Vector3.One, Vector3.Zero, "", 0f,
+            Array.Empty<CollisionBox>(), Array.Empty<ResourcePort>(), Array.Empty<LogicNode>(), "");
         _ui.SetStatus(string.IsNullOrEmpty(slug) ? "new block (not yet saved)" : $"new block '{slug}' (not yet saved)");
         RefreshPreview();
     }
@@ -443,8 +452,11 @@ public partial class BlockPrefabEditor : Node3D
             float capacity = 0f;
             var footprint = Vector3I.One;
             var modelScale = Vector3.One;
+            var modelOffset = Vector3.Zero;
             var collisionBoxes = new List<CollisionBox>();
             var ports = new List<ResourcePort>();
+            var nodes = new List<LogicNode>();
+            string paramsJson = "";
             bool hasFunctionalBlock = false;
 
             foreach (var componentNode in root.Elements("Component"))
@@ -479,12 +491,28 @@ public partial class BlockPrefabEditor : Node3D
                         modelScale = new Vector3(items[0].GetSingle(), items[1].GetSingle(), items[2].GetSingle());
                     }
 
+                    if (element.TryGetProperty("modelOffset", out var mo) && mo.ValueKind == JsonValueKind.Array && mo.GetArrayLength() == 3)
+                    {
+                        var items = mo.EnumerateArray().ToArray();
+                        modelOffset = new Vector3(items[0].GetSingle(), items[1].GetSingle(), items[2].GetSingle());
+                    }
+
+                    if (element.TryGetProperty("nodes", out var nodesElement) && nodesElement.ValueKind == JsonValueKind.Array)
+                    {
+                        nodes.AddRange(FunctionalBlockComponent.ParseNodes(nodesElement));
+                    }
+
+                    if (element.TryGetProperty("params", out var paramsElement) && paramsElement.ValueKind == JsonValueKind.Object)
+                    {
+                        paramsJson = JsonSerializer.Serialize(paramsElement);
+                    }
+
                     if (element.TryGetProperty("ports", out var portsJson) && portsJson.ValueKind == JsonValueKind.Array)
                     {
                         foreach (var portJson in portsJson.EnumerateArray())
                         {
                             string id = portJson.GetProperty("id").GetString() ?? "";
-                            var resource = Enum.Parse<ResourceType>(portJson.GetProperty("resource").GetString()!, ignoreCase: true);
+                            var resource = FunctionalBlockComponent.ParseResourceType(portJson.GetProperty("resource").GetString()!);
                             var direction = Enum.Parse<PortDirection>(portJson.GetProperty("direction").GetString()!, ignoreCase: true);
                             var face = portJson.TryGetProperty("face", out var faceJson) && faceJson.ValueKind == JsonValueKind.String
                                 ? Enum.Parse<BlockFace>(faceJson.GetString()!, ignoreCase: true)
@@ -517,7 +545,7 @@ public partial class BlockPrefabEditor : Node3D
             }
 
             ClearUndoHistory();
-            _ui.LoadFields(slug, name, color, mass, durability, damage, scenePath, footprint, modelScale, behavior, capacity, collisionBoxes, ports);
+            _ui.LoadFields(slug, name, color, mass, durability, damage, scenePath, footprint, modelScale, modelOffset, behavior, capacity, collisionBoxes, ports, nodes, paramsJson);
             _ui.SetStatus(hasFunctionalBlock
                 ? $"loaded '{slug}'"
                 : $"loaded '{slug}' - no FunctionalBlock component yet, saving will add one");
@@ -560,7 +588,7 @@ public partial class BlockPrefabEditor : Node3D
             {
                 _modelInstance = scene.Instantiate<Node3D>();
                 AddChild(_modelInstance);
-                _modelInstance.Transform = FunctionalBlockGeometry.ComputeFitTransform(aabb, extent, Vector3.Zero, Basis.Identity, _ui.ModelScale);
+                _modelInstance.Transform = FunctionalBlockGeometry.ComputeFitTransform(aabb, extent, Vector3.Zero, Basis.Identity, _ui.ModelScale, _ui.ModelOffset);
             }
             else
             {
@@ -626,6 +654,8 @@ public partial class BlockPrefabEditor : Node3D
         var previewOffset = -new Vector3(footprint.X, footprint.Y, footprint.Z) * BuildSpace.CellSize * 0.5f;
         const float markerOffset = 0.03f;
 
+        AddNodeMarkers(footprint, previewOffset);
+
         foreach (var port in _ui.Ports)
         {
             var (localPosition, normal) = FunctionalBlockGeometry.ComputePortAnchor(port.Face, port.FaceCell, footprint, BuildSpace.CellSize);
@@ -658,12 +688,121 @@ public partial class BlockPrefabEditor : Node3D
         }
     }
 
+    /// <summary>
+    /// Логические ноды (<see cref="LogicNode"/>) — маленький КУБИК в ЦЕНТРЕ своей клетки (ноды сидят внутри блока, а не на
+    /// грани, как цветные шарики физических портов) плюс подпись <c>Id (Direction, Type)</c>. Цвет — по <see cref="NodeType"/>
+    /// (<see cref="NodeColors"/>). Ноды РАЗНЫХ типов в одной клетке чуть разнесены по X, чтобы маркеры не слипались в один.
+    /// Конфликт «два одинаковых типа в одной клетке» показывается в статусе (сохранение при нём отказывает).
+    /// </summary>
+    private void AddNodeMarkers(Vector3I footprint, Vector3 previewOffset)
+    {
+        var nodes = _ui.Nodes;
+        string? conflict = FunctionalBlockComponent.FindNodeConflict(nodes);
+        if (conflict != null) _ui.SetStatus("nodes: " + conflict);
+
+        foreach (var node in nodes)
+        {
+            var anchor = FunctionalBlockGeometry.ComputeNodeAnchor(node.Cell, footprint, BuildSpace.CellSize);
+            var color = NodeColors.GetValueOrDefault(node.Type, Colors.White);
+            float spread = ((int)node.Type - 1) * 0.045f;
+            var position = anchor + previewOffset + new Vector3(spread, 0, 0);
+
+            _portVisuals.AddChild(new MeshInstance3D
+            {
+                Mesh = new BoxMesh { Size = new Vector3(0.04f, 0.04f, 0.04f) },
+                MaterialOverride = new StandardMaterial3D
+                {
+                    ShadingMode = BaseMaterial3D.ShadingModeEnum.Unshaded,
+                    AlbedoColor = color,
+                    EmissionEnabled = true,
+                    Emission = color,
+                    EmissionEnergyMultiplier = 0.6f,
+                    NoDepthTest = true, // нода внутри блока - иначе её закрывает сама модель/куб
+                },
+                Position = position,
+            });
+
+            _portVisuals.AddChild(new Label3D
+            {
+                Text = $"{node.Id} ({node.Direction}, {node.Type})",
+                FontSize = 28,
+                PixelSize = 0.0022f,
+                Billboard = BaseMaterial3D.BillboardModeEnum.Enabled,
+                NoDepthTest = true,
+                Modulate = color,
+                Position = position + new Vector3(0, 0.045f + 0.03f * (int)node.Type, 0),
+            });
+        }
+    }
+
+    /// <summary>Разбирает поле "Behavior params" (JSON-объект; пусто = нет параметров) — компактный JSON без пробелов
+    /// между токенами (как его пишет <see cref="BuildXml"/>); false и текст ошибки, если это не объект.</summary>
+    private bool TryParseParams(out string compactJson, out string error)
+    {
+        compactJson = "";
+        error = "";
+        string text = _ui.ParamsJson;
+        if (text.Length == 0) return true;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(text);
+            if (doc.RootElement.ValueKind != JsonValueKind.Object)
+            {
+                error = "must be a JSON object";
+                return false;
+            }
+
+            compactJson = JsonSerializer.Serialize(doc.RootElement);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+            return false;
+        }
+    }
+
+    /// <summary>Добавляет ноду с заглушками по умолчанию: тип Boolean в клетке (0,0,0) — а если там уже есть нода этого типа,
+    /// берёт первый ещё не занятый тип (чтобы новая нода не создавала конфликт сразу).</summary>
+    public void AddNode()
+    {
+        PushUndoPoint();
+        var existing = _ui.Nodes;
+        var type = NodeType.Boolean;
+        foreach (var candidate in new[] { NodeType.Boolean, NodeType.Number, NodeType.Electricity })
+        {
+            if (!existing.Any(n => n.Type == candidate && n.Cell == Vector3I.Zero))
+            {
+                type = candidate;
+                break;
+            }
+        }
+
+        var nodes = new List<LogicNode>(existing)
+        {
+            new() { Id = $"node_{existing.Count + 1}", Type = type, Direction = PortDirection.In, Cell = Vector3I.Zero },
+        };
+        _ui.SetNodeRows(nodes);
+        RefreshPortVisuals();
+    }
+
+    public void RemoveNode(int index)
+    {
+        var nodes = new List<LogicNode>(_ui.Nodes);
+        if (index < 0 || index >= nodes.Count) return;
+        PushUndoPoint();
+        nodes.RemoveAt(index);
+        _ui.SetNodeRows(nodes);
+        RefreshPortVisuals();
+    }
+
     public void AddPort()
     {
         PushUndoPoint();
         var ports = new List<ResourcePort>(_ui.Ports)
         {
-            new() { Id = $"port_{_ui.Ports.Count + 1}", Resource = ResourceType.Electricity, Direction = PortDirection.In, Face = BlockFace.PosZ, FaceCell = Vector2I.Zero },
+            new() { Id = $"port_{_ui.Ports.Count + 1}", Resource = ResourceType.Fluid, Direction = PortDirection.In, Face = BlockFace.PosZ, FaceCell = Vector2I.Zero },
         };
         _ui.SetPortRows(ports);
         RefreshPortVisuals();
@@ -724,6 +863,20 @@ public partial class BlockPrefabEditor : Node3D
             return;
         }
 
+        // Не пишем файл с битым JSON в params / конфликтом нод - иначе блок перестал бы грузиться - иначе блок перестал бы грузиться (каталог бросает на ошибке разбора).
+        string? nodeConflict = FunctionalBlockComponent.FindNodeConflict(_ui.Nodes);
+        if (nodeConflict != null)
+        {
+            _ui.SetStatus("not saved - " + nodeConflict);
+            return;
+        }
+
+        if (!TryParseParams(out _, out string paramsError))
+        {
+            _ui.SetStatus("not saved - behavior params: " + paramsError);
+            return;
+        }
+
         string path = $"res://blocks/{slug}.xml";
         string xml = BuildXml(slug);
 
@@ -770,6 +923,12 @@ public partial class BlockPrefabEditor : Node3D
             functionalFields.Add($"\"modelScale\": [{F(modelScale.X)}, {F(modelScale.Y)}, {F(modelScale.Z)}]");
         }
 
+        var modelOffset = _ui.ModelOffset;
+        if (!modelOffset.IsEqualApprox(Vector3.Zero))
+        {
+            functionalFields.Add($"\"modelOffset\": [{F(modelOffset.X)}, {F(modelOffset.Y)}, {F(modelOffset.Z)}]");
+        }
+
         var collisionBoxes = _ui.CollisionBoxes;
         if (collisionBoxes.Count > 0)
         {
@@ -778,12 +937,25 @@ public partial class BlockPrefabEditor : Node3D
             functionalFields.Add($"\"collision\": [\n      {boxesJson}\n    ]");
         }
 
+        if (TryParseParams(out string paramsCompact, out _) && paramsCompact.Length > 0)
+        {
+            functionalFields.Add($"\"params\": {paramsCompact}");
+        }
+
         var ports = _ui.Ports;
         string portsJson = ports.Count == 0
             ? "[]"
             : "[\n      " + string.Join(",\n      ", ports.Select(p =>
                 $"{{ \"id\": \"{p.Id}\", \"resource\": \"{p.Resource}\", \"direction\": \"{p.Direction}\", \"face\": \"{p.Face}\", \"position\": [{p.FaceCell.X}, {p.FaceCell.Y}] }}")) + "\n    ]";
         functionalFields.Add($"\"ports\": {portsJson}");
+
+        var nodes = _ui.Nodes;
+        if (nodes.Count > 0)
+        {
+            string nodesJson = "[\n      " + string.Join(",\n      ", nodes.Select(n =>
+                $"{{ \"id\": \"{n.Id}\", \"type\": \"{n.Type}\", \"direction\": \"{n.Direction}\", \"position\": [{n.Cell.X}, {n.Cell.Y}, {n.Cell.Z}] }}")) + "\n    ]";
+            functionalFields.Add($"\"nodes\": {nodesJson}");
+        }
 
         var xml = new StringBuilder();
         xml.AppendLine("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");

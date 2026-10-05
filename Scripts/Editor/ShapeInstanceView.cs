@@ -93,7 +93,7 @@ public partial class ShapeInstanceView : Node3D
             }
 
             var occludedMask = ShapeMeshBuilder.ComputeOcclusionMask(construction.Grid, instance.Origin, instance.MaxCell);
-            var (solid, wire, border) = ShapeMeshBuilder.Build(building.Shape, instance.Size, instance.RotationSteps, instance.Mirror, CellColor.Unpack(instance.Color), occludedMask, regionColors: instance.RegionColors);
+            var (solid, wire, border) = ShapeMeshBuilder.Build(building.Shape, BlockFootprint.UnrotatedSize(instance.Size, instance.RotationSteps), instance.RotationSteps, instance.Mirror, CellColor.Unpack(instance.Color), occludedMask, regionColors: instance.RegionColors);
             var origin = BuildSpace.CellMin(instance.Origin);
             view.Solid.Mesh = solid;
             view.Solid.Position = origin;

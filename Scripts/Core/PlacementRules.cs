@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using Godot;
 
 namespace SandboxPolyGame.Core;
@@ -21,15 +22,26 @@ public static class PlacementRules
     public static bool CanPlaceFootprint(VoxelGrid grid, Vector3I origin, Vector3I size)
     {
         var max = origin + size - Vector3I.One;
+        if (FindBlockedCells(grid, origin, size).Count > 0) return false;
+        return grid.BlockCount == 0 || TouchesExistingBlock(grid, origin, max);
+    }
+
+    /// <summary>Клетки области <paramref name="size"/> от <paramref name="origin"/>, куда ставить нельзя: уже заняты блоком или вне
+    /// области построек. Пусто - коллизии нет (но блок всё равно может не касаться постройки, это отдельное правило). Нужен
+    /// редактору, чтобы подсветить конфликт красным, вместо того чтобы просто спрятать призрак.</summary>
+    public static List<Vector3I> FindBlockedCells(VoxelGrid grid, Vector3I origin, Vector3I size)
+    {
+        var blocked = new List<Vector3I>();
+        var max = origin + size - Vector3I.One;
         for (int z = origin.Z; z <= max.Z; z++)
         for (int y = origin.Y; y <= max.Y; y++)
         for (int x = origin.X; x <= max.X; x++)
         {
             var cell = new Vector3I(x, y, z);
-            if (!BuildSpace.InBounds(cell) || grid.IsSolid(cell)) return false;
+            if (!BuildSpace.InBounds(cell) || grid.IsSolid(cell)) blocked.Add(cell);
         }
 
-        return grid.BlockCount == 0 || TouchesExistingBlock(grid, origin, max);
+        return blocked;
     }
 
     private static bool TouchesExistingBlock(VoxelGrid grid, Vector3I origin, Vector3I max)

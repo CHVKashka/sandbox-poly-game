@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using Godot;
 using SandboxPolyGame.Core;
 using SandboxPolyGame.Editor.Ui;
@@ -70,6 +71,8 @@ public partial class GameWorld : Node3D
 	private string _incomingJoinWorkbenchName = "";
 
 	private bool _debugCollisionView;
+	private bool _debugPowered;
+	private bool _debugButtonsPressed;
 
 	// Пока true, _Process/_Input не должны трогать остальные поля - при передаче управления дев-харнессу (см. ниже)
 	// ни террейн/верстаки/игрок, ни UI не строятся вообще, а смена сцены (см. GoToBuildEditor) завершается не раньше
@@ -163,6 +166,7 @@ public partial class GameWorld : Node3D
 			var vehicle = VehicleSpawner.Spawn(this, spawnJson,
 				sourceWorkbench.SpawnArea.GlobalPosition + new Vector3(0f, 0.1f, 0f), sourceWorkbench);
 			_vehicles.Add(vehicle);
+			ApplyDebugFlags(vehicle);
 		}
 	}
 
@@ -280,7 +284,7 @@ public partial class GameWorld : Node3D
 		_debugLabel.AddThemeColorOverride("font_color", new Color(1f, 0.8f, 0.2f));
 		_debugLabel.SetAnchorsPreset(Control.LayoutPreset.TopRight);
 		_debugLabel.Position = new Vector2(-260, 12);
-		_debugLabel.Size = new Vector2(248, 24);
+		_debugLabel.Size = new Vector2(248, 72);
 		_debugLabel.HorizontalAlignment = HorizontalAlignment.Right;
 		_uiRoot.AddChild(_debugLabel);
 
@@ -489,6 +493,7 @@ public partial class GameWorld : Node3D
 		var vehicle = VehicleSpawner.Spawn(this, json,
 			_activeWorkbench.SpawnArea.GlobalPosition + new Vector3(0f, 0.1f, 0f), _activeWorkbench);
 		_vehicles.Add(vehicle);
+		ApplyDebugFlags(vehicle);
 	}
 
 	public override void _Input(InputEvent e)
@@ -549,6 +554,20 @@ public partial class GameWorld : Node3D
 				foreach (var v in _vehicles) v.SetDebugCollisionView(_debugCollisionView);
 				GetViewport().SetInputAsHandled();
 				break;
+
+			// Дебаг: заглушка питания функциональных блоков (нод логики ещё нет) - запитать/обесточить все постройки.
+			case Key.F2:
+				_debugPowered = !_debugPowered;
+				foreach (var v in _vehicles) v.SetDebugPowered(_debugPowered);
+				GetViewport().SetInputAsHandled();
+				break;
+
+			// Дебаг: нажать/отпустить все кнопки всех построек (определения "в какую целится игрок" ещё нет).
+			case Key.F3:
+				_debugButtonsPressed = !_debugButtonsPressed;
+				foreach (var v in _vehicles) v.SetDebugButtonsPressed(_debugButtonsPressed);
+				GetViewport().SetInputAsHandled();
+				break;
 		}
 	}
 
@@ -557,7 +576,12 @@ public partial class GameWorld : Node3D
 		if (_handingOff || _player == null || !IsInstanceValid(_player)) return;
 
 		_player.MovementEnabled = !MovementBlockingModalOpen;
-		_debugLabel.Text = _debugCollisionView ? "Debug: collision view (F1)" : "";
+		_debugLabel.Text = string.Join("\n", new[]
+		{
+			_debugCollisionView ? "Debug: collision view (F1)" : "",
+			_debugPowered ? "Debug: blocks powered (F2)" : "",
+			_debugButtonsPressed ? "Debug: buttons pressed (F3)" : "",
+		}.Where(line => line.Length > 0));
 
 		if (AnyModalOpen)
 		{
@@ -585,6 +609,14 @@ public partial class GameWorld : Node3D
 		var query = PhysicsRayQueryParameters3D.Create(from, to);
 		var result = GetWorld3D().DirectSpaceState.IntersectRay(query);
 		return result.Count == 0 ? null : result["collider"].As<Node3D>();
+	}
+
+	/// <summary>Свежезаспавненная постройка подхватывает уже включённые дебаг-флаги (F2/F3).</summary>
+	private void ApplyDebugFlags(VehicleBody vehicle)
+	{
+		vehicle.SetDebugCollisionView(_debugCollisionView);
+		vehicle.SetDebugPowered(_debugPowered);
+		vehicle.SetDebugButtonsPressed(_debugButtonsPressed);
 	}
 
 	private void RecallVehicle(VehicleBody vehicle)

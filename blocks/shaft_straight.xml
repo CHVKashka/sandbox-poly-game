@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Block id="shaft_straight" name="Shaft straight">
+  <Color>#ffffff</Color>
+  <Component type="BaseComponent">{ "mass": 10, "durability": 100, "damageResistance": 0.10000000149011612 }</Component>
+  <Component type="FunctionalBlock">{
+    "footprint": [1, 1, 1],
+    "scene": "res://meshes/shaft_straight.glb",
+    "ports": [
+      { "id": "port_1", "resource": "Torque", "direction": "In", "face": "NegY", "position": [0, 0] },
+      { "id": "port_2", "resource": "Torque", "direction": "Out", "face": "NegY", "position": [0, 0] },
+      { "id": "port_3", "resource": "Torque", "direction": "In", "face": "PosY", "position": [0, 0] },
+      { "id": "port_4", "resource": "Torque", "direction": "Out", "face": "PosY", "position": [0, 0] }
+    ]
+  }</Component>
+</Block>

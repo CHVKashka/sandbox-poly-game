@@ -1,6 +1,7 @@
 using System.Collections.Generic;
 using Godot;
 using SandboxPolyGame.Editor;
+using SandboxPolyGame.Runtime;
 
 namespace SandboxPolyGame.World;
 
@@ -14,6 +15,27 @@ public partial class VehicleBody : RigidBody3D
     /// <summary>Верстак, с которого была заспавнена эта постройка — <c>R</c> по наведению возвращает игрока сюда
     /// и убирает саму постройку (см. <see cref="GameWorld"/>).</summary>
     public Workbench? SourceWorkbench { get; set; }
+
+    /// <summary>Рантайм функциональных блоков этой постройки (состояния кнопок и т.п., см. <see cref="FunctionalBlockRuntime"/>) —
+    /// создаётся <see cref="VehicleSpawner"/>, шагается здесь каждый физический тик. Состояния не сохраняются и не
+    /// реплицируются (см. Docs/05, «Рантайм функциональных блоков»).</summary>
+    public FunctionalBlockRuntime? Runtime { get; set; }
+
+    public override void _PhysicsProcess(double delta) => Runtime?.Tick(delta);
+
+    /// <summary>Дебаг-меню (F2): принудительно запитать все блоки этой постройки (заглушка питания, см.
+    /// <see cref="FunctionalBlockRuntime.DebugForcePowered"/>).</summary>
+    public void SetDebugPowered(bool powered)
+    {
+        if (Runtime != null) Runtime.DebugForcePowered = powered;
+    }
+
+    /// <summary>Дебаг-меню (F3): нажать (true) / отпустить (false) все кнопки постройки — пока единственный способ
+    /// нажать кнопку, определения "в какую целится игрок" ещё нет.</summary>
+    public void SetDebugButtonsPressed(bool pressed) =>
+        Runtime?.InteractAll<ButtonBehavior>(pressed ? BlockInteraction.Press : BlockInteraction.Release);
+
+    public override void _ExitTree() => Runtime?.Dispose();
 
     private VoxelWorld? _visual;
     private readonly List<MeshInstance3D> _collisionOverlays = new();
@@ -50,7 +72,7 @@ public partial class VehicleBody : RigidBody3D
             {
                 Name = $"{shape.Name}DebugOverlay",
                 Mesh = new BoxMesh { Size = box.Size },
-                Position = shape.Position,
+                Transform = shape.Transform, // с поворотом: коллизия функционального блока может быть повёрнута (см. VehicleSpawner)
                 MaterialOverride = new StandardMaterial3D
                 {
                     ShadingMode = BaseMaterial3D.ShadingModeEnum.Unshaded,

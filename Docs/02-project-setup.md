@@ -43,6 +43,8 @@ sandbox-poly-game/
 │  ├─ Blocks/                компоненты блоков (BaseComponent, BuildingBlock) и загрузчик blocks/*.xml (BlockCatalog)
 │  ├─ Core/                 логика без сцены: сетка клеток, чанки, меширование, каркас, рейкаст, постройка (Construction),
 │  │                         именованные сохранения (ConstructionStorage), передача данных между сценами (EditorHandoff)
+│  ├─ Runtime/              рантайм функциональных блоков: поведения (IBlockBehavior, Button), состояние на экземпляр
+│  │                         (FunctionalBlockRuntime), значения нод (NodeValue) — чистая логика без сцены, см. 05
 │  ├─ Editor/               узлы и UI редактора: BuildEditor, FlyCamera, VoxelWorld, EditorState, Ui/*
 │  ├─ World/                открытый мир вне редактора: GameWorld, Player, TerrainTile, Workbench, VehicleSpawner, Ui/*
 │  └─ Dev/                  инструменты разработчика: самотесты, скриншот-харнесс, демо-постройки

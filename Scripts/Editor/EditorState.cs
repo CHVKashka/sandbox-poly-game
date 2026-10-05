@@ -152,6 +152,15 @@ public sealed class EditorState
     public void RotatePendingY() => RotatePending(1);
     public void RotatePendingZ() => RotatePending(2);
 
+    /// <summary>Сбрасывает накопленный поворот призрака в «без поворота» (J/K/L с нуля). Призрак при этом плавно довернётся к нему,
+    /// как и при обычном повороте.</summary>
+    public void ResetPendingRotation()
+    {
+        PendingRotationBasis = Basis.Identity;
+        PendingRotationSteps = Vector3I.Zero;
+        Changed?.Invoke();
+    }
+
     /// <summary>
     /// Поворот ВСЕГДА вокруг глобальной (мировой, фиксированной) оси — новый поворот ПРЕДУМНОЖАЕТСЯ на уже
     /// накопленный (<c>new Basis(axis, angle) * PendingRotationBasis</c>), а не вокруг текущей, уже повёрнутой

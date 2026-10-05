@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Linq;
 using Godot;
 using SandboxPolyGame.Blocks;
 using SandboxPolyGame.Core;
@@ -64,10 +65,19 @@ public partial class BuildEditor : Node3D
     private UndoHistory.Snapshot? _undoStrokeBefore;
 
     // Кэш последней собранной формы призрака — чтобы не пересобирать меш каждый кадр без нужды.
+    // Меш призрака строится в ЛОКАЛЬНЫХ осях блока (без поворота) и пересобирается только при смене блока/размера/отражения;
+    // поворот и положение даёт рамка вокруг корневой клетки (FunctionalBlockGeometry.RootFrame) - см. UpdateGhostMesh.
     private string? _ghostSlug;
-    private Basis _ghostRotation = Basis.Identity;
     private Vector3I _ghostMirror;
     private Vector3I _ghostSize;
+
+    // Красная полупрозрачная подсветка клеток, где призрак конфликтует с уже стоящими блоками / выходит за область построек.
+    private MeshInstance3D _conflictOverlay = null!;
+    private List<Vector3I> _conflictCells = new();
+
+    // Пока от мыши не пришло ни одного события, её позицию приходится опрашивать у ОС (см. PollCursorPosition) - иначе после входа
+    // в редактор она "(0,0)" и попадает на тулбар, а курсор-призрак не показывается, пока мышью/колесом не шевельнут.
+    private bool _mouseSeen;
 
     // Плавная анимация поворота призрака на J/K/L (чисто визуальная — EditorState.PendingRotationSteps/
     // PendingRotationBasis меняются мгновенно, как и раньше, и уходят в реальную установку блока по ЛКМ напрямую,
@@ -90,6 +100,12 @@ public partial class BuildEditor : Node3D
     public EditorUi Ui => _ui;
     public RayHit Hover => _hover;
     public MeshInstance3D Ghost => _ghost;
+
+    /// <summary>Клетки, на которых сейчас подсвечен конфликт призрака (для самотестов).</summary>
+    public IReadOnlyList<Vector3I> PlacementConflictCells => _conflictCells;
+
+    /// <summary>Виден ли красный оверлей конфликта (для самотестов).</summary>
+    public bool ConflictOverlayVisible => _conflictOverlay is { Visible: true };
 
     /// <summary>Виден ли сейчас призрак функционального блока со своей моделью (см. <see cref="_ghostModel"/>) —
     /// для самотестов; в обычном одиночном/кубическом/формо-призраке (<see cref="Ghost"/>) всегда false.</summary>
@@ -153,7 +169,12 @@ public partial class BuildEditor : Node3D
         _state.Changed += OnStateChanged;
         OnStateChanged();
 
-        _mousePosition = GetViewport().GetMousePosition();
+        // Баг (исправлен): после входа в редактор курсор-призрак не показывался, пока не шевельнёшь колесом/мышью. Причина:
+        // GetViewport().GetMousePosition() не знает позиции мыши, пока в окно не пришло событие мыши (там (0,0) - как раз тулбар,
+        // IsPointOverUi гасит наведение), а первое же событие (в т.ч. колесо) перезаписывает _mousePosition. Теперь мышь явно
+        // видима, а позиция до первого события опрашивается у ОС (PollCursorPosition, см. _Process).
+        Input.MouseMode = Input.MouseModeEnum.Visible;
+        _mousePosition = PollCursorPosition() ?? GetViewport().GetMousePosition();
         DevHarness.Start(this);
     }
 
@@ -241,7 +262,9 @@ public partial class BuildEditor : Node3D
     // ------------------------------------------------------------------ сцена
 
     // Один плоский цвет неба и земли (запрос пользователя) — общий с World.GameWorld, см. EnvironmentBuilder.
-    private void BuildEnvironment() => EnvironmentBuilder.BuildFlatSkyAndSun(this, Color.FromHtml("#6682FF"));
+    // Цвет редактора - #238baf, освещение белое (2026-10-05, по запросу пользователя); небо игрового мира (GameWorld) остаётся прежним.
+    public static readonly Color EditorSkyColor = Color.FromHtml("#238baf");
+    private void BuildEnvironment() => EnvironmentBuilder.BuildFlatSkyAndSun(this, EditorSkyColor, whiteLighting: true);
 
     /// <summary>
     /// Ставит корневой блок 1x1x1 (обычный куб, слаг "block") в центральную клетку (0,0,0) при входе в редактор —
@@ -359,6 +382,21 @@ public partial class BuildEditor : Node3D
             Visible = false,
         };
         AddChild(_outline);
+
+        _conflictOverlay = new MeshInstance3D
+        {
+            Name = "PlaceConflict",
+            MaterialOverride = new StandardMaterial3D
+            {
+                ShadingMode = BaseMaterial3D.ShadingModeEnum.Unshaded,
+                AlbedoColor = new Color(1f, 0.12f, 0.1f, 0.45f),
+                Transparency = BaseMaterial3D.TransparencyEnum.Alpha,
+                CullMode = BaseMaterial3D.CullModeEnum.Disabled,
+            },
+            CastShadow = GeometryInstance3D.ShadowCastingSetting.Off,
+            Visible = false,
+        };
+        AddChild(_conflictOverlay);
     }
 
     private static ArrayMesh CreateWireCube()
@@ -394,6 +432,7 @@ public partial class BuildEditor : Node3D
 
     public override void _Input(InputEvent e)
     {
+        if (e is InputEventMouse) _mouseSeen = true;
         if (e is InputEventMouse mouse && !_looking) _mousePosition = mouse.Position;
 
         switch (e)
@@ -589,10 +628,24 @@ public partial class BuildEditor : Node3D
         if (string.IsNullOrEmpty(slug) || !BlockCatalog.Instance.TryGetBySlug(slug, out var definition)) return;
         // Тот же гейт, что и у призрака (CanPlaceFootprint) - блок можно поставить только рядом с уже стоящим
         // (кроме самой первой клетки постройки) - иначе ЛКМ по пустой земле поставила бы блок в стороне от всего.
-        if (!CanPlaceFootprint(_hover.PlaceCell, _state.PendingSize)) return;
+        var box = PendingPlacementBox(definition);
+        if (!CanPlaceFootprint(box.Origin, box.Size)) return;
 
-        ApplyEdit(NetEditKind.Place, _hover.PlaceCell, _state.PendingSize, definition.Slug, definition.DefaultColor,
+        ApplyEdit(NetEditKind.Place, box.Origin, box.Size, definition.Slug, definition.DefaultColor,
             _state.PendingRotationSteps, _state.PendingMirror);
+    }
+
+    /// <summary>
+    /// Занятый бокс блока, который встанет по ЛКМ в <see cref="RayHit.PlaceCell"/> (и на который смотрит призрак). Клетка под
+    /// курсором — КОРНЕВАЯ клетка блока (0,0,0 его локального бокса), и при повороте он разворачивается вокруг неё вместе со своим
+    /// размером: занятые клетки поворачиваются (см. <see cref="BlockFootprint"/>). Локальный размер — фиксированный footprint у
+    /// функционального блока и <see cref="EditorState.PendingSize"/> у резинового (куб/формы); дальше везде одно и то же.
+    /// </summary>
+    private (Vector3I Origin, Vector3I Size) PendingPlacementBox(BlockDefinition definition)
+    {
+        var functional = definition.GetComponent<FunctionalBlockComponent>();
+        var localSize = functional != null ? functional.Footprint : _state.PendingSize;
+        return BlockFootprint.PlaceBox(_hover.PlaceCell, localSize, _state.PendingRotationSteps);
     }
 
     /// <summary>
@@ -665,7 +718,7 @@ public partial class BuildEditor : Node3D
             var rayOrigin = _camera.ProjectRayOrigin(_mousePosition);
             var rayDir = _camera.ProjectRayNormal(_mousePosition);
             var originWorld = BuildSpace.CellMin(owner.Origin);
-            if (!ShapeMeshBuilder.TryRaycastFace(building.Shape, owner.Size, owner.RotationSteps, owner.Mirror, originWorld, rayOrigin, rayDir, out region))
+            if (!ShapeMeshBuilder.TryRaycastFace(building.Shape, BlockFootprint.UnrotatedSize(owner.Size, owner.RotationSteps), owner.RotationSteps, owner.Mirror, originWorld, rayOrigin, rayDir, out region))
             {
                 ShapeMeshBuilder.TryFindPaintRegion(building.Shape, owner.RotationSteps, owner.Mirror, hitBit, out region);
             }
@@ -719,6 +772,7 @@ public partial class BuildEditor : Node3D
         _ghostRotationElapsed += delta;
         var rotationT = Mathf.Clamp(_ghostRotationElapsed / GhostRotationAnimDuration, 0.0, 1.0);
         _ghostVisualBasis = _ghostRotationFrom.Slerp(_ghostRotationTo, rotationT);
+        if (!_mouseSeen && !_looking && PollCursorPosition() is { } polled) _mousePosition = polled;
         UpdateHover();
 
         // Удержание кнопки инструмента: он применяется к каждому новому блоку под курсором, но только если мышь сдвинулась —
@@ -735,6 +789,19 @@ public partial class BuildEditor : Node3D
             _infoTimer = 0.25;
             UpdateInfo();
         }
+    }
+
+    /// <summary>Позиция курсора ОС в координатах окна/вьюпорта, пока от мыши не пришло ни одного события (после этого её ведёт
+    /// <see cref="_Input"/>). null - курсор вне окна (тогда оставляем прежнюю позицию).</summary>
+    private Vector2? PollCursorPosition() =>
+        CursorPositionInViewport(DisplayServer.MouseGetPosition(), GetWindow().Position, GetViewport().GetVisibleRect());
+
+    /// <summary>Позиция курсора ОС (экранные координаты <paramref name="screen"/>) в координатах вьюпорта окна, чей угол стоит в
+    /// <paramref name="windowPosition"/>; null - курсор вне окна. Вынесено статикой ради самотеста.</summary>
+    public static Vector2? CursorPositionInViewport(Vector2I screen, Vector2I windowPosition, Rect2 viewport)
+    {
+        var local = new Vector2(screen.X - windowPosition.X, screen.Y - windowPosition.Y);
+        return viewport.HasPoint(local) ? local : null;
     }
 
     public void UpdateHover()
@@ -754,32 +821,41 @@ public partial class BuildEditor : Node3D
     {
         string slug = _state.SelectedBlockSlug;
         BlockCatalog.Instance.TryGetBySlug(slug, out var definition);
-        // Пока активен инструмент (Paint/Delete), ЛКМ ничего не ставит (см. ButtonFor/_UnhandledInput) - призрак
-        // размещения только сбивал бы с толку, поэтому скрыт целиком, а не просто "показывает недоступную клетку".
-        bool canPlace = _state.Tool == ToolMode.None && _hover.Found && definition != null
-                        && CanPlaceFootprint(_hover.PlaceCell, _state.PendingSize);
+
+        // Пока активен инструмент (Paint/Delete), ЛКМ ничего не ставит (см. ButtonFor/_UnhandledInput) - призрак размещения
+        // только сбивал бы с толку, поэтому скрыт целиком.
+        bool placing = _state.Tool == ToolMode.None && _hover.Found && definition != null;
+        var placementBox = definition != null ? PendingPlacementBox(definition) : (Origin: _hover.PlaceCell, Size: _state.PendingSize);
+
+        // Два разных «нельзя»: (1) КОНФЛИКТ - клетки бокса заняты или вне области построек: призрак остаётся на месте (баг, найден
+        // пользователем: после поворота в упор к другим блокам он просто пропадал) и поверх конфликтных клеток рисуется красный
+        // полупрозрачный блок; (2) блок не касается постройки (парящий вдали) - как и раньше, призрака нет вообще.
+        var blocked = placing ? PlacementRules.FindBlockedCells(_world.Grid, placementBox.Origin, placementBox.Size) : new List<Vector3I>();
+        bool canPlace = placing && blocked.Count == 0 && CanPlaceFootprint(placementBox.Origin, placementBox.Size);
+        bool showGhost = placing && (canPlace || blocked.Count > 0);
+        UpdateConflictOverlay(blocked);
 
         // Функциональный блок со своей моделью (мотор/вал) не укладывается в один MeshInstance3D.Mesh (см.
         // _ghostModel doc) - призрак ставится отдельным узлом вместо куба/формы _ghost, та же подгонка
         // (FunctionalBlockGeometry), что и у уже размещённых блоков (FunctionalBlockView)/иконки (BlockIconView).
         var functional = definition?.GetComponent<FunctionalBlockComponent>();
         (PackedScene? scene, Aabb aabb) ghostScene = default;
-        if (canPlace && functional != null && !string.IsNullOrEmpty(functional.ScenePath))
+        if (showGhost && functional != null && !string.IsNullOrEmpty(functional.ScenePath))
         {
             ghostScene = FunctionalBlockGeometry.GetOrLoadScene(functional.ScenePath);
         }
 
         bool showModel = ghostScene.scene != null;
-        _ghost.Visible = canPlace && !showModel;
+        _ghost.Visible = showGhost && !showModel;
         if (_ghostModel != null) _ghostModel.Visible = showModel;
 
         if (showModel)
         {
-            UpdateGhostModel(ghostScene.scene!, ghostScene.aabb, functional!.ModelScale);
+            UpdateGhostModel(ghostScene.scene!, ghostScene.aabb, functional!.Footprint, functional.ModelScale, functional.ModelOffset);
         }
-        else if (canPlace)
+        else if (showGhost)
         {
-            UpdateGhostMesh(definition!, slug);
+            UpdateGhostMesh(definition!, slug, functional?.Footprint ?? _state.PendingSize);
             _ghostMaterial.AlbedoColor = definition!.DefaultColor;
         }
 
@@ -790,6 +866,52 @@ public partial class BuildEditor : Node3D
             _outline.Position = BuildSpace.CellCenter(_hover.BlockCell);
             _outlineMaterial.AlbedoColor = _state.Tool == ToolMode.Delete ? new Color(1f, 0.25f, 0.2f) : _state.PaintColor;
         }
+    }
+
+    /// <summary>
+    /// Красный полупрозрачный «блок» на каждой клетке, где призрак упирается в уже стоящий блок или выходит за область построек.
+    /// Чуть больше клетки (на 0.01 м с каждой стороны) - иначе грани совпали бы с гранями стоящего блока (z-fighting) и красного
+    /// не было бы видно поверх него. Меш пересобирается, только когда набор клеток реально изменился.
+    /// </summary>
+    private void UpdateConflictOverlay(List<Vector3I> blocked)
+    {
+        _conflictOverlay.Visible = blocked.Count > 0;
+        if (blocked.Count == 0)
+        {
+            _conflictCells = blocked;
+            return;
+        }
+
+        if (blocked.SequenceEqual(_conflictCells)) return;
+        _conflictCells = blocked;
+
+        const float grow = 0.01f;
+        var vertices = new List<Vector3>(blocked.Count * 36);
+        foreach (var cell in blocked)
+        {
+            var min = BuildSpace.CellMin(cell) - new Vector3(grow, grow, grow);
+            var max = min + new Vector3(1, 1, 1) * (BuildSpace.CellSize + 2 * grow);
+            Vector3 P(int x, int y, int z) => new(x == 0 ? min.X : max.X, y == 0 ? min.Y : max.Y, z == 0 ? min.Z : max.Z);
+            void Quad(Vector3 a, Vector3 b, Vector3 c, Vector3 d)
+            {
+                vertices.Add(a); vertices.Add(b); vertices.Add(c);
+                vertices.Add(a); vertices.Add(c); vertices.Add(d);
+            }
+
+            Quad(P(0, 0, 0), P(1, 0, 0), P(1, 1, 0), P(0, 1, 0)); // -Z
+            Quad(P(1, 0, 1), P(0, 0, 1), P(0, 1, 1), P(1, 1, 1)); // +Z
+            Quad(P(0, 0, 1), P(0, 0, 0), P(0, 1, 0), P(0, 1, 1)); // -X
+            Quad(P(1, 0, 0), P(1, 0, 1), P(1, 1, 1), P(1, 1, 0)); // +X
+            Quad(P(0, 0, 1), P(1, 0, 1), P(1, 0, 0), P(0, 0, 0)); // -Y
+            Quad(P(0, 1, 0), P(1, 1, 0), P(1, 1, 1), P(0, 1, 1)); // +Y
+        }
+
+        var arrays = new Godot.Collections.Array();
+        arrays.Resize((int)Mesh.ArrayType.Max);
+        arrays[(int)Mesh.ArrayType.Vertex] = vertices.ToArray();
+        var mesh = new ArrayMesh();
+        mesh.AddSurfaceFromArrays(Mesh.PrimitiveType.Triangles, arrays);
+        _conflictOverlay.Mesh = mesh;
     }
 
     /// <summary>
@@ -811,28 +933,26 @@ public partial class BuildEditor : Node3D
     /// Призрак отражает настоящую форму выбранного блока (не только куб), текущий поворот/отражение
     /// (<see cref="EditorState.PendingRotationSteps"/>/<see cref="EditorState.PendingMirror"/>) и размер
     /// (<see cref="EditorState.PendingSize"/>) — то есть выглядит ровно так же, как блок, который встанет по ЛКМ
-    /// (панель Resize на тулбаре меняет именно это, не уже поставленные блоки). Меш кубов — <see cref="BoxMesh"/>
-    /// размером во весь Size (без склейки соседних граней, как у настоящих кубов в постройке, но снаружи выглядит
-    /// так же — одна сплошная область без швов); меш остальных форм строится той же <c>ShapeMeshBuilder</c>, что и
-    /// уже поставленные блоки (координаты — от угла клетки, см. <see cref="ShapeInstanceView"/>).
-    /// <para/>
-    /// Поворот берётся из <see cref="_ghostVisualBasis"/> (плавно доводится, Slerp, до <see cref="EditorState.PendingRotationBasis"/>
-    /// на J/K/L, см. его doc-комментарий), не напрямую из <see cref="EditorState"/> — во время анимации это
-    /// промежуточная, не кратная 90° ориентация, поэтому меш пересобирается каждый кадр, пока анимация не осядет на
-    /// целевой (сравнение ниже естественно перестаёт совпадать, пока поворот ещё "в пути").
+    /// (панель Resize на тулбаре меняет именно это, не уже поставленные блоки). Меш строится в ЛОКАЛЬНЫХ осях блока, без поворота
+    /// (куб — <see cref="BoxMesh"/> с мин. углом в нуле, остальные формы — той же <c>ShapeMeshBuilder</c>, что и поставленные
+    /// блоки, плюс полные грани, которых у призрака иначе нет — см. <c>includeFullCoverageFaces</c>), и пересобирается только когда
+    /// меняется блок/локальный размер/отражение. Поворот и положение даёт <see cref="FunctionalBlockGeometry.RootFrame"/> с
+    /// анимируемым <see cref="_ghostVisualBasis"/> (Slerp до <see cref="EditorState.PendingRotationBasis"/> на J/K/L): корневая клетка
+    /// под курсором стоит на месте, блок целиком (вместе с размером) жёстко разворачивается вокруг её центра — для куба, формы и
+    /// функционального блока одинаково.
     /// </summary>
-    private void UpdateGhostMesh(BlockDefinition definition, string slug)
+    private void UpdateGhostMesh(BlockDefinition definition, string slug, Vector3I localSize)
     {
         var building = definition.GetComponent<BuildingBlockComponent>();
-        var rotation = _ghostVisualBasis;
         var mirror = _state.PendingMirror;
-        var size = _state.PendingSize;
         bool isCube = building == null || building.Shape == BlockShape.Cube;
-        var extent = new Vector3(size.X, size.Y, size.Z) * BuildSpace.CellSize;
 
-        _ghost.Position = BuildSpace.CellMin(_hover.PlaceCell) + (isCube ? extent * 0.5f : Vector3.Zero);
+        var extent = new Vector3(localSize.X, localSize.Y, localSize.Z) * BuildSpace.CellSize;
+        // BoxMesh центрирован на своём начале, а меш формы (и рамка) - от мин. угла: куб сдвигается на половину размера в ЛОКАЛЬНЫХ осях.
+        var localShift = isCube ? extent * 0.5f : Vector3.Zero;
+        _ghost.Transform = FunctionalBlockGeometry.RootFrame(_hover.PlaceCell, _ghostVisualBasis) * new Transform3D(Basis.Identity, localShift);
 
-        if (_ghostSlug == slug && _ghostRotation == rotation && _ghostMirror == mirror && _ghostSize == size) return;
+        if (_ghostSlug == slug && _ghostMirror == mirror && _ghostSize == localSize) return;
 
         if (isCube)
         {
@@ -843,14 +963,13 @@ public partial class BuildEditor : Node3D
             // includeFullCoverageFaces: true — призрак не стоит в VoxelGrid, поэтому ChunkMesher никогда не дорисует
             // ему низ/заднюю стенку и т.п. (см. doc-комментарий ShapeMeshBuilder.BuildData); без этого флага у
             // призрака Wedge/Pyramid/InvertedPyramid были видны только рампа/треугольные борта, силуэт был "дырявым".
-            var (solid, _, _) = ShapeMeshBuilder.Build(building!.Shape, size, rotation, mirror, Colors.White, includeFullCoverageFaces: true);
+            var (solid, _, _) = ShapeMeshBuilder.Build(building!.Shape, localSize, Basis.Identity, mirror, Colors.White, includeFullCoverageFaces: true);
             _ghost.Mesh = (Mesh?)solid ?? new BoxMesh { Size = extent };
         }
 
         _ghostSlug = slug;
-        _ghostRotation = rotation;
         _ghostMirror = mirror;
-        _ghostSize = size;
+        _ghostSize = localSize;
     }
 
     /// <summary>
@@ -864,7 +983,7 @@ public partial class BuildEditor : Node3D
     /// <see cref="EditorState.PendingMirror"/> для настоящих моделей не поддерживается (см. <see cref="FunctionalBlockGeometry"/>
     /// class doc) — призрак его тоже игнорирует, ровно как и уже поставленный блок.
     /// </summary>
-    private void UpdateGhostModel(PackedScene scene, Aabb aabb, Vector3 modelScale)
+    private void UpdateGhostModel(PackedScene scene, Aabb aabb, Vector3I footprint, Vector3 modelScale, Vector3 modelOffset)
     {
         if (_ghostModelScene != scene)
         {
@@ -874,10 +993,11 @@ public partial class BuildEditor : Node3D
             _ghostModelScene = scene;
         }
 
-        var size = _state.PendingSize;
-        var targetExtent = new Vector3(size.X, size.Y, size.Z) * BuildSpace.CellSize;
-        var targetCenter = BuildSpace.CellMin(_hover.PlaceCell) + targetExtent * 0.5f;
-        _ghostModel!.Transform = FunctionalBlockGeometry.ComputeFitTransform(aabb, targetExtent, targetCenter, _ghostVisualBasis, modelScale);
+        // Модель - в локальных (неповёрнутых) метрах footprint'а; жёсткий поворот вокруг КОРНЕВОЙ клетки (под курсором) даёт
+        // рамка с анимируемым базисом: корень стоит на месте, остальной блок плавно разворачивается вокруг его центра.
+        var localExtent = new Vector3(footprint.X, footprint.Y, footprint.Z) * BuildSpace.CellSize;
+        var frame = FunctionalBlockGeometry.RootFrame(_hover.PlaceCell, _ghostVisualBasis);
+        _ghostModel!.Transform = frame * FunctionalBlockGeometry.ComputeFitTransform(aabb, localExtent, localExtent * 0.5f, Basis.Identity, modelScale, modelOffset);
     }
 
     private void OnStateChanged()

@@ -6,13 +6,16 @@ using SandboxPolyGame.Blocks;
 namespace SandboxPolyGame.Core;
 
 /// <summary>
-/// Строит меш не-кубического блока (Wedge/Pyramid/InvertedPyramid) из сырых данных <see cref="BlockGeometry"/>:
-/// отражает и поворачивает вершины ВНУТРИ единичного куба (0..1, вокруг его центра 0.5 — см. <paramref name="mirror"/>
-/// ниже), и только потом растягивает результат под текущий размер экземпляра (<see cref="Construction.TrySetSize"/>
-/// двигает именно эти вершины, пересобирая меш заново) — порядок важен, см. комментарий в <c>BuildData</c>. Строит
-/// полный wireframe (контур + диагонали граней, как у <see cref="ChunkMesher"/>). Результат — в локальных
-/// координатах относительно МИНИМАЛЬНОГО угла bounding box (0 .. Size*CellSize), тем же соглашением, что и чанки
-/// (позиционируются в мире через угол, не центр).
+/// Строит меш не-кубического блока (Wedge/Pyramid/InvertedPyramid) из сырых данных <see cref="BlockGeometry"/>.
+/// <b>Размер (<c>size</c>) здесь — ЛОКАЛЬНЫЙ, до поворота</b> (2026-10-05): форма отражается и растягивается под него в СВОИХ осях
+/// и только потом жёстко поворачивается вокруг центра своего бокса — то есть блок вместе со своим размером крутится как единое целое
+/// (3×1×1 клин после поворота на 90° вокруг Y занимает 1×1×3). Занятый бокс в мире — поворот локального (см.
+/// <see cref="BlockFootprint"/>: блок крутится вокруг корневой клетки, а <c>BlockInstance.Size</c> хранит уже повёрнутый бокс, поэтому
+/// вызывающий код получает локальный размер через <see cref="BlockFootprint.UnrotatedSize"/>). Отражение (<paramref name="mirror"/>
+/// ниже) применяется в локальных осях ДО растяжки и поворота. Строит полный wireframe (контур + диагонали граней, как у
+/// <see cref="ChunkMesher"/>). Результат — в координатах относительно МИНИМАЛЬНОГО угла повёрнутого bounding box (0 .. повёрнутый
+/// размер * CellSize), тем же соглашением, что и чанки (позиционируются в мире через угол, не центр); для блока без поворота это
+/// ровно локальный размер, как раньше.
 /// </summary>
 public static class ShapeMeshBuilder
 {
@@ -57,22 +60,13 @@ public static class ShapeMeshBuilder
     {
         if (!BlockGeometry.TryGet(shape, out var localVertices, out var faces)) return null;
 
-        var extent = new Vector3(size.X, size.Y, size.Z) * BuildSpace.CellSize;
-        var unitCenter = new Vector3(0.5f, 0.5f, 0.5f);
-
-        // Поворот/отражение применяются НАД НОРМАЛИЗОВАННЫМ единичным кубом (вокруг его центра 0.5,0.5,0.5) —
-        // и только ПОТОМ результат растягивается под реальный размер (extent, в осях СЕТКИ/МИРА, не блока).
-        // Раньше растягивали (Size) СНАЧАЛА, а вращали уже неравномерно вытянутую фигуру — при повороте на
-        // 90°/270° вокруг оси, меняющей местами две РАЗНЫЕ по размеру грани (несимметричный Size), итоговый
-        // bounding box поворачивался вместе с формой и переставал совпадать с реально занятой областью клеток
-        // (Construction.Size — она осями сетки не поворачивается), из-за чего блок визуально "плавал" не по
-        // границе клеток. Поворот единичного куба (90°-степени) всегда переводит [0,1]³ само в себя, поэтому
-        // после растяжения на extent форма гарантированно укладывается ровно в занятые клетки.
-        Vector3 ToWorld(Vector3 unit)
-        {
-            var oriented = rotation * (Mirrored(unit, mirror) - unitCenter) + unitCenter; // всё ещё внутри [0,1]³
-            return oriented * extent; // теперь — реальные метры относительно угла bounding box
-        }
+        // Размер - ЛОКАЛЬНЫЙ: сначала отражение и растяжка в собственных осях блока, потом жёсткий поворот вокруг центра бокса, потом
+        // сдвиг в рамку повёрнутого bounding box (его мин. угол - нулевая точка). Для поворота, кратного 90°, повёрнутый бокс -
+        // ровно перестановка осей локального, форма лежит точно в занятых клетках (см. BlockFootprint). Раньше было наоборот
+        // (поворот единичного куба, потом растяжка в осях МИРА): блок поворачивался, а его размер - нет.
+        var localExtent = new Vector3(size.X, size.Y, size.Z) * BuildSpace.CellSize;
+        var boxExtent = RotatedExtent(rotation, localExtent);
+        Vector3 ToWorld(Vector3 unit) => OrientedPoint(unit, rotation, mirror, localExtent, boxExtent);
 
         var data = new ChunkMeshData();
         var positions = new Vector3[8]; // максимум вершин в грани в наших формах — 4
@@ -130,10 +124,10 @@ public static class ShapeMeshBuilder
         regionIndex = -1;
         if (!BlockGeometry.TryGet(shape, out var localVertices, out var faces)) return false;
 
-        var extent = new Vector3(size.X, size.Y, size.Z) * BuildSpace.CellSize;
+        var localExtent = new Vector3(size.X, size.Y, size.Z) * BuildSpace.CellSize; // ЛОКАЛЬНЫЙ размер, как у BuildData
         var rotation = ComposeRotation(rotationSteps);
-        var unitCenter = new Vector3(0.5f, 0.5f, 0.5f);
-        Vector3 ToWorld(Vector3 unit) => originWorld + (rotation * (Mirrored(unit, mirror) - unitCenter) + unitCenter) * extent;
+        var boxExtent = RotatedExtent(rotation, localExtent);
+        Vector3 ToWorld(Vector3 unit) => originWorld + OrientedPoint(unit, rotation, mirror, localExtent, boxExtent);
 
         double bestT = double.PositiveInfinity;
         var positions = new Vector3[8];
@@ -226,6 +220,18 @@ public static class ShapeMeshBuilder
         regionIndex = diagonal;
         return true;
     }
+
+    /// <summary>Габарит (по осям мира) бокса размером <paramref name="localExtent"/> после поворота <paramref name="rotation"/>. Для
+    /// поворота кратного 90° - точная перестановка осей, для промежуточного (анимация призрака) - охватывающий бокс.</summary>
+    private static Vector3 RotatedExtent(Basis rotation, Vector3 localExtent) => new(
+        Mathf.Abs(rotation.Row0.X) * localExtent.X + Mathf.Abs(rotation.Row0.Y) * localExtent.Y + Mathf.Abs(rotation.Row0.Z) * localExtent.Z,
+        Mathf.Abs(rotation.Row1.X) * localExtent.X + Mathf.Abs(rotation.Row1.Y) * localExtent.Y + Mathf.Abs(rotation.Row1.Z) * localExtent.Z,
+        Mathf.Abs(rotation.Row2.X) * localExtent.X + Mathf.Abs(rotation.Row2.Y) * localExtent.Y + Mathf.Abs(rotation.Row2.Z) * localExtent.Z);
+
+    /// <summary>Точка единичного куба формы -> метры в рамке повёрнутого bounding box: отражение, растяжка на локальный размер,
+    /// поворот вокруг центра бокса, сдвиг центра в центр повёрнутого бокса.</summary>
+    private static Vector3 OrientedPoint(Vector3 unit, Basis rotation, Vector3I mirror, Vector3 localExtent, Vector3 boxExtent) =>
+        rotation * (Mirrored(unit, mirror) * localExtent - localExtent * 0.5f) + boxExtent * 0.5f;
 
     private static Vector3 Mirrored(Vector3 unit, Vector3I mirror) => new(
         mirror.X != 0 ? 1f - unit.X : unit.X,

@@ -2,6 +2,7 @@ using Godot;
 using SandboxPolyGame.Blocks;
 using SandboxPolyGame.Core;
 using SandboxPolyGame.Editor;
+using SandboxPolyGame.Runtime;
 
 namespace SandboxPolyGame.World;
 
@@ -39,6 +40,8 @@ public static class VehicleSpawner
         voxelWorld.RebuildDirty();
 
         var construction = voxelWorld.Construction;
+        body.Runtime = new FunctionalBlockRuntime(construction, BlockCatalog.Instance);
+        voxelWorld.FunctionalBlocks.Runtime = body.Runtime; // модели кнопок анимируются по состоянию из рантайма
         double totalMass = 0;
         Vector3 weightedCenterSum = Vector3.Zero;
 
@@ -66,13 +69,15 @@ public static class VehicleSpawner
                 // проходим насквозь целиком. Координаты боксов - в ЛОКАЛЬНОЙ системе блока (метры, неповёрнутый),
                 // повёрнуты и сдвинуты тем же трансформом, что и его модель (FunctionalBlockGeometry) -
                 // CollisionShape3D.Transform, не только Position, т.к. поворот тоже нужен (бокс не обязан быть кубом).
-                var rotation = ShapeMeshBuilder.ComposeRotation(instance.RotationSteps);
+                // Рамка - та же, что у модели (FunctionalBlockView): блок крутится вокруг корневой клетки, не вокруг угла/центра
+                // хитбокса (раньше коллизия поворачивалась вокруг угла бокса, а модель - вокруг центра, и они расходились).
+                var frame = FunctionalBlockGeometry.InstanceFrame(instance.Origin, instance.Size, functional.Footprint, instance.RotationSteps);
                 foreach (var box in functional.CollisionBoxes)
                 {
                     body.AddChild(new CollisionShape3D
                     {
                         Shape = new BoxShape3D { Size = box.Size },
-                        Transform = new Transform3D(rotation, instanceMin + rotation * (box.Position + box.Size * 0.5f)),
+                        Transform = frame * new Transform3D(Basis.Identity, box.Position + box.Size * 0.5f),
                     });
                 }
             }

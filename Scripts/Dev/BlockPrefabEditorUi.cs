@@ -27,6 +27,9 @@ public sealed class BlockPrefabEditorUi
     public event Action? AddPortRequested;
     public event Action<int>? RemovePortRequested;
     public event Action? PortsChanged;
+    public event Action? AddNodeRequested;
+    public event Action<int>? RemoveNodeRequested;
+    public event Action? NodesChanged;
 
     /// <summary>
     /// Фокус вошёл в любое редактируемое поле (текст/дропдаун) — ПЕРЕД тем, как пользователь успел что-то в нём
@@ -47,8 +50,11 @@ public sealed class BlockPrefabEditorUi
     private readonly LineEdit _sceneField;
     private readonly LineEdit[] _footprintFields = new LineEdit[3];
     private readonly LineEdit[] _modelScaleFields = new LineEdit[3];
+    private readonly LineEdit[] _modelOffsetFields = new LineEdit[3];
     private readonly LineEdit _behaviorField;
     private readonly LineEdit _capacityField;
+    private readonly TextEdit _paramsField;
+    private readonly VBoxContainer _nodeList;
     private readonly VBoxContainer _collisionList;
     private readonly VBoxContainer _portList;
     private readonly Label _status;
@@ -59,9 +65,13 @@ public sealed class BlockPrefabEditorUi
     private readonly List<(LineEdit Id, OptionButton Resource, OptionButton Direction, OptionButton Face, LineEdit[] FaceCell)> _portRows = new();
     private bool _suppressPortEvents;
 
+    private readonly List<(LineEdit Id, OptionButton Type, OptionButton Direction, LineEdit[] Cell)> _nodeRows = new();
+    private bool _suppressNodeEvents;
+
     private static readonly ResourceType[] ResourceValues = (ResourceType[])Enum.GetValues(typeof(ResourceType));
     private static readonly PortDirection[] DirectionValues = (PortDirection[])Enum.GetValues(typeof(PortDirection));
     private static readonly BlockFace[] FaceValues = (BlockFace[])Enum.GetValues(typeof(BlockFace));
+    private static readonly NodeType[] NodeTypeValues = (NodeType[])Enum.GetValues(typeof(NodeType));
 
     public BlockPrefabEditorUi(Control layerRoot)
     {
@@ -151,13 +161,33 @@ public sealed class BlockPrefabEditorUi
         scaleHint.AutowrapMode = TextServer.AutowrapMode.WordSmart;
         column.AddChild(scaleHint);
 
+        var offsetRow = new HBoxContainer();
+        offsetRow.AddChild(UiStyle.MakeLabel("Model offset X/Y/Z (м)", 13));
+        for (int axis = 0; axis < 3; axis++)
+        {
+            var field = new LineEdit { CustomMinimumSize = new Vector2(60, 28), Text = "0" };
+            field.TextSubmitted += _ => FieldsChanged?.Invoke();
+            field.FocusExited += () => FieldsChanged?.Invoke();
+            offsetRow.AddChild(field);
+            _modelOffsetFields[axis] = field;
+        }
+        column.AddChild(offsetRow);
+        var offsetHint = UiStyle.MakeLabel(
+            "Сдвиг модели внутри клетки в метрах (оси неповёрнутого блока, 0 = по центру габарита модели) - чтобы " +
+            "асимметричная модель (угловая труба) совпала с центрами клетки. Коллизию и порты не двигает.", 11, UiStyle.TextDim);
+        offsetHint.AutowrapMode = TextServer.AutowrapMode.WordSmart;
+        column.AddChild(offsetHint);
+
         column.AddChild(Separator());
         _behaviorField = AddTextRow(column, "Behavior", "");
         _capacityField = AddNumericRow(column, "Capacity", "0");
+        _paramsField = AddJsonField(column,
+            "Behavior params (JSON-объект, пусто = нет; у Button: \"mode\" momentary|toggle, \"glowNode\" имя узла-крышки, " +
+            "\"glowColor\" #rrggbb)", 66);
 
         column.AddChild(Separator());
         var portsHeader = new HBoxContainer();
-        var portsHeaderLabel = UiStyle.MakeLabel("Ports (ресурсные входы/выходы; несколько портов могут сидеть в одном месте)", 13, UiStyle.TextDim);
+        var portsHeaderLabel = UiStyle.MakeLabel("Ports (ФИЗИЧЕСКИЕ: вал Torque / труба Fluid; несколько портов могут сидеть в одном месте)", 13, UiStyle.TextDim);
         portsHeaderLabel.AutowrapMode = TextServer.AutowrapMode.WordSmart;
         portsHeaderLabel.CustomMinimumSize = new Vector2(360, 0);
         portsHeader.AddChild(portsHeaderLabel);
@@ -169,6 +199,22 @@ public sealed class BlockPrefabEditorUi
         _portList = new VBoxContainer();
         _portList.AddThemeConstantOverride("separation", 10);
         column.AddChild(_portList);
+
+        column.AddChild(Separator());
+        var nodesHeader = new HBoxContainer();
+        var nodesHeaderLabel = UiStyle.MakeLabel(
+            "Nodes (логика: Electricity/Boolean/Number; сидят в ЦЕНТРЕ клетки блока; в одной клетке - только разные типы)", 13, UiStyle.TextDim);
+        nodesHeaderLabel.AutowrapMode = TextServer.AutowrapMode.WordSmart;
+        nodesHeaderLabel.CustomMinimumSize = new Vector2(360, 0);
+        nodesHeader.AddChild(nodesHeaderLabel);
+        var addNodeButton = UiStyle.MakeButton("+ Add node", new Vector2(100, 26));
+        addNodeButton.Pressed += () => AddNodeRequested?.Invoke();
+        nodesHeader.AddChild(addNodeButton);
+        column.AddChild(nodesHeader);
+
+        _nodeList = new VBoxContainer();
+        _nodeList.AddThemeConstantOverride("separation", 10);
+        column.AddChild(_nodeList);
 
         column.AddChild(Separator());
         var collisionHeader = new HBoxContainer();
@@ -202,8 +248,11 @@ public sealed class BlockPrefabEditorUi
             BindUndoCapture(field);
         }
         BindUndoCapture(_sceneField);
+        _paramsField.FocusExited += () => FieldsChanged?.Invoke(); // многострочное поле: Enter - новая строка, применяем по потере фокуса
+        BindUndoCapture(_paramsField);
         foreach (var field in _footprintFields) BindUndoCapture(field);
         foreach (var field in _modelScaleFields) BindUndoCapture(field);
+        foreach (var field in _modelOffsetFields) BindUndoCapture(field);
     }
 
     /// <summary>Снимает Undo-снэпшот, когда фокус ВХОДИТ в это поле/дропдаун — ДО того, как пользователь успеет что-то
@@ -290,6 +339,23 @@ public sealed class BlockPrefabEditorUi
         return field;
     }
 
+    /// <summary>Подпись + многострочное поле для сырого JSON (параметры поведения, сигнальные порты) — применяется по потере
+    /// фокуса (Enter в многострочном поле — перенос строки, не "применить").</summary>
+    private static TextEdit AddJsonField(VBoxContainer column, string label, float height)
+    {
+        var caption = UiStyle.MakeLabel(label, 12, UiStyle.TextDim);
+        caption.AutowrapMode = TextServer.AutowrapMode.WordSmart;
+        column.AddChild(caption);
+
+        var field = new TextEdit
+        {
+            CustomMinimumSize = new Vector2(480, height),
+            WrapMode = TextEdit.LineWrappingMode.Boundary,
+        };
+        column.AddChild(field);
+        return field;
+    }
+
     private static LineEdit AddNumericRow(VBoxContainer column, string label, string defaultValue)
     {
         var row = new HBoxContainer();
@@ -324,6 +390,12 @@ public sealed class BlockPrefabEditorUi
     /// <summary>Для самотестов — меняет только слаг (остальные поля через <see cref="LoadFields"/>), т.к. в обычном
     /// UI слаг печатается руками, а не задаётся программно.</summary>
     public void SetSlugForTesting(string slug) => _slugField.Text = slug;
+
+    /// <summary>Для самотестов — меняет только "Model offset" (см. <see cref="ModelOffset"/>), не трогая остальные поля.</summary>
+    public void SetModelOffsetForTesting(Vector3 offset)
+    {
+        for (int axis = 0; axis < 3; axis++) _modelOffsetFields[axis].Text = offset[axis].ToString(CultureInfo.InvariantCulture);
+    }
 
     /// <summary>Для самотестов — меняет только "Model stretch" (см. <see cref="ModelScale"/>), не трогая остальные поля.</summary>
     public void SetModelScaleForTesting(Vector3 scale)
@@ -363,10 +435,54 @@ public sealed class BlockPrefabEditorUi
         ParseFloatOr(_modelScaleFields[1].Text, 1f),
         ParseFloatOr(_modelScaleFields[2].Text, 1f));
 
+    /// <summary>Ручной сдвиг модели в клетке, метры (см. <see cref="FunctionalBlockComponent.ModelOffset"/>) - (0,0,0) по умолчанию.</summary>
+    public Vector3 ModelOffset => new(
+        ParseFloatOr(_modelOffsetFields[0].Text, 0f),
+        ParseFloatOr(_modelOffsetFields[1].Text, 0f),
+        ParseFloatOr(_modelOffsetFields[2].Text, 0f));
+
     public float Mass => ParseFloatOr(_massField.Text, 10f);
     public float Durability => ParseFloatOr(_durabilityField.Text, 100f);
     public float DamageResistance => ParseFloatOr(_damageField.Text, 0.1f);
     public float Capacity => ParseFloatOr(_capacityField.Text, 0f);
+
+    /// <summary>Сырой текст поля "Behavior params" (JSON-объект или пусто) — разбор и проверка в <see cref="BlockPrefabEditor"/>.</summary>
+    public string ParamsJson => _paramsField.Text.Trim();
+
+    /// <summary>Для самотестов — задаёт только параметры поведения (JSON-текст), не трогая остальные поля.</summary>
+    public void SetParamsForTesting(string paramsJson) => _paramsField.Text = paramsJson;
+
+    /// <summary>Для самотестов — заполняет поля УЖЕ СУЩЕСТВУЮЩЕГО ряда ноды (добавленного через
+    /// <see cref="AddNodeRequested"/>/<see cref="SetNodeRows"/>) напрямую, без события <see cref="NodesChanged"/>.</summary>
+    public void SetNodeForTesting(int index, string id, NodeType type, PortDirection direction, Vector3I cell)
+    {
+        var row = _nodeRows[index];
+        row.Id.Text = id;
+        row.Type.Selected = Array.IndexOf(NodeTypeValues, type);
+        row.Direction.Selected = Array.IndexOf(DirectionValues, direction);
+        for (int axis = 0; axis < 3; axis++) row.Cell[axis].Text = cell[axis].ToString(CultureInfo.InvariantCulture);
+    }
+
+    /// <summary>Логические ноды — собираются из живых полей рядов при каждом обращении (как <see cref="Ports"/>).</summary>
+    public IReadOnlyList<LogicNode> Nodes
+    {
+        get
+        {
+            var result = new List<LogicNode>(_nodeRows.Count);
+            foreach (var row in _nodeRows)
+            {
+                result.Add(new LogicNode
+                {
+                    Id = row.Id.Text.Trim(),
+                    Type = NodeTypeValues[row.Type.Selected],
+                    Direction = DirectionValues[row.Direction.Selected],
+                    Cell = new Vector3I(ParseIntOrZero(row.Cell[0].Text), ParseIntOrZero(row.Cell[1].Text), ParseIntOrZero(row.Cell[2].Text)),
+                });
+            }
+
+            return result;
+        }
+    }
 
     public IReadOnlyList<CollisionBox> CollisionBoxes
     {
@@ -412,8 +528,8 @@ public sealed class BlockPrefabEditorUi
     // ------------------------------------------------------------------ запись полей (загрузка существующего/нового блока)
 
     public void LoadFields(string slug, string name, Color color, float mass, float durability, float damage,
-        string scenePath, Vector3I footprint, Vector3 modelScale, string behavior, float capacity,
-        IReadOnlyList<CollisionBox> collisionBoxes, IReadOnlyList<ResourcePort> ports)
+        string scenePath, Vector3I footprint, Vector3 modelScale, Vector3 modelOffset, string behavior, float capacity,
+        IReadOnlyList<CollisionBox> collisionBoxes, IReadOnlyList<ResourcePort> ports, IReadOnlyList<LogicNode> nodes, string paramsJson)
     {
         _slugField.Text = slug;
         _nameField.Text = name;
@@ -425,11 +541,14 @@ public sealed class BlockPrefabEditorUi
         _sceneField.Text = scenePath;
         for (int axis = 0; axis < 3; axis++) _footprintFields[axis].Text = footprint[axis].ToString(CultureInfo.InvariantCulture);
         for (int axis = 0; axis < 3; axis++) _modelScaleFields[axis].Text = modelScale[axis].ToString(CultureInfo.InvariantCulture);
+        for (int axis = 0; axis < 3; axis++) _modelOffsetFields[axis].Text = modelOffset[axis].ToString(CultureInfo.InvariantCulture);
         _behaviorField.Text = behavior;
         _capacityField.Text = capacity.ToString(CultureInfo.InvariantCulture);
+        _paramsField.Text = paramsJson;
 
         SetCollisionBoxRows(collisionBoxes);
         SetPortRows(ports);
+        SetNodeRows(nodes);
     }
 
     /// <summary>Перестраивает список рядов коллизии с нуля — вызывается при загрузке блока и при Add/Remove
@@ -582,6 +701,76 @@ public sealed class BlockPrefabEditorUi
     private void NotifyPortChanged()
     {
         if (!_suppressPortEvents) PortsChanged?.Invoke();
+    }
+
+    // ------------------------------------------------------------------ логические ноды (тот же приём "список рядов", что и порты)
+
+    /// <summary>Перестраивает список рядов нод с нуля — тот же приём, что и <see cref="SetPortRows"/>.</summary>
+    public void SetNodeRows(IReadOnlyList<LogicNode> nodes)
+    {
+        _suppressNodeEvents = true;
+        foreach (var child in _nodeList.GetChildren()) child.QueueFree();
+        _nodeRows.Clear();
+
+        for (int i = 0; i < nodes.Count; i++) AddNodeRow(nodes[i], i);
+
+        _suppressNodeEvents = false;
+    }
+
+    private void AddNodeRow(LogicNode node, int index)
+    {
+        var entry = new VBoxContainer();
+        entry.AddThemeConstantOverride("separation", 2);
+
+        var header = new HBoxContainer();
+        header.AddChild(UiStyle.MakeLabel($"Node #{index}", 12, UiStyle.TextDim));
+        int capturedIndex = index;
+        var removeButton = UiStyle.MakeButton("Remove", new Vector2(70, 24));
+        removeButton.Pressed += () => RemoveNodeRequested?.Invoke(capturedIndex);
+        header.AddChild(removeButton);
+        entry.AddChild(header);
+
+        var idRow = new HBoxContainer();
+        idRow.AddChild(UiStyle.MakeLabel("id", 11, UiStyle.TextDim));
+        var idField = new LineEdit { CustomMinimumSize = new Vector2(140, 26), Text = node.Id };
+        idField.TextSubmitted += _ => NotifyNodeChanged();
+        idField.FocusExited += () => NotifyNodeChanged();
+        BindUndoCapture(idField);
+        idRow.AddChild(idField);
+
+        var typeDropdown = MakeEnumDropdown(NodeTypeValues.Select(t => t.ToString()), Array.IndexOf(NodeTypeValues, node.Type));
+        typeDropdown.ItemSelected += _ => NotifyNodeChanged();
+        BindUndoCapture(typeDropdown);
+        idRow.AddChild(typeDropdown);
+
+        var directionDropdown = MakeEnumDropdown(DirectionValues.Select(d => d.ToString()), Array.IndexOf(DirectionValues, node.Direction));
+        directionDropdown.ItemSelected += _ => NotifyNodeChanged();
+        BindUndoCapture(directionDropdown);
+        idRow.AddChild(directionDropdown);
+        entry.AddChild(idRow);
+
+        var cellRow = new HBoxContainer();
+        cellRow.AddChild(UiStyle.MakeLabel("cell x/y/z", 11, UiStyle.TextDim));
+        var cellFields = new LineEdit[3];
+        for (int axis = 0; axis < 3; axis++)
+        {
+            var field = new LineEdit { CustomMinimumSize = new Vector2(44, 26), Text = node.Cell[axis].ToString(CultureInfo.InvariantCulture) };
+            field.TextSubmitted += _ => NotifyNodeChanged();
+            field.FocusExited += () => NotifyNodeChanged();
+            BindUndoCapture(field);
+            cellRow.AddChild(field);
+            cellFields[axis] = field;
+        }
+        entry.AddChild(cellRow);
+
+        _nodeList.AddChild(entry);
+        _nodeList.AddChild(new HSeparator());
+        _nodeRows.Add((idField, typeDropdown, directionDropdown, cellFields));
+    }
+
+    private void NotifyNodeChanged()
+    {
+        if (!_suppressNodeEvents) NodesChanged?.Invoke();
     }
 
     public void SetStatus(string message) => _status.Text = message;

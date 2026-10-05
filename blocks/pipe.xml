@@ -1,13 +1,19 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <Block id="pipe" name="Pipe">
   <Color>#3c8fa0</Color>
-  <Component type="BaseComponent">{ "mass": 5, "durability": 50, "damageResistance": 0.1 }</Component>
+  <Component type="BaseComponent">{ "mass": 5, "durability": 50, "damageResistance": 0.10000000149011612 }</Component>
   <Component type="FunctionalBlock">{
     "footprint": [1, 1, 1],
     "behavior": "Pipe",
+    "scene": "res://meshes/pipe_straight.glb",
+    "collision": [
+      { "position": [0, 0, 0], "size": [0.25, 0.25, 0.25] }
+    ],
     "ports": [
-      { "id": "fluid_in", "resource": "Fluid", "direction": "In" },
-      { "id": "fluid_out", "resource": "Fluid", "direction": "Out" }
+      { "id": "fluid_in_top", "resource": "Fluid", "direction": "In", "face": "PosY", "position": [0, 0] },
+      { "id": "fluid_out_top", "resource": "Fluid", "direction": "Out", "face": "PosY", "position": [0, 0] },
+      { "id": "fluid_in_bottom", "resource": "Fluid", "direction": "In", "face": "NegY", "position": [0, 0] },
+      { "id": "fluid_out_bottom", "resource": "Fluid", "direction": "Out", "face": "NegY", "position": [0, 0] }
     ]
   }</Component>
 </Block>
