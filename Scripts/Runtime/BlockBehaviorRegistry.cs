@@ -13,6 +13,9 @@ public static class BlockBehaviorRegistry
     private static readonly Dictionary<string, IBlockBehavior> Behaviors = new()
     {
         [ButtonBehavior.Key] = new ButtonBehavior(),
+        [ElectricMotorBehavior.Key] = new ElectricMotorBehavior(),
+        [BatteryBehavior.Key] = new BatteryBehavior(),
+        [PilotSeatBehavior.Key] = new PilotSeatBehavior(),
     };
 
     public static bool TryGet(string key, out IBlockBehavior behavior) => Behaviors.TryGetValue(key, out behavior!);

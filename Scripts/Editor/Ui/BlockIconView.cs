@@ -87,7 +87,14 @@ internal static class BlockIconView
             if (scene != null)
             {
                 var instance = scene.Instantiate<Node3D>();
-                instance.Transform = FunctionalBlockGeometry.ComputeFitTransform(aabb, Vector3.One, Vector3.Zero, Vector3I.Zero, functional.ModelScale, functional.ModelOffset);
+                // Иконка — модель в рамке блока (масштаб+якорь), равномерно уменьшенная/увеличенная так, чтобы её bbox лёг в единичный
+                // куб с центром в начале координат (как у куба-иконки), - сама камера иконки смотрит на такой куб.
+                var bounds = BlockModelLayout.BoundsInBlockFrame(aabb, functional.ModelScale, functional.Anchor);
+                var largest = Mathf.Max(bounds.Size.X, Mathf.Max(bounds.Size.Y, bounds.Size.Z));
+                float fit = largest > 1e-6 ? (float)(1.0 / largest) : 1f;
+                var center = bounds.Position + bounds.Size * 0.5f;
+                var modelTransform = BlockModelLayout.ModelTransform(aabb, functional.ModelScale, functional.Anchor);
+                instance.Transform = new Transform3D(Basis.Identity.Scaled(new Vector3(fit, fit, fit)), -center * fit) * modelTransform;
                 return instance;
             }
         }

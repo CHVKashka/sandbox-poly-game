@@ -17,6 +17,22 @@ public enum ToolMode
     None,
     Paint,
     Delete,
+
+    /// <summary>Инструмент «Nodes»: блоки полупрозрачны, видны ноды функциональных блоков, ЛКМ-перетаскиванием между нодами соединяются провода (см. <c>WireOverlay</c>).</summary>
+    Wire,
+
+    /// <summary>Инструмент «Parameters»: блоки с настройками подсвечены тёмно-фиолетовым (под курсором — голубым), клик открывает панель их параметров слева.</summary>
+    Parameters,
+}
+
+/// <summary>Слой логики в инструменте «Nodes»: вкладки показывают и соединяют только ноды своего слоя (см. <see cref="WireOverlay.LayerOf"/>).</summary>
+public enum WireLayer
+{
+    /// <summary>Электроэнергия: ноды <see cref="NodeType.Electricity"/> (жёлтые).</summary>
+    Electricity,
+
+    /// <summary>Логика: ноды <see cref="NodeType.Number"/> (зелёные) и <see cref="NodeType.Boolean"/> (красные).</summary>
+    Logic,
 }
 
 /// <summary>Общее состояние редактора; UI подписывается на <see cref="Changed"/> и перерисовывается.</summary>
@@ -29,6 +45,7 @@ public sealed class EditorState
 
     private int _selectedSlot;
     private ToolMode _tool = ToolMode.None;
+    private WireLayer _wireLayer = WireLayer.Electricity;
     private Color _paintColor = Color.FromHtml("#d94040");
     private bool _wireframe;
     private bool _borders = true;
@@ -86,6 +103,19 @@ public sealed class EditorState
         {
             if (value == _tool) return;
             _tool = value;
+            Changed?.Invoke();
+        }
+    }
+
+    /// <summary>ÐÐ°ÐºÐ¾Ð¹ ÑÐ»Ð¾Ð¹ Ð½Ð¾Ð´ Ð¿Ð¾ÐºÐ°Ð·Ð°Ð½ Ð¸ ÑÐ¾ÐµÐ´Ð¸Ð½ÑÐµÑÑÑ Ð² Ð¸Ð½ÑÑÑÑÐ¼ÐµÐ½ÑÐµ Â«NodesÂ» (Ð²ÐºÐ»Ð°Ð´ÐºÐ¸ Ð½Ð° ÑÑÐ»Ð±Ð°ÑÐµ).</summary>
+    /// <summary>Какой слой нод показан и соединяется в инструменте «Nodes» (вкладки на тулбаре).</summary>
+    public WireLayer WireLayer
+    {
+        get => _wireLayer;
+        set
+        {
+            if (value == _wireLayer) return;
+            _wireLayer = value;
             Changed?.Invoke();
         }
     }

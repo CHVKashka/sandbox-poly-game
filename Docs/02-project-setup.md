@@ -23,7 +23,7 @@
 | `edit.bat` | Сборка + открыть проект в GUI-редакторе Godot (`-e`) |
 | `test.bat` | Сборка + самотесты headless (см. [04-testing.md](04-testing.md)); код выхода 0 = всё прошло |
 | `export.bat [аргументы]` | Обёртка над `Tools\export-windows.ps1` — собирает отдельный `.exe` игры (см. ниже) |
-| `blockeditor.bat [slug]` | Сборка + дебаг-редактор функциональных блоков (`--blockeditor`, см. [05](05-world-and-vehicle-systems.md) «Дебаг-редактор блоков»); необязательный `slug` сразу открывает существующий блок, например `blockeditor.bat electric_motor` |
+| `blockeditor.bat [slug]` | Сборка + редактор функциональных блоков (`--blockeditor`, новый формат: модель с масштабом и якорем, автоматический footprint, коллизия клетками — см. [05](05-world-and-vehicle-systems.md) «Редактор блоков»); необязательный `slug` сразу открывает существующий блок, например `blockeditor.bat my_block` |
 
 ## Структура репозитория
 
@@ -33,21 +33,22 @@ sandbox-poly-game/
 ├─ sandbox-poly-game.csproj / .sln   C#-проект (Godot.NET.Sdk 4.7.2, net8.0, GodotFloat64=true)
 ├─ nuget.config             привязка пакетов Godot* к локальному источнику GodotDouble (см. ниже)
 ├─ build.bat / run.bat / edit.bat / test.bat / export.bat / blockeditor.bat   быстрый старт (см. выше)
-├─ blocks/                  data-driven описания блоков, по одному XML-файлу на блок (см. 03)
+├─ blocks/                  data-driven описания блоков, по одному XML-файлу на блок (см. 03); резиновые формы вручную, функциональные — через `blockeditor.bat`
 ├─ meshes/                  статичные глб-модели мира (верстак и т.п.) — см. 05, «Формат моделей»
 ├─ Scenes/
 │  ├─ World.tscn            главная сцена (`run/main_scene`): открытый мир — один узел со скриптом GameWorld
-│  └─ BuildEditor.tscn      редактор построек — не главная сцена, вход через верстак (`ChangeSceneToFile`, см. 05);
-│                            дев-харнесс (`--selftest`/`--demo=...`) всегда сразу передаёт сюда управление, минуя мир
+│  ├─ BuildEditor.tscn      редактор построек — не главная сцена, вход через верстак (`ChangeSceneToFile`, см. 05);
+│  │                         дев-харнесс (`--selftest`/`--demo=...`) всегда сразу передаёт сюда управление, минуя мир
+│  └─ BlockEditor.tscn      редактор функциональных блоков (`--blockeditor`, `Dev.BlockEditor`); `GameWorld` уводит на неё по аргументу
 ├─ Scripts/
-│  ├─ Blocks/                компоненты блоков (BaseComponent, BuildingBlock) и загрузчик blocks/*.xml (BlockCatalog)
+│  ├─ Blocks/                компоненты блоков (BaseComponent, BuildingBlock, FunctionalBlock), клетки коллизии (CellBox), загрузчик blocks/*.xml (BlockCatalog)
 │  ├─ Core/                 логика без сцены: сетка клеток, чанки, меширование, каркас, рейкаст, постройка (Construction),
 │  │                         именованные сохранения (ConstructionStorage), передача данных между сценами (EditorHandoff)
 │  ├─ Runtime/              рантайм функциональных блоков: поведения (IBlockBehavior, Button), состояние на экземпляр
 │  │                         (FunctionalBlockRuntime), значения нод (NodeValue) — чистая логика без сцены, см. 05
 │  ├─ Editor/               узлы и UI редактора: BuildEditor, FlyCamera, VoxelWorld, EditorState, Ui/*
 │  ├─ World/                открытый мир вне редактора: GameWorld, Player, TerrainTile, Workbench, VehicleSpawner, Ui/*
-│  └─ Dev/                  инструменты разработчика: самотесты, скриншот-харнесс, демо-постройки
+│  └─ Dev/                  инструменты разработчика: самотесты, скриншот-харнесс, демо-постройки, редактор блоков (BlockEditor/BlockEditorUi)
 ├─ Shaders/work_area_boundary.gdshader   шейдер пунктирной границы области построек
 ├─ Tools/export-windows.ps1 экспорт игры в отдельный exe (см. ниже)
 ├─ Docs/                    эта документация

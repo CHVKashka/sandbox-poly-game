@@ -17,7 +17,7 @@ namespace SandboxPolyGame.Dev;
 /// часть 2 — интеграционные проверки через имитацию реального ввода (Input.ParseInputEvent): ЛКМ/ПКМ, Tab, 1–9,
 /// колесо, WASD, СКМ, блокировка UI, панель Resize на тулбаре.
 /// </summary>
-public sealed class SelfTest
+public sealed partial class SelfTest
 {
     private static readonly ushort Block = BlockCatalog.Instance.Get("block").RuntimeId;
 
@@ -36,6 +36,11 @@ public sealed class SelfTest
         for (int i = 0; i < count; i++) await node.ToSignal(node.GetTree(), SceneTree.SignalName.ProcessFrame);
     }
 
+    public static async Task PhysicsFrames(Node node, int count)
+    {
+        for (int i = 0; i < count; i++) await node.ToSignal(node.GetTree(), SceneTree.SignalName.PhysicsFrame);
+    }
+
     public static async Task RunAsync(BuildEditor editor)
     {
         var test = new SelfTest();
@@ -50,6 +55,15 @@ public sealed class SelfTest
         test.RunNonCubeMeshingTests();
         test.RunResizeMeshingTests();
         test.RunRotationStateTests();
+        test.RunBlockModelLayoutTests();
+        test.RunParametersTests();
+        test.RunNodeWireTests();
+        test.RunPowerAndMotionTests();
+        test.RunTorqueNetworkTests();
+        test.RunPilotSeatTests();
+        test.RunRealBlocksTests();
+        test.RunCollisionCellsTests();
+        test.RunFunctionalBlockFormatTests();
         test.RunFunctionalBlockPendingSizeTests();
         test.RunFunctionalBlockGeometryTests();
         test.RunNodeAndBehaviorTests();
@@ -60,9 +74,12 @@ public sealed class SelfTest
         test.RunUndoHistoryTests();
         await test.RunNetworkingTests(editor);
         await test.RunPlayerAndWorldTests(editor);
+        await test.RunSeatInteractionTests(editor);
         await test.RunEditorTests(editor);
+        await test.RunEditorToolTests(editor);
         await test.RunPlacementConflictTests(editor);
-        await test.RunBlockPrefabEditorTests(editor);
+        await test.RunBlockEditorTests(editor);
+        await test.RunBlockEditorSchemaTests(editor);
         test.RunVehicleSpawnerCollisionTests(editor);
         test.RunFunctionalRuntimeSpawnTest(editor);
         test.RunButtonVisualTests(editor);
@@ -426,10 +443,10 @@ public sealed class SelfTest
     {
         GD.Print("-- block catalog: functional blocks (FunctionalBlockComponent, ResourceType/ResourcePort)");
 
-        // Состав функциональных блоков - пользовательские данные (их правят через --blockeditor, переименовывают, удаляют), поэтому
-        // проверяются ИНВАРИАНТЫ каждого функционального блока настоящего каталога, а не конкретные слаги/числа.
+        // blocks/ после перехода на новый формат содержит только резиновые формы (функциональные блоки создаются заново в новом редакторе
+        // блоков - это пользовательские данные), поэтому проверяются ИНВАРИАНТЫ каждого функционального блока, который там окажется
+        // (включая будущие), а не конкретные слаги/числа и не их наличие; сам формат покрыт на фикстурах (RunFunctionalBlockFormatTests).
         var functionalBlocks = catalog.All.Where(d => d.HasComponent<FunctionalBlockComponent>()).ToList();
-        Check(functionalBlocks.Count > 0, "the catalog has functional blocks", $"{functionalBlocks.Count}");
         foreach (var definition in functionalBlocks)
         {
             var fn = FunctionalOf(definition)!;
@@ -437,7 +454,13 @@ public sealed class SelfTest
             Check(fn.Footprint.X >= 1 && fn.Footprint.Y >= 1 && fn.Footprint.Z >= 1, $"'{definition.Slug}': footprint is at least 1x1x1", $"{fn.Footprint}");
             Check(FunctionalBlockComponent.FindNodeConflict(fn.Nodes) == null, $"'{definition.Slug}': no two nodes of the same type share a cell");
             Check(fn.Ports.All(p => p.Resource is ResourceType.Fluid or ResourceType.Torque), $"'{definition.Slug}': physical ports are only Fluid/Torque");
+            Check(fn.ModelScale.X > 0 && fn.ModelScale.Y > 0 && fn.ModelScale.Z > 0, $"'{definition.Slug}': model scale is positive on every axis", $"{fn.ModelScale}");
+            Check(CollisionCells.Expand(fn.CollisionBoxes).SequenceEqual(fn.CollisionCells),
+                $"'{definition.Slug}': the merged collision boxes cover exactly its collision cells (nothing lost, nothing extra)");
         }
+
+        Check(catalog.All.Count(d => d.HasComponent<BuildingBlockComponent>()) >= 4 && functionalBlocks.All(d => !d.HasComponent<BuildingBlockComponent>()),
+            "every catalog block is either a shape (BuildingBlock) or a functional block, never both");
 
         Check(!Enum.GetNames<ResourceType>().Contains("Electricity"), "ResourceType has no Electricity - only physical resources (Fluid, Torque) remain");
         // Блок "cable" удалён (2026-10-04): электричество идёт нодами логики, не физическими кабелями-блоками.
@@ -817,21 +840,20 @@ public sealed class SelfTest
         GD.Print("-- functional blocks: PendingSize is pinned to the block's fixed Footprint, Resize has no effect");
 
         var state = new EditorState();
+        // (ниже state пересоздаётся уже с фикстурным блоком в каталоге)
         Check(state.SelectedBlockSlug == "block", "setup: default hotbar slot 0 is 'block' (shape blocks sort before functional ones)", state.SelectedBlockSlug);
 
         state.SelectedSlot = 0;
         state.AdjustPendingSize(0, 4);
         Check(state.PendingSize == new Vector3I(5, 1, 1), "setup: growing a resizable block's PendingSize still works as before");
 
-        var fixedBlock = FindFunctional();
-        if (fixedBlock == null)
-        {
-            Check(false, "setup: the catalog has a functional block");
-            return;
-        }
-
+        // Функциональный блок-фикстура с нетривиальным footprint'ом (2x1x3, со смещением от корня) подставляется в каталог на время теста.
+        using var scope = UseCatalogWith(("zz_wide", "{ \"footprint\": [2,1,3], \"footprintMin\": [-1,0,0] }"));
+        state = new EditorState(); // хотбар строится из каталога при создании - пересоздаём уже с фикстурой в каталоге
+        state.SelectedSlot = 0;
+        var fixedBlock = BlockCatalog.Instance.Get("zz_wide");
         string fixedSlug = fixedBlock.Slug;
-        var fixedFootprint = FunctionalOf(fixedBlock)!.Footprint; // у блока может быть любой footprint - его правят в --blockeditor
+        var fixedFootprint = FunctionalOf(fixedBlock)!.Footprint;
 
         state.SetSlot(1, fixedSlug);
         state.SelectedSlot = 1;
@@ -853,22 +875,220 @@ public sealed class SelfTest
             "SetSlot on the CURRENTLY selected slot re-resolves PendingSize immediately, not just on the next SelectedSlot change", $"{state.PendingSize}");
     }
 
-    // ================================================================== функциональные блоки: подгонка настоящей модели под размер клетки
+    // ================================================================== новый формат блока: рамка блока, якорь, footprint, клетки коллизии
 
     /// <summary>
-    /// <see cref="FunctionalBlockGeometry"/> — общая геометрия для <c>Editor.FunctionalBlockView</c> (размещённые
-    /// мотор/вал в мире) и <c>Editor.Ui.BlockIconView</c> (их иконка в хотбаре). Чистая математика, без загрузки
-    /// настоящих .glb — <see cref="FunctionalBlockGeometry.ComputeLocalAabb"/> проверяется на синтетическом дереве
-    /// узлов (вложенный <see cref="MeshInstance3D"/> со своим трансформом), <see cref="FunctionalBlockGeometry.ComputeFitTransform"/> —
-    /// на синтетическом <see cref="Aabb"/>.
+    /// <see cref="BlockModelLayout"/> — чистая математика нового формата: масштаб по умолчанию 0.125 (2 м в Blender = 1 клетка), правило якоря
+    /// (доля bbox → та же доля клетки (0,0,0)), footprint из bbox с допуском 1% и минимумом 1×1×1. Без загрузки моделей.
+    /// </summary>
+    private void RunBlockModelLayoutTests()
+    {
+        GD.Print("-- block model layout: default scale 0.125, anchor rule, footprint from bbox (1% tolerance, min 1x1x1)");
+        const float cell = BuildSpace.CellSize;
+
+        Check(Math.Abs(BlockModelLayout.DefaultScale - 0.125f) < 1e-9 && cell == 0.25f,
+            "default model scale is 0.125 (2 m in Blender = 1 cell = 0.25 m)");
+
+        // Модель 2x2x2 ед. с началом координат в ЦЕНТРЕ (bbox -1..1), как отдаёт Blender: bbox.min встаёт в точку (0,0,0).
+        var centered = new Aabb(new Vector3(-1, -1, -1), new Vector3(2, 2, 2));
+        var byDefault = BlockModelLayout.ModelTransform(centered, BlockModelLayout.DefaultScaleVector, Vector3.Zero);
+        Check((byDefault * centered.Position).IsEqualApprox(Vector3.Zero),
+            "default anchor: the model's bbox.min lands exactly on point (0,0,0) of cell (0,0,0)", $"{byDefault * centered.Position}");
+        Check((byDefault * (centered.Position + centered.Size)).IsEqualApprox(new Vector3(cell, cell, cell)),
+            "...and its far corner on one full cell (2 m x 0.125 = 0.25 m): no auto-fit, just the explicit scale");
+
+        // Начало координат ВООБЩЕ вне модели - результат зависит только от bbox, не от того, где оно стоит в файле.
+        var offCenter = new Aabb(new Vector3(3, -2, 5), new Vector3(4, 2, 6));
+        var scale = new Vector3(0.25f, 0.5f, 0.125f);
+        Check((BlockModelLayout.ModelTransform(offCenter, scale, Vector3.Zero) * offCenter.Position).IsEqualApprox(Vector3.Zero),
+            "bbox.min goes to (0,0,0) no matter where the model's own origin was in the file");
+
+        // Правило якоря: точка bbox с долями f попадает в точку клетки (0,0,0) с теми же долями (f * CellSize).
+        bool anchorRule = true;
+        string anchorProblem = "";
+        foreach (var anchor in new[] { Vector3.Zero, new Vector3(0.5f, 0.5f, 0.5f), Vector3.One, new Vector3(1, 0, 0.5f), new Vector3(0, 1, 0), new Vector3(0.5f, 1, 0) })
+        {
+            var mapped = BlockModelLayout.ModelTransform(offCenter, scale, anchor) * (offCenter.Position + offCenter.Size * anchor);
+            if (!mapped.IsEqualApprox(anchor * cell))
+            {
+                anchorRule = false;
+                anchorProblem = $"anchor={anchor} mapped={mapped}";
+            }
+        }
+
+        Check(anchorRule, "anchor rule: the chosen bbox point (min/center/max per axis) lands on the same fraction of cell (0,0,0)", anchorProblem);
+
+        // Смена масштаба двигает модель так, что якорь остаётся на месте.
+        var anchorPick = new Vector3(1, 0.5f, 0);
+        var anchorPoint = offCenter.Position + offCenter.Size * anchorPick;
+        var beforeScale = BlockModelLayout.ModelTransform(offCenter, new Vector3(0.1f, 0.1f, 0.1f), anchorPick) * anchorPoint;
+        var afterScale = BlockModelLayout.ModelTransform(offCenter, new Vector3(0.3f, 0.05f, 0.2f), anchorPick) * anchorPoint;
+        Check(beforeScale.IsEqualApprox(afterScale), "changing the scale keeps the anchor point where it was", $"{beforeScale} vs {afterScale}");
+
+        Check(BlockModelLayout.SnapAnchorFraction(0.1) == 0f && BlockModelLayout.SnapAnchorFraction(0.5) == 0.5f && BlockModelLayout.SnapAnchorFraction(0.9) == 1f
+              && BlockModelLayout.SnapAnchorFraction(-3) == 0f && BlockModelLayout.SnapAnchorFraction(7) == 1f,
+            "anchor fractions snap to 0 / 0.5 / 1");
+
+        // Границы модели в рамке блока.
+        var oneCell = BlockModelLayout.BoundsInBlockFrame(centered, BlockModelLayout.DefaultScaleVector, Vector3.Zero);
+        Check(oneCell.Position.IsEqualApprox(Vector3.Zero) && oneCell.Size.IsEqualApprox(new Vector3(cell, cell, cell)),
+            "bounds in the block frame: a 2 m model at the default scale and anchor is exactly cell (0,0,0)", $"{oneCell}");
+        var twoCellsMax = BlockModelLayout.BoundsInBlockFrame(centered, new Vector3(0.25f, 0.125f, 0.125f), new Vector3(1, 0, 0));
+        Check(twoCellsMax.Position.IsEqualApprox(new Vector3(-cell, 0, 0)) && twoCellsMax.Size.IsEqualApprox(new Vector3(2 * cell, cell, cell)),
+            "anchor Max on X for a 2-cell model: it occupies cells -1 and 0 (the root cell is its right half)", $"{twoCellsMax}");
+
+        // Footprint: клетки, в которые попадает bbox.
+        void CheckFootprint(string name, Aabb bounds, Vector3I expectedMin, Vector3I expectedSize)
+        {
+            var (min, size) = BlockModelLayout.ComputeFootprint(bounds);
+            Check(min == expectedMin && size == expectedSize, name, $"got min={min} size={size}, expected min={expectedMin} size={expectedSize}");
+        }
+
+        CheckFootprint("footprint: a bbox of exactly one cell is 1x1x1 at (0,0,0)", oneCell, Vector3I.Zero, Vector3I.One);
+        CheckFootprint("footprint: 2x3x1 cells", new Aabb(Vector3.Zero, new Vector3(2 * cell, 3 * cell, cell)), Vector3I.Zero, new Vector3I(2, 3, 1));
+        CheckFootprint("footprint tolerance: a bbox 0.5% longer than a cell does NOT spill into the next cell (float noise)",
+            new Aabb(Vector3.Zero, new Vector3(cell * 1.005f, cell, cell)), Vector3I.Zero, Vector3I.One);
+        CheckFootprint("footprint tolerance: 2% longer than a cell DOES take the next cell",
+            new Aabb(Vector3.Zero, new Vector3(cell * 1.02f, cell, cell)), Vector3I.Zero, new Vector3I(2, 1, 1));
+        CheckFootprint("footprint tolerance on the min side: starting 0.4% of a cell before 0 does not take cell -1",
+            new Aabb(new Vector3(-cell * 0.004f, 0, 0), new Vector3(cell, cell, cell)), Vector3I.Zero, Vector3I.One);
+        CheckFootprint("...but starting 4% of a cell before 0 does take cell -1",
+            new Aabb(new Vector3(-cell * 0.04f, 0, 0), new Vector3(cell, cell, cell)), new Vector3I(-1, 0, 0), new Vector3I(2, 1, 1));
+        CheckFootprint("footprint of a model shifted into negative cells (anchor Max): min is negative",
+            twoCellsMax, new Vector3I(-1, 0, 0), new Vector3I(2, 1, 1));
+        CheckFootprint("footprint of an odd-sized model about its center: 3 cells from -1 to 1",
+            BlockModelLayout.BoundsInBlockFrame(new Aabb(new Vector3(-1.5f, -0.5f, -0.5f), new Vector3(3, 1, 1)), new Vector3(0.25f, 0.25f, 0.25f), new Vector3(0.5f, 0, 0)),
+            new Vector3I(-1, 0, 0), new Vector3I(3, 1, 1));
+        CheckFootprint("a model smaller than a cell still takes one cell (minimum 1x1x1)",
+            new Aabb(new Vector3(0.02f, 0.02f, 0.02f), new Vector3(0.05f, 0.05f, 0.05f)), Vector3I.Zero, Vector3I.One);
+        var flat = BlockModelLayout.ComputeFootprint(new Aabb(new Vector3(0, 0.1f, 0), new Vector3(cell, 0, cell)));
+        Check(flat.Size == Vector3I.One && flat.Min == Vector3I.Zero, "a flat (zero-thickness) model still takes one cell in that axis", $"{flat}");
+        var onBoundary = BlockModelLayout.ComputeFootprint(new Aabb(new Vector3(0, cell, 0), new Vector3(cell, 0, cell)));
+        Check(onBoundary.Size == Vector3I.One, "...even a zero-thickness one lying exactly on a cell boundary", $"{onBoundary}");
+        var noisy = BlockModelLayout.ComputeFootprint(new Aabb(new Vector3(1e-7f, -1e-7f, 0), new Vector3(cell + 2e-7f, cell, cell - 3e-7f)));
+        Check(noisy.Min == Vector3I.Zero && noisy.Size == Vector3I.One, "1e-7 m of float noise on every side does not move or grow the footprint", $"{noisy}");
+    }
+
+    /// <summary>
+    /// <see cref="CollisionCells"/> — клетки коллизии → минимальный набор боксов: параллелепипед даёт ОДИН бокс, несвязные группы — отдельные,
+    /// покрытие точное (ни лишней, ни потерянной клетки), результат не зависит от порядка входных клеток.
+    /// </summary>
+    private void RunCollisionCellsTests()
+    {
+        GD.Print("-- collision cells: merged into the minimal set of boxes at load (one box per parallelepiped, separate boxes for disconnected groups)");
+
+        var cuboid = CollisionCells.Merge(new CellBox(new Vector3I(-1, 0, 2), new Vector3I(3, 2, 4)).Cells());
+        Check(cuboid.Count == 1 && cuboid[0].Min == new Vector3I(-1, 0, 2) && cuboid[0].Size == new Vector3I(3, 2, 4),
+            "a 3x2x4 parallelepiped of cells (with a negative index) becomes exactly ONE box", $"{cuboid.Count} boxes: {string.Join("; ", cuboid)}");
+
+        var single = CollisionCells.Merge(new[] { new Vector3I(4, -2, 0) });
+        Check(single.Count == 1 && single[0].Size == Vector3I.One && single[0].Min == new Vector3I(4, -2, 0), "one cell is one 1x1x1 box");
+        Check(CollisionCells.Merge(Array.Empty<Vector3I>()).Count == 0, "no cells - no boxes (a block without collision stays without collision)");
+
+        var twoGroups = CollisionCells.Merge(new CellBox(Vector3I.Zero, new Vector3I(2, 1, 1)).Cells().Concat(new CellBox(new Vector3I(0, 3, 0), new Vector3I(1, 1, 2)).Cells()));
+        Check(twoGroups.Count == 2, "two disconnected groups (a gap of empty cells between them) give two separate boxes", $"{twoGroups.Count}");
+
+        var diagonal = CollisionCells.Merge(new[] { Vector3I.Zero, new Vector3I(1, 1, 0) });
+        Check(diagonal.Count == 2, "cells that only touch at an edge are not one box", $"{diagonal.Count}");
+
+        var lShape = CollisionCells.Merge(new[] { new Vector3I(0, 0, 0), new Vector3I(1, 0, 0), new Vector3I(2, 0, 0), new Vector3I(0, 1, 0) });
+        Check(lShape.Count == 2, "an L-shape of 4 cells is the minimal 2 boxes", $"{lShape.Count}");
+
+        var missingCorner = CollisionCells.Merge(new CellBox(Vector3I.Zero, new Vector3I(2, 2, 2)).Cells().Where(c => c != new Vector3I(1, 1, 1)));
+        Check(missingCorner.Count == 3, "a 2x2x2 cube with one corner missing is the minimal 3 boxes (2x2x1 + 2x1x1 + 1x1x1)", $"{missingCorner.Count}");
+
+        // Инварианты на псевдослучайных наборах: точное покрытие, непересечение, независимость от порядка, не больше боксов, чем клеток.
+        bool coverage = true, disjoint = true, orderIndependent = true, notMoreThanCells = true;
+        string problem = "";
+        uint seed = 12345;
+        uint Next() { seed = seed * 1664525u + 1013904223u; return seed >> 8; }
+        for (int round = 0; round < 40; round++)
+        {
+            var cells = new List<Vector3I>();
+            int count = 1 + (int)(Next() % 120);
+            for (int i = 0; i < count; i++) cells.Add(new Vector3I((int)(Next() % 5) - 2, (int)(Next() % 5) - 2, (int)(Next() % 5) - 2));
+
+            var boxes = CollisionCells.Merge(cells);
+            var covered = boxes.SelectMany(b => b.Cells()).ToList();
+            var expected = CollisionCells.Normalize(cells);
+            if (!CollisionCells.Normalize(covered).SequenceEqual(expected)) { coverage = false; problem = $"round {round}"; }
+            if (covered.Count != covered.Distinct().Count()) { disjoint = false; problem = $"round {round}"; }
+            if (boxes.Count > expected.Count) { notMoreThanCells = false; problem = $"round {round}"; }
+
+            var shuffled = cells.OrderBy(_ => Next()).ToList();
+            if (!CollisionCells.Merge(shuffled).SequenceEqual(boxes)) { orderIndependent = false; problem = $"round {round}"; }
+        }
+
+        Check(coverage, "40 random cell sets: the boxes cover EXACTLY the given cells (none lost, none added)", problem);
+        Check(disjoint, "...the boxes never overlap", problem);
+        Check(notMoreThanCells, "...and there are never more boxes than cells", problem);
+        Check(orderIndependent, "...and the result does not depend on the order the cells were given in", problem);
+
+        var messy = CollisionCells.Normalize(new[] { new Vector3I(1, 0, 0), new Vector3I(0, 5, 0), new Vector3I(1, 0, 0), new Vector3I(0, 0, 0) });
+        Check(messy.SequenceEqual(new[] { new Vector3I(0, 0, 0), new Vector3I(0, 5, 0), new Vector3I(1, 0, 0) }),
+            "Normalize removes duplicates and sorts by X, then Y, then Z (canonical order for the XML)", string.Join(" ", messy));
+        var overlapping = CollisionCells.Expand(new[] { new CellBox(Vector3I.Zero, new Vector3I(2, 1, 1)), new CellBox(new Vector3I(1, 0, 0), new Vector3I(2, 1, 1)) });
+        Check(overlapping.Count == 3, "Expand of two overlapping groups counts the shared cell once", $"{overlapping.Count}");
+        var box = new CellBox(new Vector3I(-1, 2, 0), new Vector3I(2, 1, 3));
+        Check(box.MinMeters.IsEqualApprox(new Vector3(-0.25f, 0.5f, 0)) && box.SizeMeters.IsEqualApprox(new Vector3(0.5f, 0.25f, 0.75f))
+              && box.CenterMeters.IsEqualApprox(new Vector3(0, 0.625f, 0.375f)) && box.CellCount == 6,
+            "CellBox converts to meters: min corner, size and center", $"{box.MinMeters} {box.SizeMeters} {box.CenterMeters}");
+    }
+
+    /// <summary>Разбор нового формата <see cref="FunctionalBlockComponent"/> (масштаб/якорь/footprint/клетки коллизии) и понятные ошибки на ключи старого.</summary>
+    private void RunFunctionalBlockFormatTests()
+    {
+        GD.Print("-- functional block format: scale/anchor/footprint/collision cells, defaults, legacy keys rejected with a clear message");
+
+        var defaults = MakeFunctional("{}");
+        Check(defaults.Footprint == Vector3I.One && defaults.FootprintMin == Vector3I.Zero && defaults.Anchor == Vector3.Zero
+              && defaults.ModelScale.IsEqualApprox(BlockModelLayout.DefaultScaleVector) && defaults.CollisionCells.Count == 0 && defaults.CollisionBoxes.Count == 0,
+            "defaults: footprint 1x1x1 at (0,0,0), anchor (0,0,0), scale 0.125 on every axis, NO collision (no automatic box)");
+
+        var full = MakeFunctional(
+            "{ \"scene\": \"res://meshes/x.glb\", \"scale\": [0.25, 0.125, 0.5], \"anchor\": [1, 0.5, 0], \"footprint\": [2, 1, 3], \"footprintMin\": [-1, 0, 0], " +
+            "\"collision\": [[1,0,0],[0,0,0],[0,0,1],[0,0,0]] }");
+        Check(full.ScenePath == "res://meshes/x.glb" && full.ModelScale.IsEqualApprox(new Vector3(0.25f, 0.125f, 0.5f)) && full.Anchor.IsEqualApprox(new Vector3(1, 0.5f, 0)),
+            "scene, per-axis scale and anchor are read as written");
+        Check(full.Footprint == new Vector3I(2, 1, 3) && full.FootprintMin == new Vector3I(-1, 0, 0), "footprint size and footprintMin (negative allowed) are read as written");
+        Check(full.CollisionCells.SequenceEqual(new[] { new Vector3I(0, 0, 0), new Vector3I(0, 0, 1), new Vector3I(1, 0, 0) }),
+            "collision cells are the source of truth: de-duplicated and kept in canonical order", string.Join(" ", full.CollisionCells));
+        Check(full.CollisionBoxes.Count == 2, "...and merged at load: an L of 3 cells is 2 boxes", $"{full.CollisionBoxes.Count}");
+
+        string Error(string json)
+        {
+            try { MakeFunctional(json); return ""; }
+            catch (Exception ex) { return ex.Message; }
+        }
+
+        Check(Error("{ \"modelScale\": [1,1,1] }").Contains("legacy") && Error("{ \"modelOffset\": [0,0,0] }").Contains("legacy"),
+            "legacy keys modelScale/modelOffset fail loudly with a message saying so (no silent mis-render)");
+        Check(Error("{ \"collision\": [ { \"position\": [0,0,0], \"size\": [0.25,0.25,0.25] } ] }").Contains("legacy"),
+            "legacy collision boxes in meters fail loudly (re-save the block in the editor)");
+        Check(Error("{ \"collision\": [[0,0]] }").Length > 0, "a collision entry that is not [x, y, z] is a data error");
+        Check(Error("{ \"footprint\": [0, 1, 1] }").Length > 0, "a footprint below 1 is a data error");
+        Check(Error("{ \"scale\": [0.125, 0, 0.125] }").Length > 0 && Error("{ \"scale\": [-1, 1, 1] }").Length > 0, "a non-positive scale is a data error");
+        var clamped = MakeFunctional("{ \"anchor\": [2, -1, 0.5] }");
+        Check(clamped.Anchor.IsEqualApprox(new Vector3(1, 0, 0.5f)), "an out-of-range anchor is clamped into 0..1", $"{clamped.Anchor}");
+
+        // Физические порты: ячейка грани — абсолютные индексы в рамке блока (см. FunctionalBlockGeometry.ComputePortAnchor).
+        var ports = MakeFunctional("{ \"ports\": [ { \"id\": \"a\", \"resource\": \"Fluid\", \"direction\": \"In\", \"face\": \"NegX\", \"position\": [-2, 3] } ] }");
+        Check(ports.Ports.Count == 1 && ports.Ports[0].Face == BlockFace.NegX && ports.Ports[0].FaceCell == new Vector2I(-2, 3),
+            "a port's face cell keeps negative indices (the block frame is rooted at cell (0,0,0))");
+    }
+
+    // ================================================================== функциональные блоки: геометрия (рамка блока, порты, ноды) и загрузка/кэш моделей
+
+    /// <summary>
+    /// <see cref="FunctionalBlockGeometry"/>: bbox вложенных узлов, размещение портов/нод на хитбоксе в рамке блока (в том числе при отрицательном
+    /// <c>FootprintMin</c>), горячая загрузка glTF и кэш сцены, который перечитывает изменённый файл.
     /// </summary>
     private void RunFunctionalBlockGeometryTests()
     {
-        GD.Print("-- functional block geometry: ComputeLocalAabb (nested transforms) + ComputeFitTransform (uniform scale/center/rotate)");
+        GD.Print("-- functional block geometry: ComputeLocalAabb (nested transforms), port/node placement in the block frame");
 
-        // ComputeLocalAabb: дочерний Node3D сдвинут на (1,0,0), внутри него MeshInstance3D с BoxMesh 2x2x2 (центрирован
-        // на СВОЁМ происхождении, как и положено BoxMesh) - итоговый AABB в пространстве root должен учитывать сдвиг
-        // ребёнка, а не просто вернуть AABB меша как есть.
+        // ComputeLocalAabb: дочерний Node3D сдвинут на (1,0,0), внутри него MeshInstance3D с BoxMesh 2x2x2 (центрирован на СВОЁМ
+        // происхождении) - итоговый AABB в пространстве root должен учитывать сдвиг ребёнка, а не просто вернуть AABB меша как есть.
         var root = new Node3D();
         var child = new Node3D { Transform = new Transform3D(Basis.Identity, new Vector3(1, 0, 0)) };
         child.AddChild(new MeshInstance3D { Mesh = new BoxMesh { Size = new Vector3(2, 2, 2) } });
@@ -880,139 +1100,175 @@ public sealed class SelfTest
             $"pos={aabb.Position} size={aabb.Size}");
         root.Free();
 
-        // ComputeFitTransform: внецентренный AABB модели 2x4x2 (центр в (2,3,2)), вписываем в клетку 0.25^3 с
-        // центром в (0.5,0.5,0.5).
-        var modelAabb = new Aabb(new Vector3(1, 1, 1), new Vector3(2, 4, 2)); // охватывает (1,1,1)..(3,5,3)
-        var targetExtent = new Vector3(0.25f, 0.25f, 0.25f);
-        var targetCenter = new Vector3(0.5f, 0.5f, 0.5f);
-        var transform = FunctionalBlockGeometry.ComputeFitTransform(modelAabb, targetExtent, targetCenter, Vector3I.Zero, Vector3.One);
-
-        var mappedCenter = transform * new Vector3(2, 3, 2);
-        Check(mappedCenter.IsEqualApprox(targetCenter),
-            "ComputeFitTransform: the model's own AABB center maps exactly onto the target center", $"{mappedCenter}");
-
-        // Масштаб РАВНОМЕРНЫЙ (минимум из трёх осей: 0.25/2, 0.25/4, 0.25/2 = 0.0625, выигрывает Y) - X/Z тоже
-        // используют 0.0625, хотя сами по себе влезли бы с 0.125 - пропорции модели не искажаются.
-        var mappedMinCorner = transform * new Vector3(1, 1, 1);
-        var expectedMinCorner = targetCenter + new Vector3(-1, -2, -1) * 0.0625f;
-        Check(mappedMinCorner.IsEqualApprox(expectedMinCorner),
-            "ComputeFitTransform: scale is uniform (the tightest axis wins) - proportions are preserved, not stretched per-axis",
-            $"got={mappedMinCorner} expected={expectedMinCorner}");
-
-        // Поворот крутится вокруг ЦЕНТРА модели (та же конвенция, что и ShapeMeshBuilder.ComposeRotation) - центр
-        // по-прежнему должен лечь точно в targetCenter, какой бы ни была сама матрица поворота.
-        var rotatedTransform = FunctionalBlockGeometry.ComputeFitTransform(modelAabb, targetExtent, targetCenter, new Vector3I(0, 1, 0), Vector3.One);
-        var rotatedCenter = rotatedTransform * new Vector3(2, 3, 2);
-        Check(rotatedCenter.IsEqualApprox(targetCenter),
-            "ComputeFitTransform: rotation pivots around the model's own center - still maps exactly onto the target center", $"{rotatedCenter}");
-
-        // extraScale (Blocks.FunctionalBlockComponent.ModelScale, "Model stretch" в --blockeditor) - поправка
-        // ПОВЕРХ равномерного масштаба, покомпонентно: (1,1,1) не меняет ничего (уже проверено выше), а, например,
-        // (2,1,1) должен ровно удвоить расстояние от центра вдоль X и оставить Y/Z как есть.
-        var stretchedTransform = FunctionalBlockGeometry.ComputeFitTransform(modelAabb, targetExtent, targetCenter, Vector3I.Zero, new Vector3(2f, 1f, 1f));
-        var stretchedMinCorner = stretchedTransform * new Vector3(1, 1, 1);
-        var expectedStretchedMinCorner = targetCenter + new Vector3(-1 * 2f, -2, -1) * 0.0625f;
-        Check(stretchedMinCorner.IsEqualApprox(expectedStretchedMinCorner),
-            "ComputeFitTransform: extraScale stretches a single axis on top of the uniform fit, independently of the others",
-            $"got={stretchedMinCorner} expected={expectedStretchedMinCorner}");
-
-        // modelOffset (Blocks.FunctionalBlockComponent.ModelOffset, "Model offset" в --blockeditor) - сдвиг в МЕТРАХ в
-        // осях неповёрнутого блока: центр модели уходит ровно на offset от центра цели, не зависит от масштаба, а при
-        // повороте блока на 90° вокруг Y поворачивается вместе с ним (+X -> -Z).
-        var offset = new Vector3(0.1f, 0f, 0f);
-        var offsetTransform = FunctionalBlockGeometry.ComputeFitTransform(modelAabb, targetExtent, targetCenter, Vector3I.Zero, Vector3.One, offset);
-        var offsetCenter = offsetTransform * new Vector3(2, 3, 2);
-        Check(offsetCenter.IsEqualApprox(targetCenter + offset),
-            "ComputeFitTransform: modelOffset shifts the model center by exactly that many meters", $"{offsetCenter}");
-        var rotatedOffsetCenter = FunctionalBlockGeometry.ComputeFitTransform(modelAabb, targetExtent, targetCenter, new Vector3I(0, 1, 0), Vector3.One, offset) * new Vector3(2, 3, 2);
-        var expectedRotatedOffset = targetCenter + ShapeMeshBuilder.ComposeRotation(new Vector3I(0, 1, 0)) * offset;
-        Check(rotatedOffsetCenter.IsEqualApprox(expectedRotatedOffset),
-            "ComputeFitTransform: modelOffset rotates together with the block", $"got={rotatedOffsetCenter} expected={expectedRotatedOffset}");
+        // Регрессия (найдена пользователем на shaft_cross): узел с ПОВОРОТОМ раздувал габарит, потому что считался AABB меша, прогнанный через
+        // поворот, а не сама геометрия - модель казалась «сжатой» внутри рамки. Круглый цилиндр (радиус 1, высота 2), повёрнутый на 45° вокруг Y:
+        // его AABB-коробка 2x2x2 после поворота даёт 2.83 по X/Z, а настоящая геометрия остаётся ~2.0.
+        var spinRoot = new Node3D();
+        var spun = new Node3D { Transform = new Transform3D(new Basis(Vector3.Up, Mathf.Pi / 4), Vector3.Zero) };
+        spun.AddChild(new MeshInstance3D { Mesh = new CylinderMesh { TopRadius = 1f, BottomRadius = 1f, Height = 2f, RadialSegments = 64 } });
+        spinRoot.AddChild(spun);
+        // Свет (тоже VisualInstance3D) с большим радиусом действия не должен входить в габарит модели.
+        spinRoot.AddChild(new OmniLight3D { OmniRange = 50f });
+        var spinAabb = FunctionalBlockGeometry.ComputeLocalAabb(spinRoot);
+        Check(Math.Abs(spinAabb.Size.X - 2.0) < 0.02 && Math.Abs(spinAabb.Size.Z - 2.0) < 0.02 && Math.Abs(spinAabb.Size.Y - 2.0) < 1e-4,
+            "ComputeLocalAabb: a rotated node does NOT inflate the bounds (measured on the real vertices, not on the rotated mesh AABB), and a light in the scene is ignored",
+            $"size={spinAabb.Size}");
+        spinRoot.Free();
 
         RunResourcePortGeometryTests();
         RunHotModelLoadTest();
     }
 
     /// <summary>
-    /// <see cref="FunctionalBlockGeometry.GetOrLoadScene"/> должен загрузить модель даже БЕЗ готового кэша импорта
-    /// (<c>res://.godot/imported/*.scn</c>) — именно это и даёт "горячую" загрузку сразу по выбору файла в
-    /// <c>Dev.BlockPrefabEditorUi.BrowseForModel</c> (по запросу пользователя), без ожидания `--import`/перезапуска.
-    /// Копируем РЕАЛЬНЫЙ `.glb` под заведомо НОВЫМ именем (ни разу не виденным движком, значит у него точно нет
-    /// `.import`-кэша) и проверяем, что <c>GD.Load</c> внутри промахнётся, а запасной путь через
-    /// <see cref="GltfDocument"/> (см. <see cref="FunctionalBlockGeometry"/> doc) всё равно вернёт настоящую модель
-    /// с ПРАВДОПОДОБНЫМ bounding box'ом (не единичный куб-заглушка на пустую/битую сцену).
+    /// <see cref="FunctionalBlockGeometry.GetOrLoadScene"/> грузит модель БЕЗ кэша импорта (<c>res://.godot/imported/*.scn</c>) напрямую через
+    /// <see cref="GltfDocument"/> — это и даёт горячую загрузку по Browse; и перечитывает файл, если он изменился (время изменения/размер) —
+    /// иначе перезагрузка после экспорта из Blender не сработала бы. Модель — самодельный .gltf с известным bbox (<see cref="WriteTestGltf"/>),
+    /// никогда не виденный движком (значит, у него точно нет `.import`-кэша), поэтому тест не зависит от ассетов в meshes/.
     /// </summary>
     private void RunHotModelLoadTest()
     {
-        GD.Print("-- hot model loading: GetOrLoadScene reads a never-imported .glb directly via GltfDocument");
+        GD.Print("-- hot model loading + scene cache: a never-imported .gltf loads directly, a changed file is re-read");
 
-        const string tempPath = "res://meshes/selftest_hotload_tmp.glb";
-        if (FileAccess.FileExists(tempPath)) DirAccess.RemoveAbsolute(tempPath);
-        var copyErr = DirAccess.CopyAbsolute("res://meshes/motor_small.glb", tempPath);
-        Check(copyErr == Error.Ok, "setup: copied motor_small.glb under a brand-new filename (no .import cache possible for it yet)", $"{copyErr}");
+        const string path = "res://meshes/selftest_hotload_tmp.gltf";
+        if (FileAccess.FileExists(path)) DirAccess.RemoveAbsolute(path);
+        FunctionalBlockGeometry.ClearSceneCache(path);
 
-        var (scene, aabb) = FunctionalBlockGeometry.GetOrLoadScene(tempPath);
-        Check(scene != null, "a never-imported .glb still loads (GltfDocument fallback, not just GD.Load)");
-        Check(aabb.Size.Length() > 0.5f, "...with a real bounding box from its actual geometry, not the empty-scene unit-cube fallback", $"{aabb.Size}");
+        Check(WriteTestGltf(path, (new Vector3(-1, -1, -1), new Vector3(1, 1, 1))), "setup: wrote a 2x2x2 box model (never imported by the engine, so no .import cache exists)");
+        var (scene, aabb) = FunctionalBlockGeometry.GetOrLoadScene(path);
+        Check(scene != null, "a never-imported model still loads (direct GltfDocument read, not only GD.Load)");
+        Check(aabb.Size.IsEqualApprox(new Vector3(2, 2, 2)), "...with its real bounding box measured from the geometry", $"{aabb.Size}");
 
-        if (FileAccess.FileExists(tempPath)) DirAccess.RemoveAbsolute(tempPath);
+        var (again, _) = FunctionalBlockGeometry.GetOrLoadScene(path);
+        Check(ReferenceEquals(scene, again), "asking again returns the cached scene, not a fresh load");
+
+        // Файл ПЕРЕЭКСПОРТИРОВАЛИ (другое содержимое и размер, в ту же секунду) - кэш должен это заметить.
+        Check(WriteTestGltf(path, (new Vector3(-1, -1, -1), new Vector3(1, 1, 1)), (new Vector3(2, -1, -1), new Vector3(4, 1, 1))), "setup: re-exported the file with a second box");
+        var (reloaded, reloadedAabb) = FunctionalBlockGeometry.GetOrLoadScene(path, forceRecheck: true);
+        Check(reloaded != null && !ReferenceEquals(reloaded, scene) && reloadedAabb.Size.IsEqualApprox(new Vector3(5, 2, 2)),
+            "a changed file is re-read: new scene instance and the new bounding box (5x2x2)", $"{reloadedAabb.Size}");
+
+        var (stable, _) = FunctionalBlockGeometry.GetOrLoadScene(path, forceRecheck: true);
+        Check(ReferenceEquals(stable, reloaded), "an unchanged file is NOT re-read on a recheck (no needless reload)");
+
+        if (FileAccess.FileExists(path)) DirAccess.RemoveAbsolute(path);
+        FunctionalBlockGeometry.ClearSceneCache(path);
+
+        // Файла ещё нет -> null (в логе ожидаемая строка ошибки); появился -> после проверки загружается.
+        var (missing, _) = FunctionalBlockGeometry.GetOrLoadScene(path);
+        Check(missing == null, "a missing file gives a null scene instead of throwing (the error is logged once; expected in this test's output)");
+        WriteTestGltf(path, (Vector3.Zero, new Vector3(1, 1, 1)));
+        var (appeared, _) = FunctionalBlockGeometry.GetOrLoadScene(path, forceRecheck: true);
+        Check(appeared != null, "once the file appears, a recheck loads it (a failed load is not cached forever)");
+
+        if (FileAccess.FileExists(path)) DirAccess.RemoveAbsolute(path);
+        FunctionalBlockGeometry.ClearSceneCache(path);
+    }
+
+    /// <summary>Пишет минимальный текстовый .gltf (данные в base64 внутри файла) из осеориентированных боксов: только позиции и индексы. Нужен тестам
+    /// вместо настоящих ассетов — bbox известен точно, а экспорт через движок в headless без рендерера не годится (у мешей нет вершинных данных).</summary>
+    private static bool WriteTestGltf(string path, params (Vector3 Min, Vector3 Max)[] boxes)
+    {
+        var bytes = new List<byte>();
+        double minX = double.MaxValue, minY = double.MaxValue, minZ = double.MaxValue, maxX = double.MinValue, maxY = double.MinValue, maxZ = double.MinValue;
+
+        foreach (var (lo, hi) in boxes)
+        {
+            for (int i = 0; i < 8; i++)
+            {
+                double x = (i & 1) != 0 ? hi.X : lo.X, y = (i & 2) != 0 ? hi.Y : lo.Y, z = (i & 4) != 0 ? hi.Z : lo.Z;
+                bytes.AddRange(BitConverter.GetBytes((float)x));
+                bytes.AddRange(BitConverter.GetBytes((float)y));
+                bytes.AddRange(BitConverter.GetBytes((float)z));
+                minX = Math.Min(minX, x); minY = Math.Min(minY, y); minZ = Math.Min(minZ, z);
+                maxX = Math.Max(maxX, x); maxY = Math.Max(maxY, y); maxZ = Math.Max(maxZ, z);
+            }
+        }
+
+        int positionBytes = bytes.Count;
+        ushort[] cube = { 0, 1, 3, 0, 3, 2, 4, 6, 7, 4, 7, 5, 0, 4, 5, 0, 5, 1, 2, 3, 7, 2, 7, 6, 0, 2, 6, 0, 6, 4, 1, 5, 7, 1, 7, 3 };
+        for (int b = 0; b < boxes.Length; b++)
+        {
+            foreach (ushort index in cube) bytes.AddRange(BitConverter.GetBytes((ushort)(b * 8 + index)));
+        }
+
+        int indexBytes = bytes.Count - positionBytes;
+        string F(double v) => ((float)v).ToString("R", System.Globalization.CultureInfo.InvariantCulture);
+        string json =
+            "{\"asset\":{\"version\":\"2.0\"},\"scene\":0,\"scenes\":[{\"nodes\":[0]}],\"nodes\":[{\"mesh\":0}]," +
+            "\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0},\"indices\":1}]}]," +
+            $"\"buffers\":[{{\"byteLength\":{bytes.Count},\"uri\":\"data:application/octet-stream;base64,{Convert.ToBase64String(bytes.ToArray())}\"}}]," +
+            $"\"bufferViews\":[{{\"buffer\":0,\"byteOffset\":0,\"byteLength\":{positionBytes},\"target\":34962}},{{\"buffer\":0,\"byteOffset\":{positionBytes},\"byteLength\":{indexBytes},\"target\":34963}}]," +
+            $"\"accessors\":[{{\"bufferView\":0,\"componentType\":5126,\"count\":{boxes.Length * 8},\"type\":\"VEC3\",\"min\":[{F(minX)},{F(minY)},{F(minZ)}],\"max\":[{F(maxX)},{F(maxY)},{F(maxZ)}]}}," +
+            $"{{\"bufferView\":1,\"componentType\":5123,\"count\":{boxes.Length * 36},\"type\":\"SCALAR\"}}]}}";
+
+        using var file = FileAccess.Open(path, FileAccess.ModeFlags.Write);
+        if (file == null) return false;
+        file.StoreString(json);
+        return true;
     }
 
     /// <summary>
-    /// <see cref="FunctionalBlockGeometry.ComputePortAnchor"/>/<see cref="FunctionalBlockGeometry.FaceDimensions"/> —
-    /// чистая математика размещения порта на стороне footprint'а, см. <see cref="ResourcePort"/> class doc: footprint
-    /// НЕ ограничен 1x1x1 (проверяем явно на 2x3x1), порт может сидеть на любой из 6 сторон в любой клетке этой
-    /// стороны, и несколько портов МОГУТ делить одну и ту же (Face, FaceCell) без ошибок/дедупликации.
+    /// <see cref="FunctionalBlockGeometry.ComputePortAnchor"/>/<see cref="FunctionalBlockGeometry.ComputeNodeAnchor"/>/<see cref="FunctionalBlockGeometry.FaceDimensions"/> —
+    /// чистая математика размещения порта на стороне footprint'а и ноды в клетке, в рамке блока (корневая клетка (0,0,0), индексы могут быть
+    /// отрицательными): footprint НЕ ограничен 1x1x1 (проверяем явно на 2x3x1 со смещением от корня), порт может сидеть на любой из 6 сторон в
+    /// любой клетке этой стороны, несколько портов МОГУТ делить одну и ту же (Face, FaceCell).
     /// </summary>
     private void RunResourcePortGeometryTests()
     {
-        GD.Print("-- resource port placement: ComputePortAnchor/FaceDimensions for non-cubic footprints");
+        GD.Print("-- resource port / node placement in the block frame (non-cubic footprint with a negative min)");
 
-        var footprint = new Vector3I(2, 3, 1); // не кубический - X и Y разного размера, Z = 1 (плоский)
+        var footprint = new Vector3I(2, 3, 1);
+        var min = new Vector3I(-1, 0, 0); // корневая клетка (0,0,0) - правая из двух по X
         const float cell = BuildSpace.CellSize;
 
-        // FaceDimensions: ±X используют (Y,Z) footprint'а, ±Y используют (X,Z), ±Z используют (X,Y).
         Check(FunctionalBlockGeometry.FaceDimensions(BlockFace.PosX, footprint) == (3, 1), "FaceDimensions: ±X face uses (footprint.Y, footprint.Z)");
         Check(FunctionalBlockGeometry.FaceDimensions(BlockFace.PosY, footprint) == (2, 1), "FaceDimensions: ±Y face uses (footprint.X, footprint.Z)");
         Check(FunctionalBlockGeometry.FaceDimensions(BlockFace.PosZ, footprint) == (2, 3), "FaceDimensions: ±Z face uses (footprint.X, footprint.Y)");
+        Check(FunctionalBlockGeometry.FaceAxes(BlockFace.NegX) == (1, 2) && FunctionalBlockGeometry.FaceAxes(BlockFace.PosY) == (0, 2) && FunctionalBlockGeometry.FaceAxes(BlockFace.NegZ) == (0, 1),
+            "FaceAxes: ±X -> (Y,Z), ±Y -> (X,Z), ±Z -> (X,Y)");
 
-        // ComputePortAnchor: клетка (0,0) на PosZ (передняя грань, X/Y-сетка) - центр первой клетки, на самой
-        // плоскости z=footprint.Z (в метрах), нормаль наружу (0,0,1).
-        var (posZOrigin, posZNormal) = FunctionalBlockGeometry.ComputePortAnchor(BlockFace.PosZ, Vector2I.Zero, footprint, cell);
-        Check(posZOrigin.IsEqualApprox(new Vector3(cell * 0.5f, cell * 0.5f, cell * footprint.Z)) && posZNormal.IsEqualApprox(new Vector3(0, 0, 1)),
-            "ComputePortAnchor: PosZ face, cell (0,0) sits at the center of the first X/Y cell, on the z=footprint.Z plane, normal (0,0,1)",
-            $"pos={posZOrigin} normal={posZNormal}");
+        // PosZ (передняя грань, X/Y-сетка): клетка (-1,0) - ПЕРВАЯ клетка footprint'а (индексы абсолютные), на плоскости z = (0+1)*cell.
+        var (posZ, posZNormal) = FunctionalBlockGeometry.ComputePortAnchor(BlockFace.PosZ, new Vector2I(-1, 0), min, footprint, cell);
+        Check(posZ.IsEqualApprox(new Vector3(-0.5f * cell, 0.5f * cell, cell)) && posZNormal.IsEqualApprox(new Vector3(0, 0, 1)),
+            "ComputePortAnchor: PosZ face, cell (-1,0) is the center of the first X/Y cell of a footprint starting at x=-1, on the z=footprint end plane",
+            $"pos={posZ} normal={posZNormal}");
 
-        // Последняя клетка на NegX (боковая грань, Y/Z-сетка размером 3x1) - cell (2,0), на плоскости x=0.
-        var (negXOrigin, negXNormal) = FunctionalBlockGeometry.ComputePortAnchor(BlockFace.NegX, new Vector2I(2, 0), footprint, cell);
-        Check(negXOrigin.IsEqualApprox(new Vector3(0, cell * 2.5f, cell * 0.5f)) && negXNormal.IsEqualApprox(new Vector3(-1, 0, 0)),
-            "ComputePortAnchor: NegX face, last Y cell (index 2 of 3) sits on the x=0 plane, normal (-1,0,0)",
-            $"pos={negXOrigin} normal={negXNormal}");
+        // Корневая клетка (0,0) на той же грани - вторая клетка по X.
+        var (posZRoot, _) = FunctionalBlockGeometry.ComputePortAnchor(BlockFace.PosZ, Vector2I.Zero, min, footprint, cell);
+        Check(posZRoot.IsEqualApprox(new Vector3(0.5f * cell, 0.5f * cell, cell)), "...and cell (0,0) is the root cell's center (the second cell along X)", $"{posZRoot}");
 
-        // Клетка за пределами реальной сетки грани (PosY грань тут только 2x1, индекс 5 не существует) клампится в
-        // границы, а не кидает исключение/вылетает за пределы footprint'а - позиция, а не сами данные, см. doc.
-        var (clampedOrigin, _) = FunctionalBlockGeometry.ComputePortAnchor(BlockFace.PosY, new Vector2I(5, 0), footprint, cell);
-        var (lastValidOrigin, _) = FunctionalBlockGeometry.ComputePortAnchor(BlockFace.PosY, new Vector2I(1, 0), footprint, cell);
-        Check(clampedOrigin.IsEqualApprox(lastValidOrigin),
-            "ComputePortAnchor: an out-of-range face cell clamps to the face's actual last cell instead of extrapolating past it",
-            $"clamped={clampedOrigin} lastValid={lastValidOrigin}");
+        // NegX (боковая грань, Y/Z-сетка 3x1): клетка (2,0) - последняя по Y, на плоскости x = min.x*cell = -cell.
+        var (negX, negXNormal) = FunctionalBlockGeometry.ComputePortAnchor(BlockFace.NegX, new Vector2I(2, 0), min, footprint, cell);
+        Check(negX.IsEqualApprox(new Vector3(-cell, 2.5f * cell, 0.5f * cell)) && negXNormal.IsEqualApprox(new Vector3(-1, 0, 0)),
+            "ComputePortAnchor: NegX face sits on the x=min plane, normal (-1,0,0)", $"pos={negX} normal={negXNormal}");
+        var (posX, posXNormal) = FunctionalBlockGeometry.ComputePortAnchor(BlockFace.PosX, new Vector2I(0, 0), min, footprint, cell);
+        Check(posX.IsEqualApprox(new Vector3(cell, 0.5f * cell, 0.5f * cell)) && posXNormal.IsEqualApprox(new Vector3(1, 0, 0)),
+            "ComputePortAnchor: PosX face sits on the x=min+size plane (the far side of the footprint), normal (1,0,0)", $"pos={posX}");
 
-        // Несколько портов делят одну и ту же (Face, FaceCell) - не ошибка, просто одна и та же точка дважды.
-        var portA = new ResourcePort { Id = "a", Resource = ResourceType.Torque, Direction = PortDirection.In, Face = BlockFace.PosZ, FaceCell = new Vector2I(1, 1) };
-        var portB = new ResourcePort { Id = "b", Resource = ResourceType.Fluid, Direction = PortDirection.Out, Face = BlockFace.PosZ, FaceCell = new Vector2I(1, 1) };
-        var (anchorA, _) = FunctionalBlockGeometry.ComputePortAnchor(portA.Face, portA.FaceCell, footprint, cell);
-        var (anchorB, _) = FunctionalBlockGeometry.ComputePortAnchor(portB.Face, portB.FaceCell, footprint, cell);
+        // Ячейка за пределами сетки грани клампится в границы footprint'а, а не вылетает за него.
+        var (clamped, _) = FunctionalBlockGeometry.ComputePortAnchor(BlockFace.PosY, new Vector2I(5, 0), min, footprint, cell);
+        var (lastValid, _) = FunctionalBlockGeometry.ComputePortAnchor(BlockFace.PosY, new Vector2I(0, 0), min, footprint, cell);
+        Check(clamped.IsEqualApprox(lastValid), "an out-of-range face cell clamps to the face's actual last cell instead of extrapolating past it", $"clamped={clamped} lastValid={lastValid}");
+        var (clampedLow, _) = FunctionalBlockGeometry.ComputePortAnchor(BlockFace.PosY, new Vector2I(-9, 0), min, footprint, cell);
+        var (firstValid, _) = FunctionalBlockGeometry.ComputePortAnchor(BlockFace.PosY, new Vector2I(-1, 0), min, footprint, cell);
+        Check(clampedLow.IsEqualApprox(firstValid), "...and below the first cell clamps to the first cell");
+
+        // Несколько портов в одной (Face, FaceCell) - одна и та же точка, не ошибка.
+        var portA = new ResourcePort { Id = "a", Resource = ResourceType.Torque, Direction = PortDirection.In, Face = BlockFace.PosZ, FaceCell = new Vector2I(0, 1) };
+        var portB = new ResourcePort { Id = "b", Resource = ResourceType.Fluid, Direction = PortDirection.Out, Face = BlockFace.PosZ, FaceCell = new Vector2I(0, 1) };
+        var (anchorA, _) = FunctionalBlockGeometry.ComputePortAnchor(portA.Face, portA.FaceCell, min, footprint, cell);
+        var (anchorB, _) = FunctionalBlockGeometry.ComputePortAnchor(portB.Face, portB.FaceCell, min, footprint, cell);
         Check(anchorA.IsEqualApprox(anchorB), "two ports sharing the same (Face, FaceCell) resolve to the exact same point - allowed, not an error");
 
-        // Ноды: ЦЕНТР своей клетки внутри блока (не на грани), клетка вне footprint'а клампится к ближайшей.
-        Check(FunctionalBlockGeometry.ComputeNodeAnchor(Vector3I.Zero, footprint, cell).IsEqualApprox(new Vector3(0.5f, 0.5f, 0.5f) * cell),
-            "ComputeNodeAnchor: cell (0,0,0) is the CENTER of the first cell (half a cell in from the block's min corner on every axis)");
-        Check(FunctionalBlockGeometry.ComputeNodeAnchor(new Vector3I(1, 2, 0), footprint, cell).IsEqualApprox(new Vector3(1.5f, 2.5f, 0.5f) * cell),
-            "ComputeNodeAnchor: a node in another cell of a multi-cell footprint sits in the center of THAT cell");
-        Check(FunctionalBlockGeometry.ComputeNodeAnchor(new Vector3I(9, -4, 5), footprint, cell).IsEqualApprox(new Vector3(1.5f, 0.5f, 0.5f) * cell),
+        // Ноды: ЦЕНТР своей клетки (абсолютный индекс в рамке блока), клетка вне footprint'а клампится к ближайшей.
+        Check(FunctionalBlockGeometry.ComputeNodeAnchor(Vector3I.Zero, min, footprint, cell).IsEqualApprox(new Vector3(0.5f, 0.5f, 0.5f) * cell),
+            "ComputeNodeAnchor: cell (0,0,0) is the CENTER of the root cell, wherever the footprint starts");
+        Check(FunctionalBlockGeometry.ComputeNodeAnchor(new Vector3I(-1, 2, 0), min, footprint, cell).IsEqualApprox(new Vector3(-0.5f, 2.5f, 0.5f) * cell),
+            "ComputeNodeAnchor: a node in a negative cell sits in the center of THAT cell");
+        Check(FunctionalBlockGeometry.ComputeNodeAnchor(new Vector3I(9, -4, 5), min, footprint, cell).IsEqualApprox(new Vector3(0.5f, 0.5f, 0.5f) * cell),
             "ComputeNodeAnchor: a cell outside the footprint clamps to the nearest real cell (stored data is untouched)");
-        var singleCellCenter = FunctionalBlockGeometry.ComputeNodeAnchor(Vector3I.Zero, Vector3I.One, cell);
-        Check(singleCellCenter.IsEqualApprox(new Vector3(cell, cell, cell) * 0.5f), "...and in a 1x1x1 block the node is the exact center of the block");
+        Check(FunctionalBlockGeometry.ComputeNodeAnchor(Vector3I.Zero, Vector3I.Zero, Vector3I.One, cell).IsEqualApprox(new Vector3(cell, cell, cell) * 0.5f),
+            "...and in a 1x1x1 block the node is the exact center of the block");
     }
 
     // ================================================================== точечная покраска наклонных/треугольных граней
@@ -1454,7 +1710,13 @@ public sealed class SelfTest
         // Хост - единственный подключённый peer, поэтому оба запроса идут от его же LocalPeerId, но сервер всё равно
         // не делит их на одну сессию (ключ строится из счётчика, не только из имени верстака).
         var readySessionKeys = new List<string>();
-        void CaptureSessionReady(string sessionKey, string workbenchName, string json) => readySessionKeys.Add(sessionKey);
+        var readySessionJson = new List<string>();
+        void CaptureSessionReady(string sessionKey, string workbenchName, string json)
+        {
+            readySessionKeys.Add(sessionKey);
+            readySessionJson.Add(json);
+        }
+
         NetHub.Instance.SessionReadyForMe += CaptureSessionReady;
 
         const string benchName = "WorkbenchLarge";
@@ -1466,6 +1728,8 @@ public sealed class SelfTest
         Check(readySessionKeys.Count == 2 && readySessionKeys[0] != readySessionKeys[1],
             "two Create-vehicle requests on the SAME workbench both succeed, with two distinct session keys (no more 'one session per workbench' limit)",
             $"keys=[{string.Join(", ", readySessionKeys)}]");
+
+        if (readySessionKeys.Count == 2) await RunNetworkedLogicEditTest(host, readySessionKeys[0], readySessionJson[0]);
 
         // Баг, найденный пользователем: раньше "есть активная сессия" рассылалось ОДИН раз (broadcast) в момент
         // открытия сессии - кто узнал об этом ПОЗЖЕ (например, подключился к сети уже после), никогда не видел,
@@ -1546,6 +1810,8 @@ public sealed class SelfTest
         Check(firstPlayerNode != null && firstPlayerNode.Camera.Current,
             "...and the player's camera is re-activated as current (the editor's own camera would have taken over and then been freed with its scene)");
 
+        await RunNetworkedVehicleTests(host, world2);
+
         world2.QueueFree();
         await Frames(host, 1);
         host.EditorCamera.Current = true; // тестовый мир выше забрал "текущую" камеру вьюпорта - вернуть редакторскую
@@ -1558,6 +1824,113 @@ public sealed class SelfTest
         var rehostErr = NetHub.Instance.Host(37999);
         Check(rehostErr == Error.Ok, "hosting again on the same port right after Disconnect() succeeds - the previous ENet peer released the port (Disconnect calls Close(), not just clears the reference)");
         NetHub.Instance.Disconnect();
+    }
+
+    /// <summary>
+    /// Параметры блоков и провода между нодами идут по сети тем же путём, что и обычные правки: настоящий круг <see cref="NetHub"/> (запрос → сервер применяет → рассылает → у участника
+    /// правка применяется к его зеркалу). «Участник» здесь — зеркало, собранное ТОЛЬКО из того, что пришло по сети (начальный снимок сессии + события), а позднее подключившийся —
+    /// ещё одна постройка из снимка, который сервер отдаёт при входе. Они должны совпасть с серверной постройкой до последнего байта сохранения.
+    /// </summary>
+    private async Task RunNetworkedLogicEditTest(BuildEditor host, string key, string initialJson)
+    {
+        GD.Print("-- networking: block parameters and wires travel through NetHub to every participant (no desync)");
+
+        var mirror = new Construction(new VoxelGrid());
+        ConstructionIO.Deserialize(mirror, initialJson, BlockCatalog.Instance);
+        int applied = 0;
+        void OnApplied(string sessionKey, NetEditKind kind, Vector3I cell, Vector3I size, string slug, Color color, Vector3I rotation, Vector3I mirrorAxes, int extraInt, bool extraBool)
+        {
+            if (sessionKey != key) return;
+            applied++;
+            NetEditOps.Apply(mirror, kind, cell, size, slug, color, rotation, mirrorAxes, extraInt, extraBool);
+        }
+
+        UndoHistory.Snapshot? lastSync = null;
+        void OnSynced(string sessionKey, UndoHistory.Snapshot snapshot)
+        {
+            if (sessionKey != key) return;
+            lastSync = snapshot;
+            UndoHistory.Restore(mirror, BlockCatalog.Instance, snapshot);
+        }
+
+        NetHub.Instance.EditApplied += OnApplied;
+        NetHub.Instance.SessionSynced += OnSynced;
+
+        void Place(string slug, Vector3I cell)
+        {
+            var fn = BlockCatalog.Instance.Get(slug).GetComponent<FunctionalBlockComponent>()!;
+            var (origin, size) = BlockFootprint.PlaceBox(cell, fn.FootprintMin, fn.Footprint, Vector3I.Zero);
+            NetHub.Instance.RequestEdit(key, NetEditKind.Place, origin, size, slug, Colors.White, Vector3I.Zero, Vector3I.Zero);
+        }
+
+        void Wire(NetEditKind kind, BlockInstance from, BlockInstance to, string fromNode, string toNode) =>
+            NetHub.Instance.RequestEdit(key, kind, from.Origin, to.Origin, NetEditOps.EncodeNodes(fromNode, toNode), Colors.White, Vector3I.Zero, Vector3I.Zero);
+
+        void SetParameter(BlockInstance block, string id, string value) =>
+            NetHub.Instance.RequestEdit(key, NetEditKind.SetParameter, block.Origin, Vector3I.One, NetEditOps.EncodeParameter(id, value), Colors.White, Vector3I.Zero, Vector3I.Zero);
+
+        BlockInstance? Motor() => mirror.Instances.FirstOrDefault(i => i.BlockSlug == "electric_motor_small");
+
+        Place("battery_small", new Vector3I(1, 0, 0));
+        Place("electric_motor_small", new Vector3I(3, 0, 0));
+        await Frames(host, 1);
+        var battery = mirror.Instances.FirstOrDefault(i => i.BlockSlug == "battery_small");
+        var motor = Motor();
+        Check(battery != null && motor != null, "(setup) the placed logic blocks reach the participant's mirror through the network round trip");
+        if (battery == null || motor == null)
+        {
+            NetHub.Instance.EditApplied -= OnApplied;
+            NetHub.Instance.SessionSynced -= OnSynced;
+            return;
+        }
+
+        Wire(NetEditKind.Connect, battery, motor, "electricity_out", "electricity");
+        Wire(NetEditKind.Connect, battery, motor, "charge_level", "Signal");
+        SetParameter(motor, "maxRpm", "900");
+        await Frames(host, 1);
+        Check(mirror.Wires.Count == 2, "both wires arrive at the participant", $"{mirror.Wires.Count}");
+        Check(Motor()!.Parameters is { } arrived && arrived.GetValueOrDefault("maxRpm") == "900", "the parameter value arrives at the participant");
+
+        int appliedBefore = applied;
+        Wire(NetEditKind.Connect, battery, motor, "electricity_out", "electricity");
+        SetParameter(motor, "maxRpm", "turbo");
+        await Frames(host, 1);
+        Check(applied == appliedBefore && mirror.Wires.Count == 2, "a refused edit (duplicate wire, non-numeric parameter) is not broadcast, so nobody diverges");
+
+        // Undo/Redo - снимок целиком: провода и параметры должны вернуться вместе с блоками.
+        NetHub.Instance.RequestUndo(key);
+        await Frames(host, 1);
+        Check(lastSync != null && Motor()!.Parameters == null && mirror.Wires.Count == 2, "Undo is synchronised as a snapshot: the parameter is rolled back on the participant, the wires stay");
+        NetHub.Instance.RequestRedo(key);
+        await Frames(host, 1);
+        Check(Motor()!.Parameters is { } redone && redone.GetValueOrDefault("maxRpm") == "900" && mirror.Wires.Count == 2, "Redo brings the parameter back on the participant");
+
+        Wire(NetEditKind.Disconnect, battery, motor, "charge_level", "Signal");
+        await Frames(host, 1);
+        Check(mirror.Wires.Count == 1, "a disconnect arrives at the participant");
+
+        // Состояние сервера = результат Undo -> Redo (снимок целиком), оно же уходит позднее подключившимся: оба обязаны совпасть с зеркалом.
+        NetHub.Instance.RequestUndo(key);
+        await Frames(host, 1);
+        NetHub.Instance.RequestRedo(key);
+        await Frames(host, 1);
+        var lateJoiner = new Construction(new VoxelGrid());
+        if (lastSync != null) ConstructionIO.Deserialize(lateJoiner, lastSync.Value.Json, BlockCatalog.Instance);
+        // Порядок блоков в списке у загруженных разными путями построек может отличаться (не часть постройки) - сравниваем содержимое: блоки с параметрами и провода между ними.
+        static string Canonical(Construction c)
+        {
+            string Key(int instanceId) { var i = c.GetInstance(instanceId)!; return $"{i.BlockSlug}@{i.Origin}"; }
+            var blocks = c.Instances.Select(i => $"{Key(i.InstanceId)} rot={i.RotationSteps} size={i.Size} params=[{string.Join(",", (i.Parameters ?? new()).OrderBy(p => p.Key).Select(p => p.Key + "=" + p.Value))}]");
+            var wires = c.Wires.Select(w => $"{Key(w.FromInstance)}.{w.FromNode}->{Key(w.ToInstance)}.{w.ToNode}");
+            return string.Join("\n", blocks.OrderBy(b => b, StringComparer.Ordinal)) + "\n--\n" + string.Join("\n", wires.OrderBy(w => w, StringComparer.Ordinal));
+        }
+
+        Check(lastSync != null && Canonical(mirror) == Canonical(lateJoiner), "a late joiner's snapshot is identical to the participant's construction (blocks, wires and parameters)", $"{Canonical(mirror)} || {Canonical(lateJoiner)}");
+        Check(lateJoiner.Wires.Count == 1 && lateJoiner.Instances.First(i => i.BlockSlug == "electric_motor_small").Parameters is { } late && late.GetValueOrDefault("maxRpm") == "900",
+            "...and it carries the wires and parameter values themselves");
+
+        NetHub.Instance.EditApplied -= OnApplied;
+        NetHub.Instance.SessionSynced -= OnSynced;
     }
 
     private void RunNetEditOpsTests()
@@ -2282,22 +2655,38 @@ public sealed class SelfTest
         // (_ghostModel, см. UpdateGhostModel) с настоящей моделью, а не куб/ничего.
         // Слот 6 к этому моменту теста уже мог быть переопределён более ранними проверками (например, кликом по
         // карточке "Wedge" в списке блоков) - выставляем содержимое явно, не полагаясь на дефолтное заполнение хотбара.
-        // Берётся любой функциональный блок каталога, чья модель реально загружается (состав блоков - пользовательские данные).
-        var modelBlock = FindFunctional(ModelLoads);
-        if (modelBlock != null)
+        // Блок-фикстура с настоящей моделью (самодельный .gltf 2x2x2, масштаб 0.25 по X, якорь Max по X -> 2 клетки по X, footprint начинается с клетки -1)
+        // подставляется в каталог на время проверки (в настоящем blocks/ функциональных блоков больше нет).
+        const string ghostModelPath = "res://meshes/selftest_ghost_model.gltf";
+        WriteTestGltf(ghostModelPath, (new Vector3(-1, -1, -1), new Vector3(1, 1, 1)));
+        FunctionalBlockGeometry.ClearSceneCache(ghostModelPath);
+        string slot6Before = state.GetSlot(6);
+        using (UseCatalogWith(("zz_ghost",
+                   $"{{ \"scene\": \"{ghostModelPath}\", \"scale\": [0.25, 0.125, 0.125], \"anchor\": [1, 0, 0], \"footprint\": [2,1,1], \"footprintMin\": [-1,0,0] }}")))
         {
-            string modelSlug = modelBlock.Slug;
+            const string modelSlug = "zz_ghost";
             state.SelectedSlot = 6;
             state.SetSlot(6, modelSlug);
             Check(state.SelectedBlockSlug == modelSlug, $"setup: hotbar slot 6 now holds '{modelSlug}'", state.SelectedBlockSlug);
+            Check(state.PendingSize == new Vector3I(2, 1, 1), "selecting it pins PendingSize to its footprint (2x1x1)", $"{state.PendingSize}");
             await Move(editor, ground);
             Check(!editor.Ghost.Visible, $"'{modelSlug}' ghost: the cube/shape ghost (editor.Ghost) is hidden - a real model is shown instead");
             Check(editor.GhostModelVisible, $"'{modelSlug}' ghost: the model ghost IS visible over empty ground", $"{editor.GhostModelVisible}");
+
+            // Блок с отрицательным footprintMin занимает клетки НЕ от корня вправо, а от корня-1: ЛКМ ставит его ровно в PlaceBox().
+            var root = editor.Hover.PlaceCell;
+            var expectedBox = BlockFootprint.PlaceBox(root, new Vector3I(-1, 0, 0), new Vector3I(2, 1, 1), state.PendingRotationSteps);
+            await Click(editor, ground, MouseButton.Left);
+            var placed = editor.World.Construction.Instances.FirstOrDefault(i => i.BlockSlug == modelSlug);
+            Check(placed != null && placed.Origin == expectedBox.Origin && placed.Size == expectedBox.Size && expectedBox.Origin.X == root.X - 1,
+                "LMB places a block whose footprint starts one cell left of the root exactly into PlaceBox(root, footprintMin, footprint, rotation)",
+                placed == null ? "nothing placed" : $"origin={placed.Origin} size={placed.Size} expected origin={expectedBox.Origin} size={expectedBox.Size}");
+            editor.World.Construction.Clear();
+            state.SetSlot(6, slot6Before);
         }
-        else
-        {
-            Check(true, "ghost-model checks skipped: no functional block with a loadable model in the catalog right now");
-        }
+
+        if (FileAccess.FileExists(ghostModelPath)) DirAccess.RemoveAbsolute(ghostModelPath);
+        FunctionalBlockGeometry.ClearSceneCache(ghostModelPath);
 
         state.SelectedSlot = 3; // wedge - обратно на куб/форму, проверить, что призрак модели прячется обратно
         // PendingSize - одно общее значение на весь редактор: выбор функционального блока с footprint'ом больше 1x1x1 оставил его
@@ -2542,245 +2931,399 @@ public sealed class SelfTest
         editor.World.RebuildDirty();
     }
 
-    // ================================================================== дебаг-редактор блоков (--blockeditor)
+    // ================================================================== редактор блоков (--blockeditor)
 
     /// <summary>
-    /// <see cref="Dev.BlockPrefabEditor"/> — отдельный инструмент (не <see cref="Editor.BuildEditor"/>), поэтому
-    /// добавляется как временный ребёнок уже загруженного <paramref name="editor"/> (та же техника, что и у других
-    /// интеграционных тестов, собирающих свой узел поверх дерева <c>BuildEditor</c> — сцена не обязана быть главной,
-    /// чтобы её можно было собрать и проверить). Главный риск этого инструмента — сериализация в/из XML (UI-часть
-    /// глазами не проверить без живого дисплея), поэтому тест целится именно в неё: загрузка реального
-    /// функционального блока из каталога + полный цикл запись→чтение с диска для нового.
+    /// <see cref="Dev.BlockEditor"/> — отдельный инструмент (не <see cref="Editor.BuildEditor"/>), поэтому добавляется как временный ребёнок уже
+    /// загруженного <paramref name="editor"/> (сцена не обязана быть главной, чтобы её можно было собрать и проверить). Блоки пишутся не в настоящий
+    /// <c>blocks/</c>, а во временную папку (<see cref="BlockEditor.BlocksDirectory"/>); модель — самодельный .gltf с известным bbox.
+    /// Проверяется то, что глазами без живого дисплея не увидеть: размещение модели (масштаб/якорь/footprint), выбор якоря и стрелок масштаба по
+    /// экранным координатам, клетки коллизии → боксы, полный цикл запись→чтение XML, отказ сохранять битое, Undo/Redo, Browse, перезагрузка файла.
     /// </summary>
-    private async Task RunBlockPrefabEditorTests(BuildEditor editor)
+    private async Task RunBlockEditorTests(BuildEditor editor)
     {
-        GD.Print("-- block prefab editor (--blockeditor): load existing + new/save/reload round-trip");
+        GD.Print("-- block editor (--blockeditor): model placement, anchor/scale picking, collision cells, XML round-trip, undo, hot reload");
 
-        var tool = new BlockPrefabEditor();
+        const string modelPath = "res://meshes/selftest_blockeditor_model.gltf";
+        const string dir = "user://selftest_blockeditor";
+        const float cell = BuildSpace.CellSize;
+        DirAccess.MakeDirRecursiveAbsolute(dir);
+        foreach (string leftover in new[] { "selftest_editor_block", "selftest_editor_plain", "selftest_editor_legacy", "selftest_editor_missing" })
+        {
+            if (FileAccess.FileExists($"{dir}/{leftover}.xml")) DirAccess.RemoveAbsolute($"{dir}/{leftover}.xml");
+        }
+
+        // 2x2x2 ед. с началом координат в ЦЕНТРЕ модели (bbox -1..1), как отдаёт Blender.
+        WriteTestGltf(modelPath, (new Vector3(-1, -1, -1), new Vector3(1, 1, 1)));
+        FunctionalBlockGeometry.ClearSceneCache(modelPath);
+
+        var tool = new BlockEditor { BlocksDirectory = dir };
         editor.AddChild(tool);
         await Frames(editor, 2);
 
-        // Загрузка существующего функционального блока - поля редактора должны совпасть с тем, что прочитал каталог. Какой именно
-        // блок - не важно (их состав пользователь меняет сам), берём первый подходящий.
-        var referenceBlock = FindFunctional(f => f.Ports.Count > 0 || f.Nodes.Count > 0) ?? FindFunctional();
-        if (referenceBlock != null)
+        // ---- размещение модели: bbox.min в (0,0,0), масштаб по умолчанию 0.125, footprint автоматически
+        tool.ResetToDefaults("selftest_editor_block");
+        Check(!tool.HasModel && tool.FootprintSize == Vector3I.One && tool.FootprintMin == Vector3I.Zero,
+            "a new block without a model: no model, footprint 1x1x1 at (0,0,0)");
+
+        tool.Ui.ApplyChosenModelPath(ProjectSettings.GlobalizePath(modelPath));
+        Check(tool.Ui.ScenePath == modelPath, "Browse: a file already inside the project is used in place, as a res:// path", tool.Ui.ScenePath);
+        Check(tool.HasModel && tool.Ui.ModelScale.IsEqualApprox(BlockModelLayout.DefaultScaleVector),
+            "the model shows up right after choosing it (hot load, no import), at the default scale 0.125", $"{tool.Ui.ModelScale}");
+        Check(tool.Bounds.Position.IsEqualApprox(Vector3.Zero) && tool.Bounds.Size.IsEqualApprox(new Vector3(cell, cell, cell)),
+            "the purple frame: bbox.min at (0,0,0), a 2 m model is exactly one cell at scale 0.125", $"{tool.Bounds}");
+        Check(tool.FootprintMin == Vector3I.Zero && tool.FootprintSize == Vector3I.One, "footprint is computed from the bbox automatically: 1x1x1", $"{tool.FootprintSize}");
+
+        // ---- масштаб по осям -> footprint
+        tool.Ui.SetModelScale(new Vector3(0.375f, 0.125f, 0.25f));
+        tool.RefreshPreview();
+        Check(tool.FootprintSize == new Vector3I(3, 1, 2) && tool.FootprintMin == Vector3I.Zero,
+            "per-axis scale (0.375, 0.125, 0.25) -> a 0.75 x 0.25 x 0.5 m bbox -> footprint 3x1x2", $"{tool.FootprintSize}");
+        tool.Ui.SetModelScale(new Vector3(0.1256f, 0.125f, 0.125f));
+        tool.RefreshPreview();
+        Check(tool.FootprintSize == Vector3I.One, "a bbox 0.5% over one cell still gives 1 cell (1% tolerance - float noise must not paint the neighbor)", $"{tool.FootprintSize}");
+        tool.Ui.SetModelScale(new Vector3(0.1275f, 0.125f, 0.125f));
+        tool.RefreshPreview();
+        Check(tool.FootprintSize == new Vector3I(2, 1, 1), "...and 2% over takes the next cell", $"{tool.FootprintSize}");
+
+        // ---- якорь двигает модель и footprint
+        tool.Ui.SetModelScale(new Vector3(0.25f, 0.125f, 0.125f));
+        tool.RefreshPreview();
+        tool.SelectAnchor(new Vector3(1, 0, 0));
+        Check(tool.Ui.Anchor.IsEqualApprox(new Vector3(1, 0, 0)), "SelectAnchor writes the anchor into the panel", $"{tool.Ui.Anchor}");
+        Check(tool.Bounds.Position.IsEqualApprox(new Vector3(-cell, 0, 0)) && tool.FootprintMin == new Vector3I(-1, 0, 0) && tool.FootprintSize == new Vector3I(2, 1, 1),
+            "anchor Max on X for a 2-cell model: the model moves into cells -1..0, footprint min (-1,0,0)", $"{tool.Bounds} {tool.FootprintMin}");
+        tool.Undo();
+        Check(tool.Ui.Anchor.IsEqualApprox(Vector3.Zero) && tool.FootprintMin == Vector3I.Zero, "Ctrl+Z undoes the anchor choice (one undo point per choice)", $"{tool.Ui.Anchor}");
+        tool.Redo();
+        Check(tool.Ui.Anchor.IsEqualApprox(new Vector3(1, 0, 0)) && tool.FootprintMin == new Vector3I(-1, 0, 0), "Ctrl+Y redoes it");
+
+        tool.Ui.SetModelScale(new Vector3(0.375f, 0.125f, 0.125f));
+        tool.SelectAnchor(new Vector3(0.5f, 0, 0));
+        Check(tool.FootprintMin == new Vector3I(-1, 0, 0) && tool.FootprintSize == new Vector3I(3, 1, 1),
+            "anchor Center on X for a 3-cell model: cells -1..1 around the root cell", $"{tool.FootprintMin} {tool.FootprintSize}");
+
+        // ---- выбор якоря и стрелок по экранным координатам (камера смотрит на модель; клик в 3D-виде = эти же вызовы)
+        tool.Ui.SetModelScale(BlockModelLayout.DefaultScaleVector);
+        tool.SelectAnchor(Vector3.Zero);
+        tool.RefreshPreview();
+        var camera = tool.Camera;
+        var farCorner = BlockModelLayout.PointOnBounds(tool.Bounds, Vector3.One);
+        var pickedAnchor = tool.PickAnchor(camera.UnprojectPosition(farCorner));
+        Check(pickedAnchor.HasValue && pickedAnchor.Value.IsEqualApprox(Vector3.One), "PickAnchor: a click on the marker of the far bbox corner picks anchor (1,1,1)", $"{pickedAnchor}");
+        var faceCenter = BlockModelLayout.PointOnBounds(tool.Bounds, new Vector3(0.5f, 0.5f, 1f));
+        var pickedFace = tool.PickAnchor(camera.UnprojectPosition(faceCenter));
+        Check(pickedFace.HasValue && pickedFace.Value.IsEqualApprox(new Vector3(0.5f, 0.5f, 1f)), "...and on a face-center marker picks that face center", $"{pickedFace}");
+        Check(tool.PickAnchor(new Vector2(-5000, -5000)) == null, "a click far from every marker picks no anchor");
+
+        var pivot = tool.GizmoPivot;
+        Check(pivot.IsEqualApprox(Vector3.Zero), "the scale arrows start at the chosen anchor's point (here the origin)", $"{pivot}");
+        bool axesPicked = true;
+        for (int axis = 0; axis < 3; axis++)
         {
-            var reference = FunctionalOf(referenceBlock)!;
-            tool.LoadSlug(referenceBlock.Slug);
-            Check(tool.Ui.Footprint == reference.Footprint, $"loading '{referenceBlock.Slug}' reads its footprint", $"{tool.Ui.Footprint} vs {reference.Footprint}");
-            Check(tool.Ui.ScenePath == (reference.ScenePath ?? ""), "...and its scene path", tool.Ui.ScenePath);
-            Check(tool.Ui.Behavior == reference.Behavior, "...and its behavior string", tool.Ui.Behavior);
-            Check(tool.Ui.Ports.Count == reference.Ports.Count && tool.Ui.Ports.Select(p => (p.Id, p.Resource, p.Direction, p.Face, p.FaceCell))
-                      .SequenceEqual(reference.Ports.Select(p => (p.Id, p.Resource, p.Direction, p.Face, p.FaceCell))),
-                "...and its physical ports, field for field", $"{tool.Ui.Ports.Count} vs {reference.Ports.Count}");
-            Check(tool.Ui.Nodes.Select(n => (n.Id, n.Type, n.Direction, n.Cell)).SequenceEqual(reference.Nodes.Select(n => (n.Id, n.Type, n.Direction, n.Cell))),
-                "...and its logic nodes (id/type/direction/cell), field for field - nodes are shown as nodes, not as ports", $"{tool.Ui.Nodes.Count} vs {reference.Nodes.Count}");
+            var onArrow = pivot + BlockEditor.AxisDirection(axis) * (BlockEditor.GizmoLength * 0.75f);
+            axesPicked &= tool.PickGizmoAxis(camera.UnprojectPosition(onArrow)) == axis;
         }
 
-        // Тот же круг для КАЖДОГО функционального блока каталога: редактор читает ровно то, что прочитал каталог, ничего не теряя
-        // (в т.ч. params - иначе пересохранение блока в редакторе стёрло бы настройки поведения).
-        foreach (var definition in BlockCatalog.Instance.All.Where(d => d.HasComponent<FunctionalBlockComponent>()).OrderBy(d => d.Slug))
-        {
-            var fn = FunctionalOf(definition)!;
-            tool.LoadSlug(definition.Slug);
-            Check(tool.Ui.Nodes.Count == fn.Nodes.Count && tool.Ui.Ports.Count == fn.Ports.Count && (tool.Ui.ParamsJson.Length > 0) == (fn.BehaviorParams.Count > 0),
-                $"the block editor loads '{definition.Slug}' without losing nodes, ports or behavior params");
-        }
+        Check(axesPicked, "PickGizmoAxis: a click on each of the three arrows picks that axis (X, Y, Z)");
+        Check(tool.PickGizmoAxis(new Vector2(-5000, -5000)) == -1, "a click away from the arrows picks no axis");
 
-        // Обратная совместимость со старым форматом (без "face"/"position") проверяется на ОДНОРАЗОВОМ файле,
-        // который сам тест пишет и чистит - не на редактируемом пользователем blocks/electric_motor.xml.
-        const string legacySlug = "selftest_blockprefab_legacy_ports";
-        string legacyPath = $"res://blocks/{legacySlug}.xml";
-        using (var legacyFile = FileAccess.Open(legacyPath, FileAccess.ModeFlags.Write))
-        {
-            legacyFile.StoreString(
-                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" +
-                $"<Block id=\"{legacySlug}\" name=\"Legacy\">\n" +
-                "  <Color>#ffffff</Color>\n" +
-                "  <Component type=\"FunctionalBlock\">{ \"footprint\": [1,1,1], \"ports\": [ " +
-                "{ \"id\": \"p\", \"resource\": \"Fluid\", \"direction\": \"In\" } ] }</Component>\n" +
-                "</Block>\n");
-        }
+        // ---- перетаскивание стрелки: сдвиг мыши на длину стрелки = масштаб x2 по этой оси (Shift - по всем)
+        var tip = pivot + BlockEditor.AxisDirection(0) * BlockEditor.GizmoLength;
+        var farther = pivot + BlockEditor.AxisDirection(0) * (BlockEditor.GizmoLength * 2f);
+        tool.BeginScaleDrag(0, camera.UnprojectPosition(tip));
+        Check(tool.IsDraggingScale, "BeginScaleDrag starts a drag");
+        tool.UpdateScaleDrag(camera.UnprojectPosition(farther), uniform: false);
+        Check(tool.Ui.ModelScale.IsEqualApprox(new Vector3(0.25f, 0.125f, 0.125f)),
+            "dragging the X arrow by its own length doubles the scale on X only", $"{tool.Ui.ModelScale}");
+        Check(tool.Bounds.Size.IsEqualApprox(new Vector3(2 * cell, cell, cell)) && tool.FootprintSize == new Vector3I(2, 1, 1),
+            "...and the bbox/footprint follow the drag live", $"{tool.Bounds.Size} {tool.FootprintSize}");
+        tool.UpdateScaleDrag(camera.UnprojectPosition(farther), uniform: true);
+        Check(tool.Ui.ModelScale.IsEqualApprox(new Vector3(0.25f, 0.25f, 0.25f)), "with Shift the same drag scales every axis by the same factor", $"{tool.Ui.ModelScale}");
+        tool.EndScaleDrag();
+        Check(!tool.IsDraggingScale, "EndScaleDrag ends the drag");
+        tool.Undo();
+        Check(tool.Ui.ModelScale.IsEqualApprox(BlockModelLayout.DefaultScaleVector), "the whole drag is ONE undo step: Ctrl+Z restores the scale from before it", $"{tool.Ui.ModelScale}");
 
-        tool.LoadSlug(legacySlug);
-        Check(tool.Ui.Ports.Count == 1 && tool.Ui.Ports[0].Face == BlockFace.PosZ && tool.Ui.Ports[0].FaceCell == Vector2I.Zero,
-            "a port without 'face'/'position' in the XML (old hand-written format) defaults to (PosZ, (0,0))",
-            tool.Ui.Ports.Count > 0 ? $"{tool.Ui.Ports[0].Face}/{tool.Ui.Ports[0].FaceCell}" : "no ports");
-        if (FileAccess.FileExists(legacyPath)) DirAccess.RemoveAbsolute(legacyPath);
+        Check(Math.Abs(BlockEditor.ClosestParamOnAxis(Vector3.Zero, Vector3.Right, new Vector3(0.3f, 5f, 0.2f), Vector3.Down) - 0.3) < 1e-6,
+            "ClosestParamOnAxis: a ray passing over x=0.3 touches the X axis line at t=0.3");
+        Check(BlockEditor.ClosestParamOnAxis(Vector3.Zero, Vector3.Right, new Vector3(0, 1, 0), Vector3.Right) == 0,
+            "...and a ray parallel to the axis gives 0 (the scale simply does not change)");
+        var clampedDrag = BlockEditor.DraggedScale(new Vector3(0.125f, 0.125f, 0.125f), 1, -50, false);
+        Check(clampedDrag.X == 0.125f && clampedDrag.Y > 0.0009f && clampedDrag.Y < 0.01f && clampedDrag.Z == 0.125f,
+            "DraggedScale never collapses an axis to zero or below (lower bound 0.001) and leaves the other axes alone", $"{clampedDrag}");
 
-        // Новый блок + бокс коллизии + сохранение + перечитывание с диска - полный цикл записи/чтения XML (главный
-        // риск этого инструмента, см. class doc) на ОДНОРАЗОВОМ тестовом слаге, не трогающем настоящий каталог.
-        const string testSlug = "selftest_blockprefab_tmp";
-        string path = $"res://blocks/{testSlug}.xml";
-        if (FileAccess.FileExists(path)) DirAccess.RemoveAbsolute(path);
+        // ---- коллизия: группы клеток -> клетки в XML -> боксы при загрузке
+        const string slug = "selftest_editor_block";
+        tool.ResetToDefaults(slug);
+        tool.Ui.ApplyChosenModelPath(ProjectSettings.GlobalizePath(modelPath));
+        tool.Ui.SetModelScale(new Vector3(0.25f, 0.125f, 0.125f));
+        tool.Ui.LoadFields(slug, "Editor Test", new Color(0.5f, 0.25f, 0.75f), 12.5f, 80f, 0.3f, modelPath, new Vector3(0.25f, 0.125f, 0.125f), new Vector3(1, 0, 0),
+            "Button", 5f, Array.Empty<CellBox>(), Array.Empty<ResourcePort>(), Array.Empty<LogicNode>(), "");
+        tool.RefreshPreview();
+        Check(tool.FootprintMin == new Vector3I(-1, 0, 0) && tool.FootprintSize == new Vector3I(2, 1, 1), "setup: a 2-cell model anchored at Max: footprint min (-1,0,0), size 2x1x1");
 
-        tool.ResetToDefaults(testSlug);
-        tool.AddCollisionBox();
-        Check(tool.Ui.CollisionBoxes.Count == 1, "AddCollisionBox adds exactly one row", $"{tool.Ui.CollisionBoxes.Count}");
-        tool.Ui.SetModelScaleForTesting(new Vector3(2f, 1f, 1.5f)); // "Model stretch" - должен тоже пережить save+reload
-        tool.Ui.SetModelOffsetForTesting(new Vector3(0.125f, -0.0625f, 0f)); // "Model offset" - тоже
+        tool.AddCollisionGroup();
+        Check(tool.Ui.CollisionGroups.Count == 1 && tool.Ui.CollisionGroups[0] == new CellBox(Vector3I.Zero, Vector3I.One), "+Cells adds one 1x1x1 group at cell (0,0,0)", string.Join(";", tool.Ui.CollisionGroups));
+        tool.FillCollisionFromFootprint();
+        Check(tool.Ui.CollisionGroups.Count == 2 && tool.Ui.CollisionGroups[1] == new CellBox(tool.FootprintMin, tool.FootprintSize), "Fill footprint adds a group equal to the footprint (min and size)");
+        tool.RemoveCollisionGroup(0);
+        tool.AddCollisionGroup();
+        tool.Ui.SetCollisionGroupForTesting(1, new Vector3I(0, 2, 0), Vector3I.One); // торчит над footprint'ом - допустимо, коллизия не привязана к footprint'у
+        Check(tool.Ui.CollisionGroups.Count == 2 && tool.Ui.CollisionGroups[0] == new CellBox(new Vector3I(-1, 0, 0), new Vector3I(2, 1, 1)) && tool.Ui.CollisionGroups[1] == new CellBox(new Vector3I(0, 2, 0), Vector3I.One),
+            "Remove drops exactly that group; a group may lie outside the footprint (collision is not stretched to it)", string.Join(";", tool.Ui.CollisionGroups));
 
-        // Два порта на РАЗНЫХ сторонах + два порта, делящие ОДНУ И ТУ ЖЕ (Face, FaceCell) - проверяем именно то, что
-        // запросил пользователь: несколько ресурсов/портов, несколько портов в одном месте, порт не только на одной
-        // стороне. AddPort() добавляет ряд с заглушками по умолчанию; SetPortForTesting заполняет его целевыми значениями.
+        // Порты (в т.ч. два в одной точке и порт в отрицательной клетке грани), ноды, параметры поведения.
         tool.AddPort();
         tool.AddPort();
         tool.AddPort();
-        Check(tool.Ui.Ports.Count == 3, "AddPort adds exactly one row each call", $"{tool.Ui.Ports.Count}");
+        Check(tool.Ui.Ports.Count == 3, "AddPort adds exactly one row per call", $"{tool.Ui.Ports.Count}");
         tool.Ui.SetPortForTesting(0, "fluid_in", ResourceType.Fluid, PortDirection.In, BlockFace.NegX, new Vector2I(0, 0));
-        tool.Ui.SetPortForTesting(1, "shaft_out", ResourceType.Torque, PortDirection.Out, BlockFace.PosZ, new Vector2I(1, 2));
-        tool.Ui.SetPortForTesting(2, "shaft_out_2", ResourceType.Torque, PortDirection.Out, BlockFace.PosZ, new Vector2I(1, 2)); // той же (Face, FaceCell), что и предыдущий - намеренно
-
-        // Логические ноды (добавляются кнопкой Add node) и параметры поведения (сырой JSON) - должны пережить save+reload и
-        // не теряться при сохранении любого блока. Три ноды РАЗНЫХ типов в одной клетке (допустимо) + одна отдельно.
+        tool.Ui.SetPortForTesting(1, "shaft_out", ResourceType.Torque, PortDirection.Out, BlockFace.PosZ, new Vector2I(-1, 0));
+        tool.Ui.SetPortForTesting(2, "shaft_out_2", ResourceType.Torque, PortDirection.Out, BlockFace.PosZ, new Vector2I(-1, 0)); // та же (Face, FaceCell) - намеренно
         tool.AddNode();
         tool.AddNode();
         tool.AddNode();
         Check(tool.Ui.Nodes.Count == 3 && tool.Ui.Nodes.Select(n => n.Type).Distinct().Count() == 3,
-            "Add node x3 gives three nodes of three DIFFERENT types in one cell - the editor never creates a same-type conflict by itself",
-            string.Join(",", tool.Ui.Nodes.Select(n => n.Type)));
+            "Add node x3 gives three nodes of three DIFFERENT types in one cell - the editor never creates a same-type conflict by itself", string.Join(",", tool.Ui.Nodes.Select(n => n.Type)));
         tool.Ui.SetNodeForTesting(0, "power_in", NodeType.Electricity, PortDirection.In, new Vector3I(0, 0, 0));
         tool.Ui.SetNodeForTesting(1, "flag_out", NodeType.Boolean, PortDirection.Out, new Vector3I(0, 0, 0));
-        tool.Ui.SetNodeForTesting(2, "rpm_in", NodeType.Number, PortDirection.In, new Vector3I(0, 0, 0));
+        tool.Ui.SetNodeForTesting(2, "rpm_in", NodeType.Number, PortDirection.In, new Vector3I(-1, 0, 0));
         tool.Ui.SetParamsForTesting("{ \"mode\": \"toggle\", \"glowNode\": \"Lid\", \"glowColor\": \"#ff8800\" }");
 
+        string xml = tool.BuildXml(slug);
+        Check(xml.Contains("\"footprint\": [2, 1, 1]") && xml.Contains("\"footprintMin\": [-1, 0, 0]") && xml.Contains("\"scale\": [0.25, 0.125, 0.125]")
+              && xml.Contains("\"anchor\": [1, 0, 0]") && !xml.Contains("modelScale") && !xml.Contains("modelOffset"),
+            "the XML carries scale, anchor, and the automatically computed footprint + footprintMin (and none of the legacy keys)");
+        Check(xml.Contains("\"collision\": [") && xml.Contains("[-1, 0, 0]") && xml.Contains("[0, 2, 0]") && !xml.Contains("\"size\""),
+            "the XML stores collision as plain integer cells, not boxes in meters");
+
         tool.Save();
-        Check(FileAccess.FileExists(path), "Save() writes blocks/<slug>.xml", path);
+        string path = $"{dir}/{slug}.xml";
+        Check(FileAccess.FileExists(path), "Save() writes <blocks dir>/<slug>.xml", path);
 
+        // Каталог игры читает сохранённый файл тем же кодом, что и обычные блоки.
+        var saved = BlockCatalog.Load(dir);
+        var savedFn = saved.TryGetBySlug(slug, out var savedDef) ? FunctionalOf(savedDef) : null;
+        Check(savedFn != null, "the game's BlockCatalog loads the block the editor just saved");
+        if (savedFn != null)
+        {
+            Check(savedFn.ScenePath == modelPath && savedFn.ModelScale.IsEqualApprox(new Vector3(0.25f, 0.125f, 0.125f)) && savedFn.Anchor.IsEqualApprox(new Vector3(1, 0, 0)),
+                "catalog: scene, scale and anchor survive", $"{savedFn.ScenePath} {savedFn.ModelScale} {savedFn.Anchor}");
+            Check(savedFn.Footprint == tool.FootprintSize && savedFn.FootprintMin == tool.FootprintMin,
+                "catalog: footprint and footprintMin are exactly what the editor computed", $"{savedFn.Footprint} {savedFn.FootprintMin}");
+            Check(savedFn.CollisionCells.Count == 3 && savedFn.CollisionBoxes.Count == 2,
+                "catalog: 3 collision cells (2x1x1 block + one detached cell) merge into exactly 2 boxes", $"{savedFn.CollisionCells.Count} cells, {savedFn.CollisionBoxes.Count} boxes");
+            Check(savedFn.Behavior == "Button" && Math.Abs(savedFn.Capacity - 5f) < 1e-6 && savedFn.GetParam("mode") == "toggle", "catalog: behavior, capacity and params survive");
+            var mass = savedDef!.GetComponent<BaseComponent>();
+            Check(mass != null && Math.Abs(mass.Mass - 12.5f) < 1e-6 && Math.Abs(mass.Durability - 80f) < 1e-6 && savedDef.Name == "Editor Test",
+                "catalog: name, mass and durability survive");
+        }
+
+        // Обратное чтение редактором: поля совпадают, клетки коллизии показываются слитыми боксами.
         tool.ResetToDefaults(""); // сбросить поля, чтобы следующая загрузка проверяла реально ПРОЧИТАННОЕ, не старое
-        tool.LoadSlug(testSlug);
-        Check(tool.Ui.Footprint == Vector3I.One, "round-trip: footprint (default 1,1,1) survives save+reload", $"{tool.Ui.Footprint}");
-        Check(tool.Ui.CollisionBoxes.Count == 1, "round-trip: the collision box survives save+reload", $"{tool.Ui.CollisionBoxes.Count}");
-        Check(tool.Ui.CollisionBoxes.Count == 1 && tool.Ui.CollisionBoxes[0].Size.IsEqualApprox(new Vector3(0.25f, 0.25f, 0.25f)),
-            "round-trip: the collision box's size (default = footprint in meters) survives exactly",
-            tool.Ui.CollisionBoxes.Count > 0 ? $"{tool.Ui.CollisionBoxes[0].Size}" : "no boxes");
-        Check(tool.Ui.ModelScale.IsEqualApprox(new Vector3(2f, 1f, 1.5f)),
-            "round-trip: the manual 'Model stretch' survives save+reload", $"{tool.Ui.ModelScale}");
-        Check(tool.Ui.ModelOffset.IsEqualApprox(new Vector3(0.125f, -0.0625f, 0f)),
-            "round-trip: the manual 'Model offset' survives save+reload", $"{tool.Ui.ModelOffset}");
+        tool.LoadSlug(slug);
+        Check(tool.Ui.ScenePath == modelPath && tool.Ui.ModelScale.IsEqualApprox(new Vector3(0.25f, 0.125f, 0.125f)) && tool.Ui.Anchor.IsEqualApprox(new Vector3(1, 0, 0)),
+            "round-trip: scene, scale and anchor survive save+reload", $"{tool.Ui.ScenePath} {tool.Ui.ModelScale} {tool.Ui.Anchor}");
+        Check(tool.FootprintMin == new Vector3I(-1, 0, 0) && tool.FootprintSize == new Vector3I(2, 1, 1), "round-trip: the footprint is recomputed from the reloaded model");
+        Check(tool.Ui.CollisionGroups.SequenceEqual(new[] { new CellBox(new Vector3I(-1, 0, 0), new Vector3I(2, 1, 1)), new CellBox(new Vector3I(0, 2, 0), Vector3I.One) }),
+            "round-trip: collision cells come back as the merged boxes (one 2x1x1 and one detached 1x1x1)", string.Join(";", tool.Ui.CollisionGroups));
+        Check(tool.Ui.Ports.Count == 3 && tool.Ui.Ports.Any(p => p.Id == "fluid_in" && p.Resource == ResourceType.Fluid && p.Direction == PortDirection.In && p.Face == BlockFace.NegX && p.FaceCell == Vector2I.Zero),
+            "round-trip: ports (resource/direction/face/cell) survive", $"{tool.Ui.Ports.Count}");
+        Check(tool.Ui.Ports.Count(p => p.Face == BlockFace.PosZ && p.FaceCell == new Vector2I(-1, 0)) == 2,
+            "round-trip: two ports sharing one (Face, FaceCell) - with a NEGATIVE cell index - both survive, no dedup");
+        Check(tool.Ui.Nodes.Count == 3 && tool.Ui.Nodes.Any(n => n.Id == "rpm_in" && n.Type == NodeType.Number && n.Cell == new Vector3I(-1, 0, 0))
+              && tool.Ui.Nodes.Any(n => n.Id == "power_in" && n.Type == NodeType.Electricity && n.Direction == PortDirection.In),
+            "round-trip: nodes (id/type/direction/cell, including a negative cell) survive", string.Join(",", tool.Ui.Nodes.Select(n => $"{n.Id}:{n.Cell}")));
+        Check(tool.Ui.ParamsJson == "{\"mode\":\"toggle\",\"glowNode\":\"Lid\",\"glowColor\":\"#ff8800\"}", "round-trip: behavior params survive without loss", tool.Ui.ParamsJson);
 
-        Check(tool.Ui.Ports.Count == 3, "round-trip: all 3 ports survive save+reload", $"{tool.Ui.Ports.Count}");
-        var reloadedPowerIn = tool.Ui.Ports.FirstOrDefault(p => p.Id == "fluid_in");
-        Check(reloadedPowerIn != null && reloadedPowerIn.Resource == ResourceType.Fluid && reloadedPowerIn.Direction == PortDirection.In
-            && reloadedPowerIn.Face == BlockFace.NegX && reloadedPowerIn.FaceCell == Vector2I.Zero,
-            "round-trip: a port's resource/direction/face/cell all survive exactly", reloadedPowerIn == null ? "not found" : $"{reloadedPowerIn.Resource}/{reloadedPowerIn.Direction}/{reloadedPowerIn.Face}/{reloadedPowerIn.FaceCell}");
-
-        var sharedLocationPorts = tool.Ui.Ports.Where(p => p.Face == BlockFace.PosZ && p.FaceCell == new Vector2I(1, 2)).ToList();
-        Check(sharedLocationPorts.Count == 2 && sharedLocationPorts.Select(p => p.Id).ToHashSet().SetEquals(new[] { "shaft_out", "shaft_out_2" }),
-            "round-trip: two ports sharing the same (Face, FaceCell) both survive - no dedup/overwrite",
-            $"{sharedLocationPorts.Count} ports at that spot: {string.Join(",", sharedLocationPorts.Select(p => p.Id))}");
-
-        var reloadedNodes = tool.Ui.Nodes;
-        var reloadedPower = reloadedNodes.FirstOrDefault(n => n.Id == "power_in");
-        Check(reloadedNodes.Count == 3 && reloadedPower != null && reloadedPower.Type == NodeType.Electricity && reloadedPower.Direction == PortDirection.In
-              && reloadedNodes.Any(n => n.Id == "flag_out" && n.Type == NodeType.Boolean && n.Direction == PortDirection.Out)
-              && reloadedNodes.Any(n => n.Id == "rpm_in" && n.Type == NodeType.Number && n.Direction == PortDirection.In)
-              && reloadedNodes.All(n => n.Cell == Vector3I.Zero),
-            "round-trip: all three nodes (id/type/direction/cell), sharing one cell with different types, survive save+reload",
-            string.Join(",", reloadedNodes.Select(n => $"{n.Id}:{n.Type}:{n.Direction}:{n.Cell}")));
-        Check(tool.Ui.ParamsJson == "{\"mode\":\"toggle\",\"glowNode\":\"Lid\",\"glowColor\":\"#ff8800\"}",
-            "round-trip: behavior params (mode, glowNode, glowColor) survive save+reload without loss", tool.Ui.ParamsJson);
-
-        // Конфликт нод и битый params не должны затирать файл на диске (каталог бросает на ошибке разбора блока).
+        // ---- отказ сохранять то, что не загрузится/нельзя посчитать: файл на диске не трогается
         string savedText = FileAccess.GetFileAsString(path);
         tool.Ui.SetNodeForTesting(2, "rpm_in", NodeType.Boolean, PortDirection.In, new Vector3I(0, 0, 0)); // 2 Boolean в одной клетке (In и Out)
         tool.Save();
-        Check(FileAccess.GetFileAsString(path) == savedText,
-            "Save() with two nodes of the SAME type in one cell (even In vs Out) refuses to write - the file on disk is untouched");
-        tool.Ui.SetNodeForTesting(2, "rpm_in", NodeType.Number, PortDirection.In, new Vector3I(0, 0, 0)); // чиним конфликт
+        Check(FileAccess.GetFileAsString(path) == savedText, "Save() with two nodes of the SAME type in one cell refuses to write - the file is untouched");
+        tool.Ui.SetNodeForTesting(2, "rpm_in", NodeType.Number, PortDirection.In, new Vector3I(-1, 0, 0));
         tool.Ui.SetParamsForTesting("[1, 2]");
         tool.Save();
         Check(FileAccess.GetFileAsString(path) == savedText, "...and so does a params value that is not a JSON object");
         tool.Ui.SetParamsForTesting("{ \"mode\": \"toggle\", \"glowNode\": \"Lid\", \"glowColor\": \"#ff8800\" }");
 
-        // Remove node убирает ровно один ряд; тот же Undo-стек, что и у остальных списков.
-        int nodesBeforeRemove = tool.Ui.Nodes.Count;
-        tool.RemoveNode(1);
-        Check(tool.Ui.Nodes.Count == nodesBeforeRemove - 1 && tool.Ui.Nodes.All(n => n.Id != "flag_out"), "Remove node removes exactly that node", $"{tool.Ui.Nodes.Count}");
-        tool.Undo();
-        Check(tool.Ui.Nodes.Count == nodesBeforeRemove && tool.Ui.Nodes.Any(n => n.Id == "flag_out"), "Ctrl+Z restores the removed node", $"{tool.Ui.Nodes.Count}");
+        tool.Ui.SetCollisionGroupForTesting(0, Vector3I.Zero, new Vector3I(100, 100, 100)); // 1 000 000 клеток
+        tool.Save();
+        Check(FileAccess.GetFileAsString(path) == savedText && tool.Ui.Status.Contains("cells"), "...and a collision of a million cells (a typo, not a block)", tool.Ui.Status);
+        tool.Ui.SetCollisionGroupForTesting(0, new Vector3I(-1, 0, 0), new Vector3I(2, 1, 1));
 
-        tool.LoadSlug(testSlug);
+        const string missingSlug = "selftest_editor_missing";
+        tool.Ui.LoadFields(missingSlug, "", Colors.White, 10f, 100f, 0.1f, "res://meshes/selftest_does_not_exist.gltf", BlockModelLayout.DefaultScaleVector, Vector3.Zero,
+            "", 0f, Array.Empty<CellBox>(), Array.Empty<ResourcePort>(), Array.Empty<LogicNode>(), "");
+        tool.RefreshPreview();
+        tool.Save();
+        Check(!FileAccess.FileExists($"{dir}/{missingSlug}.xml") && tool.Ui.Status.Contains("not saved"),
+            "a model that fails to load blocks Save (the footprint can't be computed) - nothing is written", tool.Ui.Status);
 
-        // --- Undo/Redo (Ctrl+Z/Ctrl+Y), по запросу пользователя - снимок ДО действия, восстанавливается целиком.
-        int portsBeforeAdd = tool.Ui.Ports.Count; // 3, с перезагрузки выше
+        // Блок без модели - обычный плейсхолдер-куб: сохраняется с footprint 1x1x1 и без ключа scene.
+        const string plainSlug = "selftest_editor_plain";
+        tool.ResetToDefaults(plainSlug);
+        tool.Save();
+        var plain = BlockCatalog.Load(dir);
+        var plainFn = plain.TryGetBySlug(plainSlug, out var plainDef) ? FunctionalOf(plainDef) : null;
+        Check(plainFn != null && string.IsNullOrEmpty(plainFn.ScenePath) && plainFn.Footprint == Vector3I.One && plainFn.CollisionBoxes.Count == 0,
+            "a block without a model saves as a 1x1x1 placeholder with no scene and no collision");
+
+        // Старый формат: блок не грузится в каталог игры, а редактор говорит об этом в статусе, а не падает.
+        const string legacySlug = "selftest_editor_legacy";
+        using (var legacyFile = FileAccess.Open($"{dir}/{legacySlug}.xml", FileAccess.ModeFlags.Write))
+        {
+            legacyFile.StoreString(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" + $"<Block id=\"{legacySlug}\" name=\"Legacy\">\n  <Color>#ffffff</Color>\n" +
+                "  <Component type=\"FunctionalBlock\">{ \"footprint\": [1,1,1], \"modelScale\": [1,1,1], \"collision\": [ { \"position\": [0,0,0], \"size\": [0.25,0.25,0.25] } ] }</Component>\n</Block>\n");
+        }
+
+        tool.LoadSlug(legacySlug);
+        Check(tool.Ui.Status.Contains("failed to parse") && tool.Ui.Status.Contains("legacy"),
+            "a block in the old format is reported in the status line (with the reason), not a crash", tool.Ui.Status);
+        Check(!BlockCatalog.Load(dir).TryGetBySlug(legacySlug, out _), "...and the game's catalog skips it instead of mis-rendering it");
+
+        // ---- Undo/Redo
+        tool.LoadSlug(slug);
+        int portsBeforeAdd = tool.Ui.Ports.Count;
         tool.AddPort();
-        Check(tool.Ui.Ports.Count == portsBeforeAdd + 1, "setup: AddPort adds a 4th port", $"{tool.Ui.Ports.Count}");
         tool.Undo();
-        Check(tool.Ui.Ports.Count == portsBeforeAdd && tool.Ui.Ports.Any(p => p.Id == "fluid_in"),
-            "Ctrl+Z undoes AddPort - back to exactly the 3 ports from before, not just the same COUNT by accident",
-            $"{tool.Ui.Ports.Count}: {string.Join(",", tool.Ui.Ports.Select(p => p.Id))}");
+        Check(tool.Ui.Ports.Count == portsBeforeAdd && tool.Ui.Ports.Any(p => p.Id == "fluid_in"), "Ctrl+Z undoes AddPort - back to exactly the same ports", $"{tool.Ui.Ports.Count}");
         tool.Redo();
         Check(tool.Ui.Ports.Count == portsBeforeAdd + 1, "Ctrl+Y redoes it", $"{tool.Ui.Ports.Count}");
-
-        int boxesBeforeAdd = tool.Ui.CollisionBoxes.Count; // 1, из AddCollisionBox выше
-        tool.AddCollisionBox();
         tool.Undo();
-        Check(tool.Ui.CollisionBoxes.Count == boxesBeforeAdd, "Ctrl+Z also undoes AddCollisionBox (same Undo stack, not a separate one per list)", $"{tool.Ui.CollisionBoxes.Count}");
 
-        Check(tool.Ui.ModelScale.IsEqualApprox(new Vector3(2f, 1f, 1.5f)),
-            "...and fields untouched by either action (Model stretch from earlier) survive the round trip through the snapshot unchanged", $"{tool.Ui.ModelScale}");
+        int groupsBefore = tool.Ui.CollisionGroups.Count;
+        tool.AddCollisionGroup();
+        tool.Undo();
+        Check(tool.Ui.CollisionGroups.Count == groupsBefore, "Ctrl+Z also undoes adding a collision group (one undo stack for every list)", $"{tool.Ui.CollisionGroups.Count}");
 
-        // Загрузка ДРУГОГО блока (Load/New) начинает Undo/Redo с чистого листа - нельзя "отменой" дотянуться до
-        // правок уже закрытого документа.
-        string otherSlug = referenceBlock?.Slug ?? "block";
-        tool.LoadSlug(otherSlug);
-        var footprintAfterLoad = tool.Ui.Footprint;
-        var scenePathAfterLoad = tool.Ui.ScenePath;
-        tool.Undo(); // стек пуст после ClearUndoHistory в LoadSlug - должен быть no-op, не откатывать к testSlug
-        Check(tool.Ui.Footprint == footprintAfterLoad && tool.Ui.ScenePath == scenePathAfterLoad && tool.Ui.Slug == otherSlug,
-            "loading a different block (LoadSlug) clears Undo/Redo history - Ctrl+Z here is a no-op, not a jump back into the previous block's edits",
-            $"{tool.Ui.Footprint} {tool.Ui.ScenePath} {tool.Ui.Slug}");
+        int nodesBeforeRemove = tool.Ui.Nodes.Count;
+        tool.RemoveNode(1);
+        Check(tool.Ui.Nodes.Count == nodesBeforeRemove - 1, "Remove node removes exactly one node", $"{tool.Ui.Nodes.Count}");
+        tool.Undo();
+        Check(tool.Ui.Nodes.Count == nodesBeforeRemove && tool.Ui.Nodes.Any(n => n.Id == "flag_out"), "Ctrl+Z restores the removed node");
+        Check(tool.Ui.ModelScale.IsEqualApprox(new Vector3(0.25f, 0.125f, 0.125f)) && tool.Ui.Anchor.IsEqualApprox(new Vector3(1, 0, 0)),
+            "...and fields untouched by those actions (scale, anchor) come back unchanged through the snapshot");
 
-        if (FileAccess.FileExists(path)) DirAccess.RemoveAbsolute(path); // не мусорим в blocks/ настоящим файлом
+        tool.LoadSlug(plainSlug);
+        string slugAfterLoad = tool.Ui.Slug;
+        tool.Undo(); // стек пуст после LoadSlug - no-op, не откат в прежний блок
+        Check(tool.Ui.Slug == slugAfterLoad && slugAfterLoad == plainSlug, "loading a different block clears the undo history - Ctrl+Z is a no-op, not a jump back into the previous block's edits");
+
+        // ---- Browse: файл ВНЕ проекта копируется в res://meshes/ и сразу виден
+        const string outsideSource = "user://selftest_browse_source.gltf";
+        const string copiedPath = "res://meshes/selftest_browse_source.gltf";
+        if (FileAccess.FileExists(copiedPath)) DirAccess.RemoveAbsolute(copiedPath);
+        WriteTestGltf(outsideSource, (Vector3.Zero, new Vector3(4, 2, 2)));
+        FunctionalBlockGeometry.ClearSceneCache(copiedPath);
+        tool.ResetToDefaults("selftest_editor_browse");
+        tool.Ui.ApplyChosenModelPath(ProjectSettings.GlobalizePath(outsideSource));
+        Check(tool.Ui.ScenePath == copiedPath && FileAccess.FileExists(copiedPath),
+            "Browse: a file outside the project is copied into res://meshes/ and the field gets the new res:// path", tool.Ui.ScenePath);
+        Check(tool.HasModel && tool.Bounds.Size.IsEqualApprox(new Vector3(4, 2, 2) * 0.125f) && tool.FootprintSize == new Vector3I(2, 1, 1),
+            "...and the copied model is shown immediately, without --import (4x2x2 units -> 2x1x1 cells)", $"{tool.Bounds.Size} {tool.FootprintSize}");
+
+        // ---- переэкспорт модели: изменённый файл подхватывается без перезапуска
+        WriteTestGltf(copiedPath, (Vector3.Zero, new Vector3(4, 2, 2)), (new Vector3(4, 0, 0), new Vector3(8, 2, 2)));
+        Check(tool.PollModelFile(forceRecheck: true), "the editor notices the model file changed on disk (re-export from Blender) and refreshes");
+        Check(tool.Bounds.Size.IsEqualApprox(new Vector3(8, 2, 2) * 0.125f) && tool.FootprintSize == new Vector3I(4, 1, 1),
+            "...the new bbox and footprint (8x2x2 units -> 4x1x1 cells) are shown", $"{tool.Bounds.Size} {tool.FootprintSize}");
+        Check(!tool.PollModelFile(forceRecheck: true), "an unchanged file is not reloaded again");
+
+        // ---- уборка
+        foreach (string created in new[] { slug, plainSlug, legacySlug, missingSlug })
+        {
+            if (FileAccess.FileExists($"{dir}/{created}.xml")) DirAccess.RemoveAbsolute($"{dir}/{created}.xml");
+        }
+
+        foreach (string temp in new[] { modelPath, copiedPath, outsideSource })
+        {
+            if (FileAccess.FileExists(temp)) DirAccess.RemoveAbsolute(temp);
+        }
+
+        FunctionalBlockGeometry.ClearSceneCache(modelPath);
+        FunctionalBlockGeometry.ClearSceneCache(copiedPath);
         tool.QueueFree();
     }
 
     /// <summary>
-    /// Баг, найденный пользователем: раньше ЛЮБОЙ блок без собственных боксов коллизии (включая функциональные)
-    /// автоматически получал один бокс на весь экземпляр - у некоторых моделей есть выпирающие за footprint детали,
-    /// которым коллизия не нужна, а автоматический бокс делал "совсем без коллизии" недостижимым. Теперь это
-    /// различается по наличию <see cref="FunctionalBlockComponent"/>: у обычного блока (куб) коллизия по-прежнему
-    /// автоматическая, у функционального (electric_motor, без собственных боксов в каталоге) - её нет вообще.
+    /// Коллизия функционального блока в мире (<see cref="VehicleSpawner"/>): ровно боксы из его клеток (слитые при загрузке), в рамке блока — вокруг
+    /// корневой клетки, при любом повороте — и без автоматического бокса «на всякий случай» (у обычного блока он остаётся). Каталог на время теста
+    /// подменяется (<see cref="UseCatalogWith"/>) — в настоящем blocks/ функциональных блоков больше нет.
     /// </summary>
     private void RunVehicleSpawnerCollisionTests(Node host)
     {
-        GD.Print("-- VehicleSpawner collision: ordinary blocks keep the automatic box, functional blocks get EXACTLY their own boxes (no automatic fallback)");
+        GD.Print("-- VehicleSpawner collision: ordinary blocks keep the automatic box, functional blocks get EXACTLY their collision cells as merged boxes in the block frame");
 
-        var grid = new VoxelGrid();
-        var construction = new Construction(grid);
+        using var scope = UseCatalogWith(
+            ("zz_spawn", "{ \"footprint\": [2,1,1], \"footprintMin\": [-1,0,0], \"collision\": [[-1,0,0],[0,0,0],[0,2,0]] }"),
+            ("zz_nocoll", "{ \"footprint\": [1,1,1] }"));
         var catalog = BlockCatalog.Instance;
-        var functionalDef = FindFunctional();
-        if (functionalDef == null)
+        var def = catalog.Get("zz_spawn");
+        var fn = FunctionalOf(def)!;
+        Check(fn.CollisionBoxes.Count == 2, "setup: the fixture's 3 collision cells merge into 2 boxes", $"{fn.CollisionBoxes.Count}");
+
+        // ---- чистая математика: для всех 64 поворотов клетки коллизии в мире == корень + повёрнутые клетки блока
+        var rootCell = new Vector3I(5, 0, 0);
+        bool cellsAgree = true;
+        string problem = "";
+        for (int x = 0; x < 4; x++)
+        for (int y = 0; y < 4; y++)
+        for (int z = 0; z < 4; z++)
         {
-            Check(true, "spawner collision check skipped: no functional block in the catalog right now");
-            return;
+            var steps = new Vector3I(x, y, z);
+            var (origin, size) = BlockFootprint.PlaceBox(rootCell, fn.FootprintMin, fn.Footprint, steps);
+            var frame = FunctionalBlockGeometry.InstanceFrame(origin, fn.FootprintMin, fn.Footprint, steps);
+            var expected = fn.CollisionCells.Select(c => rootCell + BlockFootprint.Rotate(c, steps)).ToHashSet();
+            var covered = new HashSet<Vector3I>();
+            foreach (var box in fn.CollisionBoxes)
+            {
+                var inverse = (frame * new Transform3D(Basis.Identity, box.CenterMeters)).AffineInverse();
+                for (int dx = -4; dx <= 4; dx++)
+                for (int dy = -4; dy <= 4; dy++)
+                for (int dz = -4; dz <= 4; dz++)
+                {
+                    var candidate = rootCell + new Vector3I(dx, dy, dz);
+                    var local = inverse * BuildSpace.CellCenter(candidate);
+                    var half = box.SizeMeters * 0.5f;
+                    if (Math.Abs(local.X) < half.X && Math.Abs(local.Y) < half.Y && Math.Abs(local.Z) < half.Z) covered.Add(candidate);
+                }
+            }
+
+            if (!covered.SetEquals(expected))
+            {
+                cellsAgree = false;
+                problem = $"steps={steps}";
+            }
         }
 
-        var functionalFn = FunctionalOf(functionalDef)!;
+        Check(cellsAgree, "all 64 rotations: the world cells covered by the collision boxes == root + rotated collision cells (rotation is about the root cell)", problem);
+
+        // ---- настоящий спавн
+        var construction = new Construction(new VoxelGrid());
         construction.Place(new Vector3I(0, 0, 0), catalog.Get("block"), Colors.White);
-        construction.PlaceBlock(new Vector3I(5, 0, 0), functionalFn.Footprint, functionalDef, Colors.White);
+        var noSteps = Vector3I.Zero;
+        var (placeOrigin, placeSize) = BlockFootprint.PlaceBox(rootCell, fn.FootprintMin, fn.Footprint, noSteps);
+        Check(construction.PlaceBlock(placeOrigin, placeSize, def, Colors.White, noSteps) != null, "setup: the functional block is placed (its occupied cells start one cell left of the root)");
+        construction.PlaceBlock(new Vector3I(9, 0, 0), Vector3I.One, catalog.Get("zz_nocoll"), Colors.White);
 
-        // Функциональные блоки правятся через --blockeditor в любой момент - не зашиваем "у него N боксов", а берём РЕАЛЬНОЕ
-        // текущее число. Проверяемый инвариант - не "сколько именно", а что функциональный блок получает РОВНО столько
-        // CollisionShape3D, сколько у него своих боксов, и ни одного автоматического "на всякий случай" сверху.
-        int motorOwnBoxes = functionalFn.CollisionBoxes.Count;
-
-        string json = ConstructionIO.Serialize(construction);
         var parent = new Node3D();
         host.AddChild(parent);
+        var body = VehicleSpawner.Spawn(parent, ConstructionIO.Serialize(construction), Vector3.Zero);
+        var shapes = body.GetChildren().OfType<CollisionShape3D>().ToList();
 
-        var body = VehicleSpawner.Spawn(parent, json, Vector3.Zero);
-        int shapeCount = 0;
-        foreach (var child in body.GetChildren())
-        {
-            if (child is CollisionShape3D) shapeCount++;
-        }
+        Check(shapes.Count == 1 + fn.CollisionBoxes.Count,
+            "'block' gets its automatic box (1) + the functional block gets EXACTLY its merged boxes + a functional block without collision gets none",
+            $"got {shapes.Count}, expected {1 + fn.CollisionBoxes.Count}");
 
-        int expected = 1 + motorOwnBoxes; // 1 - автоматический бокс 'block', + сколько реально задано у мотора
-        Check(shapeCount == expected,
-            "'block' gets its automatic box (1) + a functional block gets EXACTLY its own CollisionBoxes.Count, no automatic fallback on top",
-            $"got {shapeCount}, expected {expected} (1 + '{functionalDef.Slug}'.CollisionBoxes.Count={motorOwnBoxes})");
+        var wide = shapes.FirstOrDefault(s => s.Shape is BoxShape3D b && b.Size.IsEqualApprox(new Vector3(0.5f, 0.25f, 0.25f)));
+        Check(wide != null && wide.Position.IsEqualApprox(new Vector3(1.25f, 0.125f, 0.125f)),
+            "the 2x1x1 box sits over cells 4 and 5 (the block frame starts at the root cell's corner)", wide == null ? "no 2x1x1 box" : $"{wide.Position}");
+        var detached = shapes.FirstOrDefault(s => s.Shape is BoxShape3D b && b.Size.IsEqualApprox(new Vector3(0.25f, 0.25f, 0.25f)) && s.Position.Y > 0.5f);
+        Check(detached != null && detached.Position.IsEqualApprox(new Vector3(1.375f, 0.625f, 0.125f)),
+            "the detached cell (0,2,0) is a separate box two cells above the root, outside the footprint", detached == null ? "no detached box" : $"{detached.Position}");
 
         body.QueueFree();
         parent.QueueFree();
@@ -2790,14 +3333,48 @@ public sealed class SelfTest
 
     private static FunctionalBlockComponent? FunctionalOf(BlockDefinition definition) => definition.GetComponent<FunctionalBlockComponent>();
 
-    /// <summary>Первый (по слагу) функциональный блок НАСТОЯЩЕГО каталога, подходящий под условие. Состав функциональных блоков —
-    /// редактируемые пользователем данные (blocks/*.xml переименовывают, удаляют, пересоздают через --blockeditor), поэтому тесты
-    /// берут любой подходящий, а не блок с конкретным слагом.</summary>
-    private static BlockDefinition? FindFunctional(Func<FunctionalBlockComponent, bool>? predicate = null) =>
-        BlockCatalog.Instance.All.OrderBy(d => d.Slug).FirstOrDefault(d => FunctionalOf(d) is { } f && (predicate?.Invoke(f) ?? true));
+    /// <summary>
+    /// На время <c>using</c> подменяет <see cref="BlockCatalog.Instance"/> каталогом из ВСЕХ блоков настоящего blocks/ плюс переданные функциональные
+    /// блоки-фикстуры (слаг, JSON компонента FunctionalBlock). Нужно, потому что в настоящем blocks/ функциональных блоков больше нет (их создают
+    /// заново в редакторе блоков), а <c>VehicleSpawner</c>/<c>BuildEditor</c>/<c>EditorState</c> читают блоки именно из <see cref="BlockCatalog.Instance"/>.
+    /// Слаги фикстур должны начинаться с "zz_": каталог нумерует блоки по алфавиту, и так RuntimeId настоящих блоков не сдвигаются.
+    /// </summary>
+    private static IDisposable UseCatalogWith(params FixtureBlock[] functional)
+    {
+        const string dir = "user://selftest_catalog_scope";
+        DirAccess.MakeDirRecursiveAbsolute(dir);
+        var written = new List<string>();
 
-    private static bool ModelLoads(FunctionalBlockComponent f) =>
-        !string.IsNullOrEmpty(f.ScenePath) && FunctionalBlockGeometry.GetOrLoadScene(f.ScenePath!).Scene != null;
+        using (var source = DirAccess.Open(BlockCatalog.BlocksDirectory))
+        {
+            source.ListDirBegin();
+            for (var name = source.GetNext(); name != ""; name = source.GetNext())
+            {
+                if (source.CurrentIsDir() || !name.EndsWith(".xml", StringComparison.OrdinalIgnoreCase)) continue;
+                using var read = FileAccess.Open($"{BlockCatalog.BlocksDirectory}/{name}", FileAccess.ModeFlags.Read);
+                using var write = FileAccess.Open($"{dir}/{name}", FileAccess.ModeFlags.Write);
+                write.StoreString(read.GetAsText());
+                written.Add(name);
+            }
+
+            source.ListDirEnd();
+        }
+
+        foreach (var (slug, json, parametersJson) in functional)
+        {
+            using var write = FileAccess.Open($"{dir}/{slug}.xml", FileAccess.ModeFlags.Write);
+            write.StoreString(
+                $"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Block id=\"{slug}\" name=\"{slug}\"><Color>#8899aa</Color>" +
+                $"<Component type=\"BaseComponent\">{{ \"mass\": 5 }}</Component>" +
+                (parametersJson != null ? $"<Component type=\"Parameters\">{parametersJson}</Component>" : "") +
+                $"<Component type=\"FunctionalBlock\">{json}</Component></Block>");
+            written.Add($"{slug}.xml");
+        }
+
+        var catalog = BlockCatalog.Load(dir);
+        foreach (string name in written) DirAccess.RemoveAbsolute($"{dir}/{name}");
+        return BlockCatalog.OverrideInstanceForTesting(catalog);
+    }
 
     /// <summary>
     /// ФИКСТУРНЫЙ каталог из трёх временных блоков (простой куб, кнопка с поведением Button, мотор без реализованного поведения),
@@ -2819,12 +3396,12 @@ public sealed class SelfTest
                 "<Component type=\"BaseComponent\">{ \"mass\": 2 }</Component>" +
                 "<Component type=\"FunctionalBlock\">{ \"footprint\": [1,1,1], \"behavior\": \"Button\", " +
                 "\"params\": {\"mode\":\"momentary\",\"glowNode\":\"Cap\",\"glowColor\":\"#33ff55\"}, " +
-                "\"collision\": [ { \"position\": [0,0,0], \"size\": [0.25,0.25,0.25] } ], \"ports\": [], " +
+                "\"collision\": [[0,0,0]], \"ports\": [], " +
                 "\"nodes\": [ { \"id\": \"power_in\", \"type\": \"Electricity\", \"direction\": \"In\", \"position\": [0,0,0] }, " +
                 "{ \"id\": \"signal_out\", \"type\": \"Boolean\", \"direction\": \"Out\", \"position\": [0,0,0] } ] }</Component></Block>",
             ["fx_motor"] = "<Block id=\"fx_motor\" name=\"Motor\"><Color>#39506b</Color>" +
                 "<Component type=\"BaseComponent\">{ \"mass\": 60 }</Component>" +
-                "<Component type=\"FunctionalBlock\">{ \"footprint\": [1,1,1], \"behavior\": \"ElectricMotor\", " +
+                "<Component type=\"FunctionalBlock\">{ \"footprint\": [1,1,1], \"behavior\": \"Winch\", " +
                 "\"ports\": [ { \"id\": \"shaft_out\", \"resource\": \"Torque\", \"direction\": \"Out\", \"face\": \"PosY\", \"position\": [0,0] } ], " +
                 "\"nodes\": [ { \"id\": \"power_in\", \"type\": \"Electricity\", \"direction\": \"In\", \"position\": [0,0,0] } ] }</Component></Block>",
         };
@@ -2993,7 +3570,7 @@ public sealed class SelfTest
         behavior.Interact(silentState, BlockInteraction.Press);
         Check(silentState.OutputNodeId == null && !Read(silentState), "a button with no Out/Boolean node works but outputs nothing");
 
-        Check(!BlockBehaviorRegistry.TryGet("ElectricMotor", out _) && !BlockBehaviorRegistry.TryGet("", out _),
+        Check(!BlockBehaviorRegistry.TryGet("Winch", out _) && !BlockBehaviorRegistry.TryGet("", out _),
             "behavior keys without an implementation (and the empty key) are simply not in the registry");
 
         // ---- FunctionalBlockRuntime: состояние на экземпляр, отдельно от BlockInstance
@@ -3060,17 +3637,16 @@ public sealed class SelfTest
     {
         GD.Print("-- VehicleSpawner: the spawned body carries a FunctionalBlockRuntime");
 
+        // Кнопка-фикстура (поведение Button, нода выхода, один бокс коллизии) подставляется в каталог на время теста.
+        using var scope = UseCatalogWith(("zz_button",
+            "{ \"footprint\": [1,1,1], \"behavior\": \"Button\", \"params\": {\"mode\":\"momentary\"}, \"collision\": [[0,0,0]], " +
+            "\"nodes\": [ { \"id\": \"signal_out\", \"type\": \"Boolean\", \"direction\": \"Out\", \"position\": [0,0,0] } ] }"));
         var catalog = BlockCatalog.Instance;
-        // Кнопка (поведение Button), если в каталоге она есть; иначе - любой функциональный блок. Что именно - пользовательские данные.
-        var def = FindFunctional(f => f.Behavior == ButtonBehavior.Key) ?? FindFunctional();
-        if (def == null)
-        {
-            Check(true, "runtime spawn check skipped: no functional block in the catalog right now");
-            return;
-        }
+        var def = catalog.Get("zz_button");
 
         var fn = FunctionalOf(def)!;
         bool hasBehavior = BlockBehaviorRegistry.TryGet(fn.Behavior, out _);
+        Check(hasBehavior, "setup: the fixture button's behavior is registered");
         var source = new Construction(new VoxelGrid());
         source.Place(new Vector3I(0, 0, 0), catalog.Get("block"), Colors.White);
         source.PlaceBlock(new Vector3I(3, 0, 0), fn.Footprint, def, Colors.White);
@@ -3239,8 +3815,8 @@ public sealed class SelfTest
     /// <summary>
     /// Блок с footprint'ом больше одной клетки (батарея 2×1×1) крутится вокруг КОРНЕВОЙ клетки (под курсором), а не вокруг
     /// центра своего хитбокса, и занятые клетки поворачиваются вместе с ним (<see cref="BlockFootprint"/>). Проверяется на
-    /// чистой математике для всех 64 комбинаций ступеней (в каталоге нет блока с footprint'ом > 1, а каталог менять
-    /// в тесте нельзя): занятые клетки, рамка модели/коллизии и жёсткий поворот призрака вокруг корня.
+    /// чистой математике для всех 64 комбинаций ступеней (в том числе для footprint'ов, начинающихся не с корневой клетки —
+    /// когда якорь модели стоит не в её углу): занятые клетки, рамка модели/коллизии и жёсткий поворот призрака вокруг корня.
     /// </summary>
     private void RunFootprintRotationTests()
     {
@@ -3248,9 +3824,15 @@ public sealed class SelfTest
 
         var rootCell = new Vector3I(5, 3, 7);
         const float cell = BuildSpace.CellSize;
-        var footprints = new[] { new Vector3I(2, 1, 1), new Vector3I(3, 2, 1), new Vector3I(2, 1, 3), Vector3I.One };
+        // (размер footprint'а, его минимальная клетка в рамке блока): корень (0,0,0) всегда внутри, но не обязательно в углу - якорь модели
+        // мог встать в любую её клетку, и тогда footprintMin отрицателен.
+        var footprints = new (Vector3I Size, Vector3I Min)[]
+        {
+            (new Vector3I(2, 1, 1), Vector3I.Zero), (new Vector3I(3, 2, 1), Vector3I.Zero), (new Vector3I(2, 1, 3), Vector3I.Zero), (Vector3I.One, Vector3I.Zero),
+            (new Vector3I(2, 1, 1), new Vector3I(-1, 0, 0)), (new Vector3I(3, 2, 2), new Vector3I(-1, -1, 0)), (new Vector3I(2, 3, 4), new Vector3I(-1, -2, -3)),
+        };
 
-        bool cellsMatch = true, rootInside = true, volumeKept = true, sizePermutes = true, frameAgrees = true, cellCentersMap = true, staysInside = true;
+        bool cellsMatch = true, rootInside = true, volumeKept = true, sizePermutes = true, frameAgrees = true, cellCentersMap = true, staysInside = true, rootRecovered = true;
         string firstProblem = "";
         void Note(ref bool flag, bool ok, string what)
         {
@@ -3259,22 +3841,22 @@ public sealed class SelfTest
             flag = false;
         }
 
-        foreach (var footprint in footprints)
+        foreach (var (footprint, footprintMin) in footprints)
         for (int x = 0; x < 4; x++)
         for (int y = 0; y < 4; y++)
         for (int z = 0; z < 4; z++)
         {
             var steps = new Vector3I(x, y, z);
-            var (origin, size) = BlockFootprint.PlaceBox(rootCell, footprint, steps);
-            string tag = $"footprint={footprint} steps={steps}";
+            var (origin, size) = BlockFootprint.PlaceBox(rootCell, footprintMin, footprint, steps);
+            string tag = $"footprint={footprint} min={footprintMin} steps={steps}";
 
-            // Занятые клетки = корень + повёрнутые локальные клетки.
+            // Занятые клетки = корень + повёрнутые локальные клетки (индексы в рамке блока, от корня).
             var expected = new HashSet<Vector3I>();
             for (int cz = 0; cz < footprint.Z; cz++)
             for (int cy = 0; cy < footprint.Y; cy++)
             for (int cx = 0; cx < footprint.X; cx++)
             {
-                expected.Add(rootCell + BlockFootprint.Rotate(new Vector3I(cx, cy, cz), steps));
+                expected.Add(rootCell + BlockFootprint.Rotate(footprintMin + new Vector3I(cx, cy, cz), steps));
             }
 
             var occupied = new HashSet<Vector3I>();
@@ -3291,17 +3873,18 @@ public sealed class SelfTest
 
             // Рамка ПОСТАВЛЕННОГО экземпляра (по центру занятого бокса) совпадает с рамкой призрака (по корню) - тот же результат.
             var rotation = ShapeMeshBuilder.ComposeRotation(steps);
-            var instanceFrame = FunctionalBlockGeometry.InstanceFrame(origin, size, footprint, steps);
+            var instanceFrame = FunctionalBlockGeometry.InstanceFrame(origin, footprintMin, footprint, steps);
             var rootFrame = FunctionalBlockGeometry.RootFrame(rootCell, rotation);
             Note(ref frameAgrees, instanceFrame.IsEqualApprox(rootFrame), tag);
+            Note(ref rootRecovered, BlockFootprint.RootCell(origin, footprintMin, footprint, steps) == rootCell, tag);
 
             // Центр КАЖДОЙ локальной клетки модели/коллизии попадает в центр соответствующей занятой клетки.
             for (int cz = 0; cz < footprint.Z; cz++)
             for (int cy = 0; cy < footprint.Y; cy++)
             for (int cx = 0; cx < footprint.X; cx++)
             {
-                var local = new Vector3I(cx, cy, cz);
-                var worldPoint = instanceFrame * ((new Vector3(cx, cy, cz) + new Vector3(0.5f, 0.5f, 0.5f)) * cell);
+                var local = footprintMin + new Vector3I(cx, cy, cz);
+                var worldPoint = instanceFrame * ((new Vector3(local.X, local.Y, local.Z) + new Vector3(0.5f, 0.5f, 0.5f)) * cell);
                 Note(ref cellCentersMap, worldPoint.IsEqualApprox(BuildSpace.CellCenter(rootCell + BlockFootprint.Rotate(local, steps))), tag + $" cell={local}");
             }
 
@@ -3311,7 +3894,7 @@ public sealed class SelfTest
             for (int corner = 0; corner < 8; corner++)
             {
                 var localCorner = new Vector3(
-                    (corner & 1) != 0 ? footprint.X : 0, (corner & 2) != 0 ? footprint.Y : 0, (corner & 4) != 0 ? footprint.Z : 0) * cell;
+                    footprintMin.X + ((corner & 1) != 0 ? footprint.X : 0), footprintMin.Y + ((corner & 2) != 0 ? footprint.Y : 0), footprintMin.Z + ((corner & 4) != 0 ? footprint.Z : 0)) * cell;
                 var w = instanceFrame * localCorner;
                 const float eps = 1e-4f;
                 bool inside = w.X >= boxMin.X - eps && w.Y >= boxMin.Y - eps && w.Z >= boxMin.Z - eps
@@ -3320,7 +3903,8 @@ public sealed class SelfTest
             }
         }
 
-        Check(cellsMatch, "all 64 rotations x 4 footprints: occupied cells == root + rotated local cells", firstProblem);
+        Check(cellsMatch, "all 64 rotations x 7 footprints (incl. ones starting left/below/behind the root): occupied cells == root + rotated local cells", firstProblem);
+        Check(rootRecovered, "the root cell of an already placed block is recovered exactly from its occupied box, footprint min and rotation (BlockFootprint.RootCell)", firstProblem);
         Check(rootInside, "the root cell is always occupied (it is the pivot and never moves out of the block)", firstProblem);
         Check(volumeKept && sizePermutes, "the occupied box is the footprint with its axes permuted - same volume, no stretching", firstProblem);
         Check(frameAgrees, "the frame of a PLACED instance (centered on its occupied box) equals the ghost's root-pivot frame", firstProblem);

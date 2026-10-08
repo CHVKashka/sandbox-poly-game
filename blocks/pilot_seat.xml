@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Block id="pilot_seat" name="Pilot seat">
+  <Color>#ffffff</Color>
+  <Component type="BaseComponent">{ "mass": 10, "durability": 100, "damageResistance": 0.1 }</Component>
+  <Component type="Parameters">{ "include": ["ControlAxes"] }</Component>
+  <Component type="FunctionalBlock">{
+    "scene": "res://meshes/pilot_seat.glb",
+    "scale": [0.125, 0.125, 0.125],
+    "anchor": [0, 0, 0],
+    "footprint": [4, 6, 3],
+    "footprintMin": [0, 0, 0],
+    "behavior": "PilotSeat",
+    "params": {"eyeHeight":0.75,"forward":"PosX"},
+    "collision": [
+      [0, 0, 0], [0, 0, 1], [0, 0, 2], [0, 1, 0], [0, 1, 1], [0, 1, 2], [0, 2, 0], [0, 2, 1],
+      [0, 2, 2], [0, 3, 0], [0, 3, 1], [0, 3, 2], [0, 4, 0], [0, 4, 1], [0, 4, 2], [0, 5, 0],
+      [0, 5, 1], [0, 5, 2], [1, 0, 0], [1, 0, 1], [1, 0, 2], [1, 1, 0], [1, 1, 1], [1, 1, 2],
+      [2, 0, 0], [2, 0, 1], [2, 0, 2], [2, 1, 0], [2, 1, 1], [2, 1, 2], [3, 0, 1], [3, 1, 1],
+      [3, 2, 1]
+    ],
+    "ports": [],
+    "nodes": [
+      { "id": "ad_out", "type": "Number", "direction": "Out", "position": [1, 1, 0] },
+      { "id": "ws_out", "type": "Number", "direction": "Out", "position": [2, 1, 0] },
+      { "id": "lf_out", "type": "Number", "direction": "Out", "position": [1, 1, 2] },
+      { "id": "ud_out", "type": "Number", "direction": "Out", "position": [2, 1, 2] },
+      { "id": "hotkey_1", "type": "Boolean", "direction": "Out", "position": [0, 1, 0] },
+      { "id": "hotkey_2", "type": "Boolean", "direction": "Out", "position": [0, 2, 0] },
+      { "id": "hotkey_3", "type": "Boolean", "direction": "Out", "position": [0, 3, 0] },
+      { "id": "hotkey_4", "type": "Boolean", "direction": "Out", "position": [0, 1, 2] },
+      { "id": "hotkey_5", "type": "Boolean", "direction": "Out", "position": [0, 2, 2] },
+      { "id": "hotkey_6", "type": "Boolean", "direction": "Out", "position": [0, 3, 2] },
+      { "id": "occuped", "type": "Boolean", "direction": "Out", "position": [2, 1, 1] },
+      { "id": "triger_1", "type": "Boolean", "direction": "Out", "position": [3, 2, 1] },
+      { "id": "triger_2", "type": "Boolean", "direction": "Out", "position": [3, 1, 1] }
+    ]
+  }</Component>
+</Block>

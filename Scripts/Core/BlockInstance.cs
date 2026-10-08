@@ -52,4 +52,12 @@ public sealed class BlockInstance
     /// (см. <c>UndoHistory</c>).
     /// </summary>
     public Dictionary<int, uint>? RegionColors { get; set; }
+
+    /// <summary>
+    /// Значения настраиваемых параметров этого экземпляра, ОТЛИЧАЮЩИЕСЯ от умолчания схемы (<see cref="Blocks.ParametersComponent"/>) —
+    /// id параметра → каноническое текстовое значение. null/пусто — всё по умолчанию. Меняется инструментом «Parameters»
+    /// (<see cref="Construction.TrySetParameter"/>), сохраняется в файле постройки, откатывается Undo; читают поведения через
+    /// <see cref="Runtime.ParameterSet"/>.
+    /// </summary>
+    public Dictionary<string, string>? Parameters { get; set; }
 }

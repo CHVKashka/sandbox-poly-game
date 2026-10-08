@@ -34,6 +34,13 @@ internal sealed class ToolbarUi
     private readonly Button _borders;
     private readonly Panel _paintDot;
     private readonly Panel _deleteDot;
+    private readonly Button _wire;
+    private readonly Button _parameters;
+    private readonly Control _wireLayerPanel;
+    private readonly Button _layerElectricity;
+    private readonly Button _layerLogic;
+    private readonly Panel _wireDot;
+    private readonly Panel _parametersDot;
     private readonly Panel _resizeDot;
     private readonly Panel _wireframeDot;
     private readonly Panel _bordersDot;
@@ -125,6 +132,37 @@ internal sealed class ToolbarUi
         _deleteDot = UiStyle.AddActiveIndicator(_delete);
         _delete.Toggled += on => _state.Tool = on ? ToolMode.Delete : ToolMode.None;
         column.AddChild(_delete);
+
+        _wire = UiStyle.MakeButton("Nodes", new Vector2(168, 38), toggle: true);
+        _wire.TooltipText = "N: show the nodes of functional blocks and wire them. Drag LMB from a node to another (either direction) to connect them; drag between two already connected nodes to disconnect. Hold Ctrl to keep a node as the anchor and connect it to several others by clicking them. RMB removes all wires of a node. Esc: cancel / deselect";
+        _wireDot = UiStyle.AddActiveIndicator(_wire);
+        _wire.Toggled += on => _state.Tool = on ? ToolMode.Wire : ToolMode.None;
+        column.AddChild(_wire);
+
+        // Вкладки слоёв логики: показывается только пока включён «Nodes».
+        var layers = new VBoxContainer();
+        layers.AddThemeConstantOverride("separation", 4);
+        var layerRow = UiStyle.Transparent(new HBoxContainer());
+        layerRow.AddThemeConstantOverride("separation", 4);
+        _layerElectricity = UiStyle.MakeButton("Electricity", new Vector2(82, 32), toggle: true);
+        _layerElectricity.TooltipText = "Electricity layer: power nodes (yellow)";
+        _layerElectricity.Toggled += on => { if (on) _state.WireLayer = WireLayer.Electricity; else Refresh(); };
+        layerRow.AddChild(_layerElectricity);
+        _layerLogic = UiStyle.MakeButton("Logic", new Vector2(82, 32), toggle: true);
+        _layerLogic.TooltipText = "Logic layer: Number (green) and Boolean (red) nodes";
+        _layerLogic.Toggled += on => { if (on) _state.WireLayer = WireLayer.Logic; else Refresh(); };
+        layerRow.AddChild(_layerLogic);
+        layers.AddChild(layerRow);
+        layers.AddChild(UiStyle.MakeLabel("Number - green, Boolean - red", 12, UiStyle.TextDim));
+        layers.Visible = false;
+        _wireLayerPanel = layers;
+        column.AddChild(layers);
+
+        _parameters = UiStyle.MakeButton("Parameters", new Vector2(168, 38), toggle: true);
+        _parameters.TooltipText = "P: configure blocks that have settings (seat axes, button mode, motor power...). Dark purple = configurable, cyan = under the cursor; Esc closes the panel";
+        _parametersDot = UiStyle.AddActiveIndicator(_parameters);
+        _parameters.Toggled += on => _state.Tool = on ? ToolMode.Parameters : ToolMode.None;
+        column.AddChild(_parameters);
 
         _resizePanel = BuildResizePanel(out _resizeFields[0], out _resizeFields[1], out _resizeFields[2]);
         _resizePanel.Visible = false;
@@ -362,6 +400,9 @@ internal sealed class ToolbarUi
         return button;
     }
 
+    /// <summary>Кнопка-вкладка слоя логики (для самотестов).</summary>
+    public Button WireLayerTab(WireLayer layer) => layer == WireLayer.Electricity ? _layerElectricity : _layerLogic;
+
     public void Refresh()
     {
         _paint.SetPressedNoSignal(_state.Tool == ToolMode.Paint);
@@ -373,6 +414,13 @@ internal sealed class ToolbarUi
 
         _paintDot.Visible = _state.Tool == ToolMode.Paint;
         _deleteDot.Visible = _state.Tool == ToolMode.Delete;
+        _wire.SetPressedNoSignal(_state.Tool == ToolMode.Wire);
+        _parameters.SetPressedNoSignal(_state.Tool == ToolMode.Parameters);
+        _wireDot.Visible = _state.Tool == ToolMode.Wire;
+        _wireLayerPanel.Visible = _state.Tool == ToolMode.Wire;
+        _layerElectricity.SetPressedNoSignal(_state.WireLayer == WireLayer.Electricity);
+        _layerLogic.SetPressedNoSignal(_state.WireLayer == WireLayer.Logic);
+        _parametersDot.Visible = _state.Tool == ToolMode.Parameters;
         _resizeDot.Visible = _state.ResizePanelOpen;
 
         if (_colorPicker.Color != _state.PaintColor) _colorPicker.Color = _state.PaintColor;

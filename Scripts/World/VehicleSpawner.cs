@@ -14,7 +14,7 @@ namespace SandboxPolyGame.World;
 /// — для обычного блока (куб/форма) один <see cref="BoxShape3D"/> НА ЭКЗЕМПЛЯР целиком (не на клетку — заметно
 /// меньше форм на растянутую постройку), как и раньше; функциональный блок (<see cref="FunctionalBlockComponent"/>)
 /// получает РОВНО то, что задано в его <see cref="FunctionalBlockComponent.CollisionBoxes"/>
-/// (см. <c>Dev.BlockPrefabEditor</c>) — БЕЗ автоматического общего бокса, пусто означает "блок физически проходим
+/// (клетки коллизии из редактора блоков, слитые в боксы) — БЕЗ автоматического общего бокса, пусто означает "блок физически проходим
 /// насквозь целиком" (нарочно — у некоторых моделей есть выпирающие за пределы footprint детали, которым коллизия
 /// не нужна). Визуал переиспользует <see cref="VoxelWorld"/> (тот же рендер, что и в редакторе, просто под <see cref="RigidBody3D"/>
 /// вместо статичного узла), без чёрных границ блоков (тот инструмент — только для редактора). Плавучесть/
@@ -62,22 +62,19 @@ public static class VehicleSpawner
             var functional = definition.GetComponent<FunctionalBlockComponent>();
             if (functional != null)
             {
-                // Функциональный блок - коллизия ТОЛЬКО то, что явно задано в его боксах (см. Dev.BlockPrefabEditor),
-                // никакого автоматического бокса на весь экземпляр "на всякий случай" (раньше было иначе - баг,
-                // найденный пользователем: некоторые детали модели нарочно выпирают за пределы footprint и не должны
-                // иметь коллизию вообще - автоматический общий бокс делал это невозможным). Пусто - блок физически
-                // проходим насквозь целиком. Координаты боксов - в ЛОКАЛЬНОЙ системе блока (метры, неповёрнутый),
-                // повёрнуты и сдвинуты тем же трансформом, что и его модель (FunctionalBlockGeometry) -
+                // Функциональный блок - коллизия ТОЛЬКО то, что явно задано клетками в его XML (слитыми при загрузке в минимальный
+                // набор боксов, см. CollisionCells.Merge), никакого автоматического бокса на весь экземпляр "на всякий случай":
+                // некоторые детали модели нарочно выпирают за пределы footprint и не должны иметь коллизию вообще. Пусто - блок
+                // физически проходим насквозь целиком. Координаты боксов - в рамке блока (метры от угла корневой клетки), повёрнуты
+                // и сдвинуты той же рамкой, что и модель (FunctionalBlockView): блок крутится вокруг корневой клетки.
                 // CollisionShape3D.Transform, не только Position, т.к. поворот тоже нужен (бокс не обязан быть кубом).
-                // Рамка - та же, что у модели (FunctionalBlockView): блок крутится вокруг корневой клетки, не вокруг угла/центра
-                // хитбокса (раньше коллизия поворачивалась вокруг угла бокса, а модель - вокруг центра, и они расходились).
-                var frame = FunctionalBlockGeometry.InstanceFrame(instance.Origin, instance.Size, functional.Footprint, instance.RotationSteps);
+                var frame = FunctionalBlockGeometry.InstanceFrame(instance.Origin, functional.FootprintMin, functional.Footprint, instance.RotationSteps);
                 foreach (var box in functional.CollisionBoxes)
                 {
                     body.AddChild(new CollisionShape3D
                     {
-                        Shape = new BoxShape3D { Size = box.Size },
-                        Transform = frame * new Transform3D(Basis.Identity, box.Position + box.Size * 0.5f),
+                        Shape = new BoxShape3D { Size = box.SizeMeters },
+                        Transform = frame * new Transform3D(Basis.Identity, box.CenterMeters),
                     });
                 }
             }

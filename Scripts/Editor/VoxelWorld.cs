@@ -33,6 +33,30 @@ public partial class VoxelWorld : Node3D
     private StandardMaterial3D _borderMaterial = null!;
     private bool _wireframe;
     private bool _borders = true;
+
+    private float _opacity = 1f;
+
+    /// <summary>Непрозрачность сплошных граней форм (1 — как обычно): инструменты «Nodes»/«Parameters» делают постройку полупрозрачной, чтобы были видны ноды внутри.
+    /// Каркас и границы блоков не затрагиваются.</summary>
+    public float Opacity
+    {
+        get => _opacity;
+        set
+        {
+            _opacity = value;
+            ApplyOpacity();
+        }
+    }
+
+    private void ApplyOpacity()
+    {
+        if (_solidMaterial == null) return;
+        _solidMaterial.Transparency = _opacity < 1f ? BaseMaterial3D.TransparencyEnum.Alpha : BaseMaterial3D.TransparencyEnum.Disabled;
+        _solidMaterial.AlbedoColor = new Color(1f, 1f, 1f, _opacity);
+        // Формы и модели функциональных блоков — отдельные слои со своими материалами: прозрачность общая на всю постройку.
+        _shapes.Opacity = _opacity;
+        _functionalBlocks.DefaultOpacity = _opacity;
+    }
     private ShapeInstanceView _shapes = null!;
     private FunctionalBlockView _functionalBlocks = null!;
 
@@ -109,6 +133,7 @@ public partial class VoxelWorld : Node3D
         Construction.Changed += () => _functionalBlocks.Sync(Construction);
 
         Grid.CellChanged += OnCellChanged;
+        ApplyOpacity();
         ApplyVisibility();
     }
 

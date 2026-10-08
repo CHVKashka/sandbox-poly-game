@@ -51,8 +51,9 @@ public sealed class ResourcePort
     /// см. <see cref="FunctionalBlockComponent"/> doc) — не ошибка, просто "лицевая" сторона по умолчанию.</summary>
     public BlockFace Face { get; init; } = BlockFace.PosZ;
 
-    /// <summary>Координата клетки порта ВНУТРИ 2D-сетки этой стороны (0-based; см. <see cref="Editor.FunctionalBlockGeometry.FaceDimensions"/>
-    /// для того, что именно означают X/Y для каждой стороны — это НЕ мировые/блочные оси, а оси конкретной грани).
-    /// По умолчанию (0,0) — угол грани, ближайший к минимальному углу footprint'а.</summary>
+    /// <summary>Клетка порта по двум осям этой стороны — АБСОЛЮТНЫЕ индексы клетки в рамке блока (клетка (0,0,0) — корневая, индексы
+    /// могут быть отрицательными; см. <see cref="Editor.FunctionalBlockGeometry.FaceAxes"/> для того, какие оси блока означают X/Y
+    /// для каждой стороны). У блока, footprint которого начинается с корневой клетки, это то же самое, что отсчёт от угла грани.
+    /// Выход за границы footprint'а клампится при вычислении точки (<see cref="Editor.FunctionalBlockGeometry.ComputePortAnchor"/>).</summary>
     public Vector2I FaceCell { get; init; } = Vector2I.Zero;
 }

@@ -16,6 +16,7 @@ public sealed class EditorUi
     private readonly BlockPickerUi _picker;
     private readonly SaveDialogUi _saveDialogUi;
     private readonly JoinRequestPopupUi _joinPopup;
+    private readonly ParametersPanelUi _parametersPanel;
     private readonly Label _info;
     private readonly Label _status;
     private readonly FileDialog _loadDialog;
@@ -62,6 +63,7 @@ public sealed class EditorUi
         _joinPopup.Responded += (requesterId, accepted) => JoinResponseRequested?.Invoke(requesterId, accepted);
         _hotbar = new HotbarUi(root, state);
         _toolbar = new ToolbarUi(root, state);
+        _parametersPanel = new ParametersPanelUi(root);
 
         _loadDialog = new FileDialog
         {
@@ -125,6 +127,12 @@ public sealed class EditorUi
 
     public bool PickerOpen => _picker.IsOpen;
 
+    /// <summary>Панель параметров блока (инструмент «Parameters»), слева на экране.</summary>
+    public ParametersPanelUi ParametersPanel => _parametersPanel;
+
+    /// <summary>Вкладка слоя логики на тулбаре (самотесты кликают по ней).</summary>
+    public Button WireLayerTab(WireLayer layer) => _toolbar.WireLayerTab(layer);
+
     public bool SaveDialogOpen => _saveDialogUi.IsOpen;
 
     /// <summary>Показать попап "игрок N просится присоединиться" — см. <see cref="JoinRequestPopupUi"/>.</summary>
@@ -154,9 +162,13 @@ public sealed class EditorUi
 
     public void SetStatus(string text) => _status.Text = text;
 
+    /// <summary>Текущий текст строки статуса (для самотестов).</summary>
+    public string Status => _status.Text;
+
     /// <summary>true, если точка экрана лежит над элементом интерфейса (клик по ней не должен попадать в мир).</summary>
     public bool IsPointOverUi(Vector2 point) =>
-        IsModalOpen || _hotbar.Panel.GetGlobalRect().HasPoint(point) || _toolbar.Panel.GetGlobalRect().HasPoint(point);
+        IsModalOpen || _hotbar.Panel.GetGlobalRect().HasPoint(point) || _toolbar.Panel.GetGlobalRect().HasPoint(point)
+        || (_parametersPanel.IsOpen && _parametersPanel.GlobalRect.HasPoint(point));
 
     /// <summary>
     /// Сохраняет постройку под именем/описанием, введёнными в <see cref="SaveDialogUi"/> (см. class doc) —

@@ -26,7 +26,11 @@ public sealed record ButtonSettings(ButtonMode Mode, string GlowNode, Color Glow
     public const string DefaultGlowNode = "Cap";
     public static readonly Color DefaultGlowColor = Color.FromHtml("#33ff55");
 
-    public static ButtonSettings From(FunctionalBlockComponent definition)
+    public static ButtonSettings From(FunctionalBlockComponent definition) => From(definition, ParameterSet.Empty);
+
+    /// <summary>Режим берётся из настраиваемого параметра <c>"mode"</c> экземпляра (инструмент «Parameters»), если он объявлен в схеме блока; иначе — из
+    /// <c>"params"</c> типа блока. Узел-крышка и цвет свечения — константы типа блока.</summary>
+    public static ButtonSettings From(FunctionalBlockComponent definition, ParameterSet parameters)
     {
         string glowNode = definition.GetParam("glowNode", DefaultGlowNode).Trim();
         if (glowNode.Length == 0) glowNode = DefaultGlowNode;
@@ -39,7 +43,8 @@ public sealed record ButtonSettings(ButtonMode Mode, string GlowNode, Color Glow
             else GD.PushWarning($"[button] unreadable glowColor '{colorText}' - using the default");
         }
 
-        return new ButtonSettings(ParseMode(definition.GetParam("mode", "momentary")), glowNode, glowColor);
+        string modeText = parameters.Has("mode") ? parameters.GetString("mode") : definition.GetParam("mode", "momentary");
+        return new ButtonSettings(ParseMode(modeText), glowNode, glowColor);
     }
 
     private static ButtonMode ParseMode(string text)
@@ -79,6 +84,15 @@ public sealed class ButtonState : BlockState
     /// <summary>"Кнопка включена" — то, что показывает и отдаёт кнопка: в momentary это <see cref="Pressed"/>, в toggle —
     /// <see cref="Toggled"/>. Именно по нему идёт и выходной сигнал, и целевое положение/подсветка визуала.</summary>
     public bool Active => Mode == ButtonMode.Toggle ? Toggled : Pressed;
+
+    public override double[] CaptureNet() => new[] { Pressed ? 1.0 : 0.0, Toggled ? 1.0 : 0.0, Powered ? 1.0 : 0.0 };
+
+    public override void ApplyNet(double[] values)
+    {
+        Pressed = At(values, 0) != 0;
+        Toggled = At(values, 1) != 0;
+        Powered = At(values, 2) != 0;
+    }
 }
 
 /// <summary>
@@ -90,12 +104,12 @@ public sealed class ButtonBehavior : BlockBehavior<ButtonState>
 {
     public const string Key = "Button";
 
-    protected override ButtonState CreateState(FunctionalBlockComponent definition)
+    protected override ButtonState CreateState(FunctionalBlockComponent definition, ParameterSet parameters)
     {
         var output = definition.Nodes.FirstOrDefault(p => p.Direction == PortDirection.Out && p.Type == NodeType.Boolean);
         if (output == null) GD.PushWarning("[button] block declares no Out/Boolean node - the button will output nothing");
 
-        return new ButtonState { Mode = ButtonSettings.From(definition).Mode, OutputNodeId = output?.Id };
+        return new ButtonState { Mode = ButtonSettings.From(definition, parameters).Mode, OutputNodeId = output?.Id };
     }
 
     protected override void Interact(ButtonState state, BlockInteraction interaction)

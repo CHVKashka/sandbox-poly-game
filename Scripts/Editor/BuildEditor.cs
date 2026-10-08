@@ -159,6 +159,7 @@ public partial class BuildEditor : Node3D
         _camera.LookAtPoint(new Vector3(3.0, 2.5, 5.0), new Vector3(0.0, 0.3, 0.0));
 
         BuildCursorVisuals();
+        InitializeTools();
 
         _ui = new EditorUi(this, _state);
         if (_networkWorkbenchName is { } workbenchName)
@@ -166,6 +167,7 @@ public partial class BuildEditor : Node3D
             _ui.JoinResponseRequested += (requesterId, accepted) => NetHub.Instance.RespondToJoin(workbenchName, requesterId, accepted);
         }
 
+        InitializeToolsUi();
         _state.Changed += OnStateChanged;
         OnStateChanged();
 
@@ -435,8 +437,22 @@ public partial class BuildEditor : Node3D
         if (e is InputEventMouse) _mouseSeen = true;
         if (e is InputEventMouse mouse && !_looking) _mousePosition = mouse.Position;
 
+        // Клик по миру (не по панели) снимает фокус с текстового поля панели параметров/Resize: иначе после ввода числа горячие клавиши и WASD оставались бы
+        // «в поле» до клика именно по другому элементу интерфейса.
+        if (e is InputEventMouseButton { Pressed: true } click && !_ui.IsPointOverUi(click.Position)) GetViewport().GuiReleaseFocus();
+
         switch (e)
         {
+            // Провод тянули инструментом «Nodes» - отпустили ЛКМ: соединить с нодой под курсором.
+            case InputEventMouseButton { ButtonIndex: MouseButton.Left, Pressed: false } wireRelease when _wireDragFrom != null:
+                WireToolRelease(wireRelease.Position);
+                break;
+
+            // Ctrl зажат/отпущен - для инструмента «Nodes» (якорь множественного соединения); событие идёт дальше как обычно.
+            case InputEventKey ctrlKey when ctrlKey.Keycode == Key.Ctrl || ctrlKey.PhysicalKeycode == Key.Ctrl:
+                SetWireCtrl(ctrlKey.Pressed);
+                break;
+
             case InputEventMouseMotion motion when _looking:
                 _camera.Look(motion.Relative);
                 GetViewport().SetInputAsHandled();
@@ -480,11 +496,33 @@ public partial class BuildEditor : Node3D
             return;
         }
 
+        // Пока печатаем в текстовое поле (панель параметров, Resize), буквы/цифры не должны становиться горячими клавишами редактора; Esc остаётся (закрывает панель).
+        if (key.PhysicalKeycode != Key.Escape && GetViewport().GuiGetFocusOwner() is LineEdit or TextEdit) return;
+
         switch (key.PhysicalKeycode)
         {
             case Key.Tab:
                 _ui.TogglePicker();
                 GetViewport().SetInputAsHandled();
+                break;
+
+            // Esc: сначала отмена тянущегося провода / снятие выбора ноды, затем закрытие панели параметров.
+            case Key.Escape when _state.Tool == ToolMode.Wire && !_ui.PickerOpen && EscapeWireTool():
+                GetViewport().SetInputAsHandled();
+                break;
+
+            case Key.Escape when _ui.ParametersPanel.IsOpen && !_ui.PickerOpen:
+                CloseParametersPanel();
+                GetViewport().SetInputAsHandled();
+                break;
+
+            // Горячие клавиши инструментов «Nodes» (N) и «Parameters» (P) - как клик по кнопке, повтор выключает.
+            case Key.N:
+                _state.Tool = _state.Tool == ToolMode.Wire ? ToolMode.None : ToolMode.Wire;
+                break;
+
+            case Key.P:
+                _state.Tool = _state.Tool == ToolMode.Parameters ? ToolMode.None : ToolMode.Parameters;
                 break;
 
             case Key.Escape when _ui.PickerOpen:
@@ -559,12 +597,15 @@ public partial class BuildEditor : Node3D
                 break;
 
             case MouseButton.Left when button.Pressed:
-                if (ButtonFor(_state.Tool) == MouseButton.Left) StartToolStroke(MouseButton.Left);
+                if (_state.Tool == ToolMode.Wire) WireToolPress(button.Position, button.CtrlPressed);
+                else if (_state.Tool == ToolMode.Parameters) ParametersToolClick();
+                else if (ButtonFor(_state.Tool) == MouseButton.Left) StartToolStroke(MouseButton.Left);
                 else if (_state.Tool == ToolMode.None) PlaceAtHover();
                 break;
 
             case MouseButton.Right when button.Pressed:
-                if (ButtonFor(_state.Tool) == MouseButton.Right) StartToolStroke(MouseButton.Right);
+                if (_state.Tool == ToolMode.Wire) WireToolRemove(button.Position);
+                else if (ButtonFor(_state.Tool) == MouseButton.Right) StartToolStroke(MouseButton.Right);
                 break;
 
             // Колесо мыши — зум камеры (FlyCamera.Zoom), не листание хотбара (слот теперь меняется только клавишами
@@ -645,7 +686,8 @@ public partial class BuildEditor : Node3D
     {
         var functional = definition.GetComponent<FunctionalBlockComponent>();
         var localSize = functional != null ? functional.Footprint : _state.PendingSize;
-        return BlockFootprint.PlaceBox(_hover.PlaceCell, localSize, _state.PendingRotationSteps);
+        var localMin = functional != null ? functional.FootprintMin : Vector3I.Zero;
+        return BlockFootprint.PlaceBox(_hover.PlaceCell, localMin, localSize, _state.PendingRotationSteps);
     }
 
     /// <summary>
@@ -747,7 +789,7 @@ public partial class BuildEditor : Node3D
     /// Docs/05-world-and-vehicle-systems.md, «Мультиплеер»).
     /// </summary>
     private void ApplyEdit(NetEditKind kind, Vector3I cell, Vector3I size, string blockSlug, Color color,
-        Vector3I rotation, Vector3I mirror, int extraInt = 0, bool extraBool = false)
+        Vector3I rotation, Vector3I mirror, int extraInt = 0, bool extraBool = false, bool recordUndo = true)
     {
         if (_networkWorkbenchName != null)
         {
@@ -758,7 +800,7 @@ public partial class BuildEditor : Node3D
         var before = _undo.Capture(_world.Construction);
         if (NetEditOps.Apply(_world.Construction, kind, cell, size, blockSlug, color, rotation, mirror, extraInt, extraBool))
         {
-            _undo.RecordIfChanged(before, _world.Construction);
+            if (recordUndo) _undo.RecordIfChanged(before, _world.Construction);
         }
 
         UpdateHover();
@@ -774,6 +816,8 @@ public partial class BuildEditor : Node3D
         _ghostVisualBasis = _ghostRotationFrom.Slerp(_ghostRotationTo, rotationT);
         if (!_mouseSeen && !_looking && PollCursorPosition() is { } polled) _mousePosition = polled;
         UpdateHover();
+        UpdateWireTool();
+        UpdateParametersHover();
 
         // Удержание кнопки инструмента: он применяется к каждому новому блоку под курсором, но только если мышь сдвинулась —
         // иначе после удаления цель сразу «перескакивает» на следующий блок и удаление проедает постройку насквозь.
@@ -851,15 +895,15 @@ public partial class BuildEditor : Node3D
 
         if (showModel)
         {
-            UpdateGhostModel(ghostScene.scene!, ghostScene.aabb, functional!.Footprint, functional.ModelScale, functional.ModelOffset);
+            UpdateGhostModel(ghostScene.scene!, ghostScene.aabb, functional!.ModelScale, functional.Anchor);
         }
         else if (showGhost)
         {
-            UpdateGhostMesh(definition!, slug, functional?.Footprint ?? _state.PendingSize);
+            UpdateGhostMesh(definition!, slug, functional?.Footprint ?? _state.PendingSize, functional?.FootprintMin ?? Vector3I.Zero);
             _ghostMaterial.AlbedoColor = definition!.DefaultColor;
         }
 
-        bool showOutline = _hover.IsBlock && _state.Tool != ToolMode.None;
+        bool showOutline = _hover.IsBlock && _state.Tool is ToolMode.Paint or ToolMode.Delete;
         _outline.Visible = showOutline;
         if (showOutline)
         {
@@ -941,7 +985,7 @@ public partial class BuildEditor : Node3D
     /// под курсором стоит на месте, блок целиком (вместе с размером) жёстко разворачивается вокруг её центра — для куба, формы и
     /// функционального блока одинаково.
     /// </summary>
-    private void UpdateGhostMesh(BlockDefinition definition, string slug, Vector3I localSize)
+    private void UpdateGhostMesh(BlockDefinition definition, string slug, Vector3I localSize, Vector3I localMin)
     {
         var building = definition.GetComponent<BuildingBlockComponent>();
         var mirror = _state.PendingMirror;
@@ -949,7 +993,8 @@ public partial class BuildEditor : Node3D
 
         var extent = new Vector3(localSize.X, localSize.Y, localSize.Z) * BuildSpace.CellSize;
         // BoxMesh центрирован на своём начале, а меш формы (и рамка) - от мин. угла: куб сдвигается на половину размера в ЛОКАЛЬНЫХ осях.
-        var localShift = isCube ? extent * 0.5f : Vector3.Zero;
+        // localMin - смещение локального бокса функционального блока относительно корневой клетки (у резиновых блоков ноль).
+        var localShift = (isCube ? extent * 0.5f : Vector3.Zero) + BuildSpace.CellMin(localMin);
         _ghost.Transform = FunctionalBlockGeometry.RootFrame(_hover.PlaceCell, _ghostVisualBasis) * new Transform3D(Basis.Identity, localShift);
 
         if (_ghostSlug == slug && _ghostMirror == mirror && _ghostSize == localSize) return;
@@ -983,7 +1028,7 @@ public partial class BuildEditor : Node3D
     /// <see cref="EditorState.PendingMirror"/> для настоящих моделей не поддерживается (см. <see cref="FunctionalBlockGeometry"/>
     /// class doc) — призрак его тоже игнорирует, ровно как и уже поставленный блок.
     /// </summary>
-    private void UpdateGhostModel(PackedScene scene, Aabb aabb, Vector3I footprint, Vector3 modelScale, Vector3 modelOffset)
+    private void UpdateGhostModel(PackedScene scene, Aabb aabb, Vector3 modelScale, Vector3 anchor)
     {
         if (_ghostModelScene != scene)
         {
@@ -993,11 +1038,10 @@ public partial class BuildEditor : Node3D
             _ghostModelScene = scene;
         }
 
-        // Модель - в локальных (неповёрнутых) метрах footprint'а; жёсткий поворот вокруг КОРНЕВОЙ клетки (под курсором) даёт
-        // рамка с анимируемым базисом: корень стоит на месте, остальной блок плавно разворачивается вокруг его центра.
-        var localExtent = new Vector3(footprint.X, footprint.Y, footprint.Z) * BuildSpace.CellSize;
+        // Модель - в рамке блока (метры от угла корневой клетки) по явному масштабу и якорю; жёсткий поворот вокруг КОРНЕВОЙ клетки
+        // (под курсором) даёт рамка с анимируемым базисом: корень стоит на месте, остальной блок плавно разворачивается вокруг его центра.
         var frame = FunctionalBlockGeometry.RootFrame(_hover.PlaceCell, _ghostVisualBasis);
-        _ghostModel!.Transform = frame * FunctionalBlockGeometry.ComputeFitTransform(aabb, localExtent, localExtent * 0.5f, Basis.Identity, modelScale, modelOffset);
+        _ghostModel!.Transform = frame * BlockModelLayout.ModelTransform(aabb, modelScale, anchor);
     }
 
     private void OnStateChanged()
@@ -1018,6 +1062,7 @@ public partial class BuildEditor : Node3D
             _lastPendingRotationBasis = _state.PendingRotationBasis;
         }
 
+        ApplyToolDisplay();
         UpdateCursorVisuals();
     }
 

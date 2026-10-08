@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Linq;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Godot;
@@ -23,10 +24,23 @@ public static class ConstructionIO
         /// <summary>Отражение по X/Y/Z, 0 или 1 на компоненту (см. <see cref="BlockInstance.Mirror"/>). Поле не
         /// обязательно — отсутствует в файлах, сохранённых до появления отражения, тогда считается [0,0,0].</summary>
         [JsonPropertyName("mirror")] public int[]? Mirror { get; set; }
+
+        /// <summary>Значения настраиваемых параметров, отличающиеся от умолчания (см. <see cref="BlockInstance.Parameters"/>). Не обязательно.</summary>
+        [JsonPropertyName("params")] public Dictionary<string, string>? Parameters { get; set; }
+    }
+
+    /// <summary>Провод между нодами: блоки — индексы в списке <c>blocks</c> (идентификаторы экземпляров не переживают загрузку).</summary>
+    private sealed class WireEntry
+    {
+        [JsonPropertyName("from")] public int From { get; set; }
+        [JsonPropertyName("fromNode")] public string FromNode { get; set; } = "";
+        [JsonPropertyName("to")] public int To { get; set; }
+        [JsonPropertyName("toNode")] public string ToNode { get; set; } = "";
     }
 
     /// <summary>
-    /// Формат файла постройки:
+    /// Формат файла постройки (опциональные ключи — <c>rotation</c>, <c>mirror</c>, блок <c>params</c> с изменёнными параметрами и список
+    /// <c>wires</c> с проводами между нодами; без них файл читается как раньше):
     /// <code>
     /// {
     ///   "version": 1,
@@ -53,6 +67,7 @@ public static class ConstructionIO
         [JsonPropertyName("createdUtc")] public string? CreatedUtc { get; set; }
         [JsonPropertyName("modifiedUtc")] public string? ModifiedUtc { get; set; }
         [JsonPropertyName("blocks")] public List<BlockEntry> Blocks { get; set; } = new();
+        [JsonPropertyName("wires")] public List<WireEntry>? Wires { get; set; }
     }
 
     /// <summary>Метаданные именованного сохранения (см. <see cref="ReadMetadata"/>) — без блоков, дёшево читать для
@@ -69,10 +84,13 @@ public static class ConstructionIO
     public static string Serialize(Construction construction, string? name, string? description, string? createdUtc, string? modifiedUtc)
     {
         var document = new Document { Name = name, Description = description, CreatedUtc = createdUtc, ModifiedUtc = modifiedUtc };
+        var indexOf = new Dictionary<int, int>();
         foreach (var instance in construction.Instances)
         {
+            indexOf[instance.InstanceId] = document.Blocks.Count;
             document.Blocks.Add(new BlockEntry
             {
+                Parameters = instance.Parameters is { Count: > 0 } ? new Dictionary<string, string>(instance.Parameters) : null,
                 Id = instance.BlockSlug,
                 Origin = new[] { instance.Origin.X, instance.Origin.Y, instance.Origin.Z },
                 Size = new[] { instance.Size.X, instance.Size.Y, instance.Size.Z },
@@ -80,6 +98,14 @@ public static class ConstructionIO
                 Rotation = new[] { instance.RotationSteps.X, instance.RotationSteps.Y, instance.RotationSteps.Z },
                 Mirror = new[] { instance.Mirror.X, instance.Mirror.Y, instance.Mirror.Z },
             });
+        }
+
+        if (construction.Wires.Count > 0)
+        {
+            document.Wires = construction.Wires
+                .Where(w => indexOf.ContainsKey(w.FromInstance) && indexOf.ContainsKey(w.ToInstance))
+                .Select(w => new WireEntry { From = indexOf[w.FromInstance], FromNode = w.FromNode, To = indexOf[w.ToInstance], ToNode = w.ToNode })
+                .ToList();
         }
 
         return JsonSerializer.Serialize(document, Options);
@@ -100,8 +126,10 @@ public static class ConstructionIO
         var document = JsonSerializer.Deserialize<Document>(json, Options) ?? new Document();
 
         int loaded = 0, skipped = 0;
-        foreach (var entry in document.Blocks)
+        var placed = new BlockInstance?[document.Blocks.Count]; // индекс в файле -> экземпляр (null - пропущенный блок; провода к нему отбрасываются)
+        for (int entryIndex = 0; entryIndex < document.Blocks.Count; entryIndex++)
         {
+            var entry = document.Blocks[entryIndex];
             if (entry.Origin.Length != 3 || entry.Size.Length != 3 || !catalog.TryGetBySlug(entry.Id, out var definition))
             {
                 skipped++;
@@ -119,10 +147,35 @@ public static class ConstructionIO
             var rotation = entry.Rotation is { Length: 3 } r ? new Vector3I(r[0], r[1], r[2]) : Vector3I.Zero;
             var mirror = entry.Mirror is { Length: 3 } m ? new Vector3I(m[0], m[1], m[2]) : Vector3I.Zero;
 
-            if (construction.PlaceBlock(origin, size, definition, color, rotation, mirror) == null) { skipped++; continue; }
+            var instance = construction.PlaceBlock(origin, size, definition, color, rotation, mirror);
+            if (instance == null) { skipped++; continue; }
+
+            // Параметры проходят ту же нормализацию, что и ввод игрока: неизвестный параметр/мусорное значение молча отбрасываются.
+            if (entry.Parameters is { Count: > 0 })
+            {
+                foreach (var (parameterId, text) in entry.Parameters) construction.TrySetParameter(instance, parameterId, text, catalog);
+            }
+
+            placed[entryIndex] = instance;
             loaded++;
         }
 
+        bool wiresAdded = false;
+        if (document.Wires != null)
+        {
+            foreach (var wire in document.Wires)
+            {
+                if (wire.From < 0 || wire.From >= placed.Length || wire.To < 0 || wire.To >= placed.Length) continue;
+                if (placed[wire.From] is not { } from || placed[wire.To] is not { } to) continue;
+                if (construction.CheckWire(from.InstanceId, wire.FromNode, to.InstanceId, wire.ToNode, out var checkedWire, out _, catalog)
+                    && checkedWire.FromInstance == from.InstanceId)
+                {
+                    wiresAdded |= construction.AddWireUnchecked(checkedWire);
+                }
+            }
+        }
+
+        if (wiresAdded) construction.NotifyChanged();
         return (loaded, skipped);
     }
 

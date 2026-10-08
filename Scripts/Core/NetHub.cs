@@ -190,6 +190,7 @@ public partial class NetHub : Node
         // Close() ЯВНО, не просто обнулить ссылку - иначе нижележащий ENet-сокет (UDP-порт сервера) мог не
         // освободиться сразу (баг, найденный пользователем: "Couldn't create an ENet host" при повторном Host()
         // после Exit to menu - предыдущий peer всё ещё держал тот же порт).
+        ClearVehicles();
         Multiplayer.MultiplayerPeer?.Close();
         Multiplayer.MultiplayerPeer = null;
         _isNetworked = false;

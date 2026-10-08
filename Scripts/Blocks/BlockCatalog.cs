@@ -23,6 +23,32 @@ public sealed class BlockCatalog
     /// <summary>Загружается один раз при первом обращении (лениво) и переиспользуется всю сессию игры.</summary>
     public static BlockCatalog Instance => _instance ??= Load(BlocksDirectory);
 
+    /// <summary>
+    /// Для самотестов: на время <c>using</c> подменяет <see cref="Instance"/> заданным каталогом (например, формами из настоящего
+    /// <c>blocks/</c> плюс временные функциональные блоки-фикстуры), по выходу возвращает прежний. Остальной код читает блоки именно из
+    /// <see cref="Instance"/> (по слагу и по <see cref="BlockDefinition.RuntimeId"/>), поэтому на подменённом каталоге работают
+    /// настоящие <c>VehicleSpawner</c>/<c>BuildEditor</c>, а не их копии.
+    /// </summary>
+    public static IDisposable OverrideInstanceForTesting(BlockCatalog catalog)
+    {
+        var previous = _instance;
+        _instance = catalog;
+        return new Restore(() => _instance = previous);
+    }
+
+    private sealed class Restore : IDisposable
+    {
+        private Action? _action;
+
+        public Restore(Action action) => _action = action;
+
+        public void Dispose()
+        {
+            _action?.Invoke();
+            _action = null;
+        }
+    }
+
     private readonly List<BlockDefinition> _all;
     private readonly Dictionary<string, BlockDefinition> _bySlug;
     private readonly Dictionary<ushort, BlockDefinition> _byRuntimeId;
@@ -141,6 +167,7 @@ public sealed class BlockCatalog
         BaseComponent.ComponentType => new BaseComponent(),
         BuildingBlockComponent.ComponentType => new BuildingBlockComponent(),
         FunctionalBlockComponent.ComponentType => new FunctionalBlockComponent(),
+        ParametersComponent.ComponentType => new ParametersComponent(),
         _ => throw new InvalidOperationException($"unknown component type '{type}'"),
     };
 }

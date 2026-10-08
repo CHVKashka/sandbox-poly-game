@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Block id="electric_motor_small" name="Small electric motor">
+  <Color>#ffffff</Color>
+  <Component type="BaseComponent">{ "mass": 10, "durability": 100, "damageResistance": 0.1 }</Component>
+  <Component type="Parameters">{
+    "parameters": [
+      { "id": "maxPower", "label": "Max power", "type": "Float", "min": 0, "max": 1000, "step": 0.01, "default": 0.1, "hint": "charge units per second at full throttle (signal 1 or -1)" },
+      { "id": "maxRpm", "label": "Max RPM", "type": "Float", "min": 0, "max": 10000, "step": 10, "default": 3600, "hint": "revolutions per minute at full throttle; 3600 = 60 revolutions per second" }
+    ]
+  }</Component>
+  <Component type="FunctionalBlock">{
+    "scene": "res://meshes/motor_small.glb",
+    "scale": [0.125, 0.114745, 0.125],
+    "anchor": [0.5, 1, 0.5],
+    "footprint": [1, 1, 1],
+    "footprintMin": [0, 0, 0],
+    "behavior": "ElectricMotor",
+    "collision": [
+      [0, 0, 0]
+    ],
+    "ports": [
+      { "id": "port_1", "resource": "Torque", "direction": "Out", "face": "PosY", "position": [0, 0] }
+    ],
+    "nodes": [
+      { "id": "Signal", "type": "Number", "direction": "In", "position": [0, 0, 0] },
+      { "id": "electricity", "type": "Electricity", "direction": "In", "position": [0, 0, 0] }
+    ]
+  }</Component>
+</Block>

@@ -1,18 +1,30 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <Block id="battery_small" name="Small battery">
   <Color>#ffffff</Color>
-  <Component type="BaseComponent">{ "mass": 10, "durability": 100, "damageResistance": 0.10000000149011612 }</Component>
+  <Component type="BaseComponent">{ "mass": 10, "durability": 100, "damageResistance": 0.1 }</Component>
+  <Component type="Parameters">{
+    "parameters": [
+      { "id": "levelOutput", "label": "Level output", "type": "Enum", "options": ["absolute", "fraction"], "default": "absolute", "hint": "absolute: charge in units (0..capacity); fraction: 0..1" },
+      { "id": "initialCharge", "label": "Initial charge", "type": "Float", "min": 0, "max": 1, "step": 0.05, "default": 1, "hint": "share of the capacity when the vehicle spawns" },
+      { "id": "chargeRate", "label": "Charge rate", "type": "Float", "min": 0, "max": 1000, "step": 1, "default": 20, "hint": "max units per second accepted on the electricity input" }
+    ]
+  }</Component>
   <Component type="FunctionalBlock">{
-    "footprint": [2, 1, 1],
     "scene": "res://meshes/battary_small.glb",
+    "scale": [0.125, 0.12, 0.125],
+    "anchor": [0, 0, 0],
+    "footprint": [2, 1, 1],
+    "footprintMin": [0, 0, 0],
+    "behavior": "Battery",
+    "capacity": 1000,
     "collision": [
-      { "position": [0, 0, 0], "size": [0.5, 0.25, 0.25] }
+      [0, 0, 0], [1, 0, 0]
     ],
     "ports": [],
     "nodes": [
-      { "id": "charge_in", "type": "Electricity", "direction": "In", "position": [0, 0, 0] },
-      { "id": "charge_out", "type": "Electricity", "direction": "Out", "position": [1, 0, 0] },
-      { "id": "charge_level", "type": "Number", "direction": "Out", "position": [0, 0, 0] }
+      { "id": "charge_level", "type": "Number", "direction": "Out", "position": [0, 0, 0] },
+      { "id": "electricity_out", "type": "Electricity", "direction": "Out", "position": [0, 0, 0] },
+      { "id": "electricity_in", "type": "Electricity", "direction": "In", "position": [1, 0, 0] }
     ]
   }</Component>
 </Block>

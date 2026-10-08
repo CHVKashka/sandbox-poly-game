@@ -1,7 +1,7 @@
 @echo off
-REM Builds the C# project, then runs the block prefab editor (--blockeditor, see Docs\05-world-and-vehicle-systems.md)
+REM Builds the C# project, then runs the block editor (--blockeditor, see Docs\05-world-and-vehicle-systems.md)
 REM with the custom double-precision engine. Optional argument: slug of an existing block to open immediately,
-REM e.g.  blockeditor.bat electric_motor
+REM e.g.  blockeditor.bat my_block
 REM The engine is located automatically (see Tools\find-godot-engine.ps1) - no path to edit here.
 REM To force a specific engine, set GODOT_SRC before running, e.g.:  set GODOT_SRC=D:\Godot\godot-src && blockeditor.bat
 setlocal enabledelayedexpansion

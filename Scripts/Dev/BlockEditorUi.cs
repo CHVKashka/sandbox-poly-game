@@ -4,26 +4,30 @@ using System.Globalization;
 using System.Linq;
 using Godot;
 using SandboxPolyGame.Blocks;
+using SandboxPolyGame.Core;
+using SandboxPolyGame.Editor;
 using SandboxPolyGame.Editor.Ui;
 
 namespace SandboxPolyGame.Dev;
 
 /// <summary>
-/// Боковая панель <see cref="BlockPrefabEditor"/> (<c>--blockeditor</c>) — все текстовые поля/кнопки, без 3D-логики
-/// (та — в самом <see cref="BlockPrefabEditor"/>). Числовые поля — тот же паттерн, что и у Resize-панели
-/// <see cref="ToolbarUi"/>: применяются по Enter/потере фокуса, некорректный ввод откатывается на предыдущее
-/// значение, а не падает и не зависает в невалидном состоянии.
+/// Боковая панель <see cref="BlockEditor"/> (<c>--blockeditor</c>) — все текстовые поля/кнопки, без 3D-логики (та — в самом
+/// <see cref="BlockEditor"/>). Числовые поля — тот же паттерн, что и у Resize-панели <see cref="ToolbarUi"/>: применяются по
+/// Enter/потере фокуса, некорректный ввод заменяется значением по умолчанию, а не падает и не зависает в невалидном состоянии.
+/// Footprint здесь НЕ поле: он считается автоматически из bbox модели (см. <see cref="BlockModelLayout.ComputeFootprint"/>) и
+/// только показывается (<see cref="SetModelInfo"/>).
 /// </summary>
-public sealed class BlockPrefabEditorUi
+public sealed class BlockEditorUi
 {
     public event Action<string>? LoadRequested;
     public event Action? NewRequested;
     public event Action? SaveRequested;
-    public event Action? FieldsChanged; // любое поле (кроме боксов коллизии) изменилось - призыв пересчитать превью
+    public event Action? FieldsChanged; // любое поле (кроме рядов коллизии/портов/нод) изменилось - пересчитать превью
     public event Action? ReloadSceneRequested;
-    public event Action? AddCollisionBoxRequested;
-    public event Action<int>? RemoveCollisionBoxRequested;
-    public event Action? CollisionBoxesChanged;
+    public event Action? AddCollisionGroupRequested;
+    public event Action? FillCollisionFromFootprintRequested;
+    public event Action<int>? RemoveCollisionGroupRequested;
+    public event Action? CollisionChanged;
     public event Action? AddPortRequested;
     public event Action<int>? RemovePortRequested;
     public event Action? PortsChanged;
@@ -32,11 +36,9 @@ public sealed class BlockPrefabEditorUi
     public event Action? NodesChanged;
 
     /// <summary>
-    /// Фокус вошёл в любое редактируемое поле (текст/дропдаун) — ПЕРЕД тем, как пользователь успел что-то в нём
-    /// поменять (см. <see cref="BindUndoCapture"/>). <see cref="BlockPrefabEditor"/> снимает снэпшот ДО изменения
-    /// именно по этому событию, а не по <see cref="FieldsChanged"/>/<see cref="CollisionBoxesChanged"/>/
-    /// <see cref="PortsChanged"/> — те стреляют уже ПОСЛЕ того, как Godot применил новое значение к полю (по Enter/
-    /// потере фокуса), то есть "состояние до правки" к этому моменту уже потеряно.
+    /// Фокус вошёл в любое редактируемое поле (текст/дропдаун) — ПЕРЕД тем, как пользователь успел что-то в нём поменять
+    /// (см. <see cref="BindUndoCapture"/>). <see cref="BlockEditor"/> снимает снэпшот для Undo/Redo ДО изменения именно по
+    /// этому событию, а не по событиям «значение изменилось» — те стреляют уже ПОСЛЕ того, как Godot применил новое значение.
     /// </summary>
     public event Action? EditSessionStarting;
 
@@ -48,18 +50,19 @@ public sealed class BlockPrefabEditorUi
     private readonly LineEdit _durabilityField;
     private readonly LineEdit _damageField;
     private readonly LineEdit _sceneField;
-    private readonly LineEdit[] _footprintFields = new LineEdit[3];
-    private readonly LineEdit[] _modelScaleFields = new LineEdit[3];
-    private readonly LineEdit[] _modelOffsetFields = new LineEdit[3];
+    private readonly LineEdit[] _scaleFields = new LineEdit[3];
+    private readonly OptionButton[] _anchorDropdowns = new OptionButton[3];
+    private readonly Label _modelInfo;
     private readonly LineEdit _behaviorField;
     private readonly LineEdit _capacityField;
     private readonly TextEdit _paramsField;
+    private readonly TextEdit _schemaField;
     private readonly VBoxContainer _nodeList;
     private readonly VBoxContainer _collisionList;
     private readonly VBoxContainer _portList;
     private readonly Label _status;
 
-    private readonly List<(LineEdit[] Position, LineEdit[] Size)> _collisionRows = new();
+    private readonly List<(LineEdit[] Min, LineEdit[] Size)> _collisionRows = new();
     private bool _suppressCollisionEvents;
 
     private readonly List<(LineEdit Id, OptionButton Resource, OptionButton Direction, OptionButton Face, LineEdit[] FaceCell)> _portRows = new();
@@ -72,8 +75,13 @@ public sealed class BlockPrefabEditorUi
     private static readonly PortDirection[] DirectionValues = (PortDirection[])Enum.GetValues(typeof(PortDirection));
     private static readonly BlockFace[] FaceValues = (BlockFace[])Enum.GetValues(typeof(BlockFace));
     private static readonly NodeType[] NodeTypeValues = (NodeType[])Enum.GetValues(typeof(NodeType));
+    private static readonly float[] AnchorFractions = { 0f, 0.5f, 1f };
+    private static readonly string[] AnchorNames = { "Min", "Center", "Max" };
 
-    public BlockPrefabEditorUi(Control layerRoot)
+    /// <summary>Верхний предел числа клеток, которые можно записать в XML коллизии (защита от случайного 1000×1000×1000).</summary>
+    public const int MaxCollisionCells = 20000;
+
+    public BlockEditorUi(Control layerRoot)
     {
         var panel = new PanelContainer();
         panel.AddThemeStyleboxOverride("panel", UiStyle.Panel(14f));
@@ -88,10 +96,11 @@ public sealed class BlockPrefabEditorUi
         column.AddThemeConstantOverride("separation", 8);
         scroll.AddChild(column);
 
-        column.AddChild(UiStyle.MakeLabel("Block Prefab Editor (--blockeditor)", 18));
+        column.AddChild(UiStyle.MakeLabel("Block Editor (--blockeditor)", 18));
         var hint = UiStyle.MakeLabel(
-            "WASD/Q/E + зажатая СКМ - камера, колесо - зум. Фокус с полей снимается автоматически при клике в " +
-            "3D-вид, чтобы WASD не уходило в текст. Числа применяются по Enter/потере фокуса.", 12, UiStyle.TextDim);
+            "WASD/Q/E + зажатая СКМ - камера, колесо - зум. ЛКМ по белому маркеру на фиолетовой рамке - выбрать якорь, " +
+            "ЛКМ-перетаскивание цветной стрелки - масштаб по оси (Shift - по всем осям). Ctrl+Z / Ctrl+Y - отмена/повтор. " +
+            "Числа применяются по Enter/потере фокуса.", 12, UiStyle.TextDim);
         hint.AutowrapMode = TextServer.AutowrapMode.WordSmart;
         column.AddChild(hint);
 
@@ -132,51 +141,53 @@ public sealed class BlockPrefabEditorUi
         sceneRow.AddChild(reloadButton);
         column.AddChild(sceneRow);
 
-        var footprintRow = new HBoxContainer();
-        footprintRow.AddChild(UiStyle.MakeLabel("Footprint (клетки)", 13));
-        for (int axis = 0; axis < 3; axis++)
-        {
-            var field = new LineEdit { CustomMinimumSize = new Vector2(50, 28), Text = "1" };
-            field.TextSubmitted += _ => FieldsChanged?.Invoke();
-            field.FocusExited += () => FieldsChanged?.Invoke();
-            footprintRow.AddChild(field);
-            _footprintFields[axis] = field;
-        }
-        column.AddChild(footprintRow);
-
         var scaleRow = new HBoxContainer();
-        scaleRow.AddChild(UiStyle.MakeLabel("Model stretch X/Y/Z", 13));
+        scaleRow.AddChild(UiStyle.MakeLabel("Scale X/Y/Z", 13));
         for (int axis = 0; axis < 3; axis++)
         {
-            var field = new LineEdit { CustomMinimumSize = new Vector2(50, 28), Text = "1" };
+            var field = new LineEdit
+            {
+                CustomMinimumSize = new Vector2(80, 28),
+                Text = BlockModelLayout.DefaultScale.ToString(CultureInfo.InvariantCulture),
+            };
             field.TextSubmitted += _ => FieldsChanged?.Invoke();
             field.FocusExited += () => FieldsChanged?.Invoke();
             scaleRow.AddChild(field);
-            _modelScaleFields[axis] = field;
+            _scaleFields[axis] = field;
         }
+
+        var resetScaleButton = UiStyle.MakeButton("Default", new Vector2(70, 28));
+        resetScaleButton.Pressed += ResetScale;
+        scaleRow.AddChild(resetScaleButton);
         column.AddChild(scaleRow);
         var scaleHint = UiStyle.MakeLabel(
-            "Множитель поверх автоматической подгонки (1 = как в игре по умолчанию) - растянуть модель вручную " +
-            "под границы хитбокса, если автоматическая подгонка не годится.", 11, UiStyle.TextDim);
+            "Масштаб модели по осям (по умолчанию 0.125: 2 м в Blender = 1 клетка = 0.25 м). Автоподгонки по bbox нет. " +
+            "Якорь при изменении масштаба остаётся на месте.", 11, UiStyle.TextDim);
         scaleHint.AutowrapMode = TextServer.AutowrapMode.WordSmart;
         column.AddChild(scaleHint);
 
-        var offsetRow = new HBoxContainer();
-        offsetRow.AddChild(UiStyle.MakeLabel("Model offset X/Y/Z (м)", 13));
+        var anchorRow = new HBoxContainer();
+        anchorRow.AddChild(UiStyle.MakeLabel("Anchor X/Y/Z", 13));
         for (int axis = 0; axis < 3; axis++)
         {
-            var field = new LineEdit { CustomMinimumSize = new Vector2(60, 28), Text = "0" };
-            field.TextSubmitted += _ => FieldsChanged?.Invoke();
-            field.FocusExited += () => FieldsChanged?.Invoke();
-            offsetRow.AddChild(field);
-            _modelOffsetFields[axis] = field;
+            var dropdown = MakeEnumDropdown(AnchorNames, 0);
+            dropdown.ItemSelected += _ => FieldsChanged?.Invoke();
+            BindUndoCapture(dropdown);
+            anchorRow.AddChild(dropdown);
+            _anchorDropdowns[axis] = dropdown;
         }
-        column.AddChild(offsetRow);
-        var offsetHint = UiStyle.MakeLabel(
-            "Сдвиг модели внутри клетки в метрах (оси неповёрнутого блока, 0 = по центру габарита модели) - чтобы " +
-            "асимметричная модель (угловая труба) совпала с центрами клетки. Коллизию и порты не двигает.", 11, UiStyle.TextDim);
-        offsetHint.AutowrapMode = TextServer.AutowrapMode.WordSmart;
-        column.AddChild(offsetHint);
+
+        column.AddChild(anchorRow);
+        var anchorHint = UiStyle.MakeLabel(
+            "Какая точка bbox модели встаёт в клетку (0,0,0) (Min/Center/Max по каждой оси; можно и кликом по маркеру в 3D). " +
+            "Min/Min/Min - нижний задний левый угол bbox в точке (0,0,0). Точка попадает в ту же долю клетки (0,0,0), что и в bbox.", 11, UiStyle.TextDim);
+        anchorHint.AutowrapMode = TextServer.AutowrapMode.WordSmart;
+        column.AddChild(anchorHint);
+
+        _modelInfo = UiStyle.MakeLabel("", 12, UiStyle.Accent);
+        _modelInfo.AutowrapMode = TextServer.AutowrapMode.WordSmart;
+        _modelInfo.CustomMinimumSize = new Vector2(480, 0);
+        column.AddChild(_modelInfo);
 
         column.AddChild(Separator());
         _behaviorField = AddTextRow(column, "Behavior", "");
@@ -184,10 +195,13 @@ public sealed class BlockPrefabEditorUi
         _paramsField = AddJsonField(column,
             "Behavior params (JSON-объект, пусто = нет; у Button: \"mode\" momentary|toggle, \"glowNode\" имя узла-крышки, " +
             "\"glowColor\" #rrggbb)", 66);
+        _schemaField = AddJsonField(column,
+            "Parameters schema (компонент Parameters, JSON: что игрок настраивает инструментом Parameters; пусто = блок без настроек; сохраняется как есть)", 100);
 
         column.AddChild(Separator());
         var portsHeader = new HBoxContainer();
-        var portsHeaderLabel = UiStyle.MakeLabel("Ports (ФИЗИЧЕСКИЕ: вал Torque / труба Fluid; несколько портов могут сидеть в одном месте)", 13, UiStyle.TextDim);
+        var portsHeaderLabel = UiStyle.MakeLabel(
+            "Ports (ФИЗИЧЕСКИЕ: вал Torque / труба Fluid; несколько портов могут сидеть в одном месте; cell - индексы клетки грани в рамке блока)", 13, UiStyle.TextDim);
         portsHeaderLabel.AutowrapMode = TextServer.AutowrapMode.WordSmart;
         portsHeaderLabel.CustomMinimumSize = new Vector2(360, 0);
         portsHeader.AddChild(portsHeaderLabel);
@@ -218,10 +232,17 @@ public sealed class BlockPrefabEditorUi
 
         column.AddChild(Separator());
         var collisionHeader = new HBoxContainer();
-        collisionHeader.AddChild(UiStyle.MakeLabel("Collision boxes (метры, локально для блока; пусто = нет коллизии)", 13, UiStyle.TextDim));
-        var addBoxButton = UiStyle.MakeButton("+ Add box", new Vector2(100, 26));
-        addBoxButton.Pressed += () => AddCollisionBoxRequested?.Invoke();
-        collisionHeader.AddChild(addBoxButton);
+        var collisionLabel = UiStyle.MakeLabel(
+            "Collision (клетки: min x/y/z + размер в клетках; источник правды в XML - сами клетки; пусто = нет коллизии)", 13, UiStyle.TextDim);
+        collisionLabel.AutowrapMode = TextServer.AutowrapMode.WordSmart;
+        collisionLabel.CustomMinimumSize = new Vector2(260, 0);
+        collisionHeader.AddChild(collisionLabel);
+        var addCellsButton = UiStyle.MakeButton("+ Cells", new Vector2(70, 26));
+        addCellsButton.Pressed += () => AddCollisionGroupRequested?.Invoke();
+        collisionHeader.AddChild(addCellsButton);
+        var fillButton = UiStyle.MakeButton("Fill footprint", new Vector2(110, 26));
+        fillButton.Pressed += () => FillCollisionFromFootprintRequested?.Invoke();
+        collisionHeader.AddChild(fillButton);
         column.AddChild(collisionHeader);
 
         _collisionList = new VBoxContainer();
@@ -239,40 +260,40 @@ public sealed class BlockPrefabEditorUi
 
         layerRoot.AddChild(panel);
 
-        // Каждое базовое поле (кроме slug/collision, у которых своя логика) помечает превью как "грязное" И снимает
-        // снэпшот для Undo/Redo (см. BindUndoCapture) ПРИ ВХОДЕ фокуса в поле - до того, как значение изменится.
+        // Каждое базовое поле помечает превью как "грязное" И снимает снэпшот для Undo/Redo (см. BindUndoCapture) ПРИ ВХОДЕ
+        // фокуса в поле - до того, как значение изменится.
         foreach (var field in new[] { _nameField, _colorField, _massField, _durabilityField, _damageField, _behaviorField, _capacityField })
         {
             field.TextSubmitted += _ => FieldsChanged?.Invoke();
             field.FocusExited += () => FieldsChanged?.Invoke();
             BindUndoCapture(field);
         }
+
         BindUndoCapture(_sceneField);
         _paramsField.FocusExited += () => FieldsChanged?.Invoke(); // многострочное поле: Enter - новая строка, применяем по потере фокуса
         BindUndoCapture(_paramsField);
-        foreach (var field in _footprintFields) BindUndoCapture(field);
-        foreach (var field in _modelScaleFields) BindUndoCapture(field);
-        foreach (var field in _modelOffsetFields) BindUndoCapture(field);
+        _schemaField.FocusExited += () => FieldsChanged?.Invoke();
+        BindUndoCapture(_schemaField);
+        foreach (var field in _scaleFields) BindUndoCapture(field);
     }
 
     /// <summary>Снимает Undo-снэпшот, когда фокус ВХОДИТ в это поле/дропдаун — ДО того, как пользователь успеет что-то
-    /// в нём поменять (см. <see cref="EditSessionStarting"/> doc про то, почему не на событии "значение изменилось").</summary>
+    /// в нём поменять (см. <see cref="EditSessionStarting"/> doc).</summary>
     private void BindUndoCapture(Control control) => control.FocusEntered += () => EditSessionStarting?.Invoke();
 
+    private void ResetScale()
+    {
+        EditSessionStarting?.Invoke();
+        SetModelScale(BlockModelLayout.DefaultScaleVector);
+        FieldsChanged?.Invoke();
+    }
+
     /// <summary>
-    /// Открывает НАТИВНЫЙ диалог выбора файла ОС (<see cref="DisplayServer.FileDialogShow"/> — на Windows это и есть
-    /// обычный проводник, а не свой `Control`-диалог Godot) для выбора `.glb`/`.gltf`, по запросу пользователя
-    /// ("подгрузка моделей через проводник Windows"), вместо печати пути в <see cref="_sceneField"/> руками.
-    /// <para/>
-    /// Выбранный файл ВНЕ папки проекта скопировать НЕЛЬЗЯ сослаться на него через <c>res://</c> напрямую (движок
-    /// пакует только то, что лежит внутри проекта) — поэтому такой файл копируется в <c>res://meshes/</c>
-    /// (<see cref="DirAccess.CopyAbsolute"/>, тем же именем файла, перезаписывая одноимённый, если уже есть). Файл,
-    /// уже лежащий где-то ВНУТРИ проекта, просто используется по месту (<see cref="ProjectSettings.LocalizePath"/>
-    /// возвращает для него настоящий <c>res://...</c>, без копирования).
-    /// <para/>
-    /// Модель видна в превью СРАЗУ, без `--import`/перезапуска — <see cref="FunctionalBlockGeometry.GetOrLoadScene"/>
-    /// при отсутствии кэша импорта (свежескопированный/никогда не импортировавшийся файл) читает `.glb`/`.gltf`
-    /// напрямую через <see cref="GltfDocument"/>, в обход конвейера импорта редактора (см. его doc-комментарий).
+    /// Открывает НАТИВНЫЙ диалог выбора файла ОС (<see cref="DisplayServer.FileDialogShow"/> — на Windows это обычный проводник) для
+    /// выбора `.glb`/`.gltf`. Выбранный файл ВНЕ папки проекта копируется в <c>res://meshes/</c> (<see cref="DirAccess.CopyAbsolute"/>,
+    /// тем же именем, перезаписывая одноимённый) — движок ссылается только на файлы внутри проекта; файл, уже лежащий внутри
+    /// проекта, используется по месту. Модель видна в превью СРАЗУ: <see cref="FunctionalBlockGeometry.GetOrLoadScene"/> читает
+    /// `.glb`/`.gltf` напрямую через <see cref="GltfDocument"/>, без `--import`/перезапуска.
     /// </summary>
     private void BrowseForModel()
     {
@@ -294,7 +315,8 @@ public sealed class BlockPrefabEditorUi
             }));
     }
 
-    private void ApplyChosenModelPath(string nativePath)
+    /// <summary>Обрабатывает выбранный в диалоге файл (публичный — вызывается и самотестом без настоящего диалога).</summary>
+    public void ApplyChosenModelPath(string nativePath)
     {
         string localized = ProjectSettings.LocalizePath(nativePath);
         string resPath;
@@ -319,9 +341,9 @@ public sealed class BlockPrefabEditorUi
             copied = true;
         }
 
-        // Порядок важен: ставим СВОЙ статус ДО перезагрузки, а не после - если сцена реально не прочитается (битый
-        // файл и т.п.), RefreshPreview сам перезапишет его настоящей ошибкой ("scene not found/failed to load: ...",
-        // см. Dev.BlockPrefabEditor.RefreshPreview) - наш "скопировано"/"установлено" не должен эту ошибку скрывать.
+        // Порядок важен: ставим СВОЙ статус ДО перезагрузки - если сцена реально не прочитается, превью само перезапишет его
+        // настоящей ошибкой, наш "скопировано"/"установлено" не должен её скрывать. Смена модели - правка, значит точка Undo.
+        EditSessionStarting?.Invoke();
         _sceneField.Text = resPath;
         SetStatus(copied ? $"copied into {resPath}" : $"model set to {resPath}");
         ReloadSceneRequested?.Invoke();
@@ -339,8 +361,8 @@ public sealed class BlockPrefabEditorUi
         return field;
     }
 
-    /// <summary>Подпись + многострочное поле для сырого JSON (параметры поведения, сигнальные порты) — применяется по потере
-    /// фокуса (Enter в многострочном поле — перенос строки, не "применить").</summary>
+    /// <summary>Подпись + многострочное поле для сырого JSON (параметры поведения) — применяется по потере фокуса
+    /// (Enter в многострочном поле — перенос строки, не "применить").</summary>
     private static TextEdit AddJsonField(VBoxContainer column, string label, float height)
     {
         var caption = UiStyle.MakeLabel(label, 12, UiStyle.TextDim);
@@ -387,25 +409,63 @@ public sealed class BlockPrefabEditorUi
 
     public string Slug => _slugField.Text.Trim();
 
-    /// <summary>Для самотестов — меняет только слаг (остальные поля через <see cref="LoadFields"/>), т.к. в обычном
-    /// UI слаг печатается руками, а не задаётся программно.</summary>
+    /// <summary>Для самотестов — меняет только слаг (в обычном UI он печатается руками).</summary>
     public void SetSlugForTesting(string slug) => _slugField.Text = slug;
 
-    /// <summary>Для самотестов — меняет только "Model offset" (см. <see cref="ModelOffset"/>), не трогая остальные поля.</summary>
-    public void SetModelOffsetForTesting(Vector3 offset)
+    public string Name => string.IsNullOrWhiteSpace(_nameField.Text) ? Slug : _nameField.Text.Trim();
+    public string ScenePath => _sceneField.Text.Trim();
+    public string Behavior => _behaviorField.Text.Trim();
+
+    public Color Color => TryParseColor(_colorField.Text, out var color) ? color : Colors.White;
+
+    /// <summary>Масштаб модели по осям; нечисловой/неположительный ввод заменяется значением по умолчанию
+    /// (<see cref="BlockModelLayout.DefaultScale"/>), округляется до 6 знаков (чтобы в XML не попадал float-шум).</summary>
+    public Vector3 ModelScale => new(
+        ParsePositiveOr(_scaleFields[0].Text, BlockModelLayout.DefaultScale),
+        ParsePositiveOr(_scaleFields[1].Text, BlockModelLayout.DefaultScale),
+        ParsePositiveOr(_scaleFields[2].Text, BlockModelLayout.DefaultScale));
+
+    /// <summary>Якорь — доли bbox {0, 0.5, 1} по осям (см. <see cref="BlockModelLayout"/>).</summary>
+    public Vector3 Anchor => new(
+        AnchorFractions[Math.Max(_anchorDropdowns[0].Selected, 0)],
+        AnchorFractions[Math.Max(_anchorDropdowns[1].Selected, 0)],
+        AnchorFractions[Math.Max(_anchorDropdowns[2].Selected, 0)]);
+
+    public float Mass => ParseFloatOr(_massField.Text, 10f);
+    public float Durability => ParseFloatOr(_durabilityField.Text, 100f);
+    public float DamageResistance => ParseFloatOr(_damageField.Text, 0.1f);
+    public float Capacity => ParseFloatOr(_capacityField.Text, 0f);
+
+    /// <summary>Сырой текст поля "Behavior params" (JSON-объект или пусто) — разбор и проверка в <see cref="BlockEditor"/>.</summary>
+    public string ParamsJson => _paramsField.Text.Trim();
+
+    /// <summary>Текст компонента <c>Parameters</c> (схема настраиваемых параметров блока, JSON; пусто — у блока нет настроек) — редактор хранит и записывает его как есть, чтобы пересохранение блока его не стирало.</summary>
+    public string ParametersSchemaJson => _schemaField.Text.Trim();
+
+    /// <summary>Для самотестов — задаёт текст схемы параметров.</summary>
+    public void SetParametersSchemaForTesting(string json) => _schemaField.Text = json;
+
+    /// <summary>Для самотестов — задаёт только параметры поведения (JSON-текст), не трогая остальные поля.</summary>
+    public void SetParamsForTesting(string paramsJson) => _paramsField.Text = paramsJson;
+
+    /// <summary>Записывает масштаб в поля (без событий) — вызывается и перетаскиванием стрелки в 3D, и Undo.</summary>
+    public void SetModelScale(Vector3 scale)
     {
-        for (int axis = 0; axis < 3; axis++) _modelOffsetFields[axis].Text = offset[axis].ToString(CultureInfo.InvariantCulture);
+        for (int axis = 0; axis < 3; axis++) _scaleFields[axis].Text = FormatNumber(scale[axis]);
     }
 
-    /// <summary>Для самотестов — меняет только "Model stretch" (см. <see cref="ModelScale"/>), не трогая остальные поля.</summary>
-    public void SetModelScaleForTesting(Vector3 scale)
+    /// <summary>Записывает якорь в выпадающие списки (без событий). Доли привязываются к {0, 0.5, 1}.</summary>
+    public void SetAnchor(Vector3 anchor)
     {
-        for (int axis = 0; axis < 3; axis++) _modelScaleFields[axis].Text = scale[axis].ToString(CultureInfo.InvariantCulture);
+        var snapped = BlockModelLayout.SnapAnchor(anchor);
+        // (float): в сборке движка с double-precision Vector3[axis] - double, а Array.IndexOf сравнивает как object и вернул бы -1 для float-массива.
+        for (int axis = 0; axis < 3; axis++) _anchorDropdowns[axis].Selected = Array.IndexOf(AnchorFractions, (float)snapped[axis]);
     }
 
-    /// <summary>Для самотестов — заполняет поля УЖЕ СУЩЕСТВУЮЩЕГО ряда порта (добавленного через
-    /// <see cref="AddPortRequested"/>/<see cref="SetPortRows"/>) напрямую, без события <see cref="PortsChanged"/> —
-    /// обычный UI правит их руками по одному полю за раз, тестам нужно выставить все сразу.</summary>
+    /// <summary>Строка с размерами модели/footprint'ом под полями якоря — только показ, не данные.</summary>
+    public void SetModelInfo(string text) => _modelInfo.Text = text;
+
+    /// <summary>Для самотестов — заполняет поля УЖЕ СУЩЕСТВУЮЩЕГО ряда порта напрямую, без события <see cref="PortsChanged"/>.</summary>
     public void SetPortForTesting(int index, string id, ResourceType resource, PortDirection direction, BlockFace face, Vector2I faceCell)
     {
         var row = _portRows[index];
@@ -417,43 +477,7 @@ public sealed class BlockPrefabEditorUi
         row.FaceCell[1].Text = faceCell.Y.ToString(CultureInfo.InvariantCulture);
     }
 
-    public string Name => string.IsNullOrWhiteSpace(_nameField.Text) ? Slug : _nameField.Text.Trim();
-    public string ScenePath => _sceneField.Text.Trim();
-    public string Behavior => _behaviorField.Text.Trim();
-
-    public Color Color => TryParseColor(_colorField.Text, out var color) ? color : Colors.White;
-
-    public Vector3I Footprint => new(
-        ParseIntOr(_footprintFields[0].Text, 1),
-        ParseIntOr(_footprintFields[1].Text, 1),
-        ParseIntOr(_footprintFields[2].Text, 1));
-
-    /// <summary>Ручной множитель поверх автоматической подгонки модели (см. <see cref="FunctionalBlockComponent.ModelScale"/>) —
-    /// (1,1,1) по умолчанию, т.е. поведение не отличается от прежнего, пока пользователь не растянул модель сам.</summary>
-    public Vector3 ModelScale => new(
-        ParseFloatOr(_modelScaleFields[0].Text, 1f),
-        ParseFloatOr(_modelScaleFields[1].Text, 1f),
-        ParseFloatOr(_modelScaleFields[2].Text, 1f));
-
-    /// <summary>Ручной сдвиг модели в клетке, метры (см. <see cref="FunctionalBlockComponent.ModelOffset"/>) - (0,0,0) по умолчанию.</summary>
-    public Vector3 ModelOffset => new(
-        ParseFloatOr(_modelOffsetFields[0].Text, 0f),
-        ParseFloatOr(_modelOffsetFields[1].Text, 0f),
-        ParseFloatOr(_modelOffsetFields[2].Text, 0f));
-
-    public float Mass => ParseFloatOr(_massField.Text, 10f);
-    public float Durability => ParseFloatOr(_durabilityField.Text, 100f);
-    public float DamageResistance => ParseFloatOr(_damageField.Text, 0.1f);
-    public float Capacity => ParseFloatOr(_capacityField.Text, 0f);
-
-    /// <summary>Сырой текст поля "Behavior params" (JSON-объект или пусто) — разбор и проверка в <see cref="BlockPrefabEditor"/>.</summary>
-    public string ParamsJson => _paramsField.Text.Trim();
-
-    /// <summary>Для самотестов — задаёт только параметры поведения (JSON-текст), не трогая остальные поля.</summary>
-    public void SetParamsForTesting(string paramsJson) => _paramsField.Text = paramsJson;
-
-    /// <summary>Для самотестов — заполняет поля УЖЕ СУЩЕСТВУЮЩЕГО ряда ноды (добавленного через
-    /// <see cref="AddNodeRequested"/>/<see cref="SetNodeRows"/>) напрямую, без события <see cref="NodesChanged"/>.</summary>
+    /// <summary>Для самотестов — заполняет поля УЖЕ СУЩЕСТВУЮЩЕГО ряда ноды напрямую, без события <see cref="NodesChanged"/>.</summary>
     public void SetNodeForTesting(int index, string id, NodeType type, PortDirection direction, Vector3I cell)
     {
         var row = _nodeRows[index];
@@ -461,6 +485,17 @@ public sealed class BlockPrefabEditorUi
         row.Type.Selected = Array.IndexOf(NodeTypeValues, type);
         row.Direction.Selected = Array.IndexOf(DirectionValues, direction);
         for (int axis = 0; axis < 3; axis++) row.Cell[axis].Text = cell[axis].ToString(CultureInfo.InvariantCulture);
+    }
+
+    /// <summary>Для самотестов — заполняет поля УЖЕ СУЩЕСТВУЮЩЕГО ряда группы клеток коллизии, без события <see cref="CollisionChanged"/>.</summary>
+    public void SetCollisionGroupForTesting(int index, Vector3I min, Vector3I size)
+    {
+        var row = _collisionRows[index];
+        for (int axis = 0; axis < 3; axis++)
+        {
+            row.Min[axis].Text = min[axis].ToString(CultureInfo.InvariantCulture);
+            row.Size[axis].Text = size[axis].ToString(CultureInfo.InvariantCulture);
+        }
     }
 
     /// <summary>Логические ноды — собираются из живых полей рядов при каждом обращении (как <see cref="Ports"/>).</summary>
@@ -484,26 +519,24 @@ public sealed class BlockPrefabEditorUi
         }
     }
 
-    public IReadOnlyList<CollisionBox> CollisionBoxes
+    /// <summary>Группы клеток коллизии (min + размер, размер не меньше 1) — из живых полей рядов при каждом обращении.</summary>
+    public IReadOnlyList<CellBox> CollisionGroups
     {
         get
         {
-            var result = new List<CollisionBox>(_collisionRows.Count);
+            var result = new List<CellBox>(_collisionRows.Count);
             foreach (var row in _collisionRows)
             {
-                result.Add(new CollisionBox
-                {
-                    Position = new Vector3(ParseFloatOr(row.Position[0].Text, 0), ParseFloatOr(row.Position[1].Text, 0), ParseFloatOr(row.Position[2].Text, 0)),
-                    Size = new Vector3(ParseFloatOr(row.Size[0].Text, 0.25f), ParseFloatOr(row.Size[1].Text, 0.25f), ParseFloatOr(row.Size[2].Text, 0.25f)),
-                });
+                result.Add(new CellBox(
+                    new Vector3I(ParseIntOrZero(row.Min[0].Text), ParseIntOrZero(row.Min[1].Text), ParseIntOrZero(row.Min[2].Text)),
+                    new Vector3I(ParseSizeOr1(row.Size[0].Text), ParseSizeOr1(row.Size[1].Text), ParseSizeOr1(row.Size[2].Text))));
             }
 
             return result;
         }
     }
 
-    /// <summary>Та же "жить читается из живых полей" идея, что и у <see cref="CollisionBoxes"/> — порт собирается
-    /// заново при каждом обращении, УЖЕ ОТРАЖАЯ поля ряда (Id/Resource/Direction/Face/FaceCell).</summary>
+    /// <summary>Физические порты — тот же приём "читать из живых полей", что и у групп коллизии.</summary>
     public IReadOnlyList<ResourcePort> Ports
     {
         get
@@ -528,8 +561,8 @@ public sealed class BlockPrefabEditorUi
     // ------------------------------------------------------------------ запись полей (загрузка существующего/нового блока)
 
     public void LoadFields(string slug, string name, Color color, float mass, float durability, float damage,
-        string scenePath, Vector3I footprint, Vector3 modelScale, Vector3 modelOffset, string behavior, float capacity,
-        IReadOnlyList<CollisionBox> collisionBoxes, IReadOnlyList<ResourcePort> ports, IReadOnlyList<LogicNode> nodes, string paramsJson)
+        string scenePath, Vector3 modelScale, Vector3 anchor, string behavior, float capacity,
+        IReadOnlyList<CellBox> collisionGroups, IReadOnlyList<ResourcePort> ports, IReadOnlyList<LogicNode> nodes, string paramsJson, string parametersSchemaJson = "")
     {
         _slugField.Text = slug;
         _nameField.Text = name;
@@ -539,89 +572,88 @@ public sealed class BlockPrefabEditorUi
         _durabilityField.Text = durability.ToString(CultureInfo.InvariantCulture);
         _damageField.Text = damage.ToString(CultureInfo.InvariantCulture);
         _sceneField.Text = scenePath;
-        for (int axis = 0; axis < 3; axis++) _footprintFields[axis].Text = footprint[axis].ToString(CultureInfo.InvariantCulture);
-        for (int axis = 0; axis < 3; axis++) _modelScaleFields[axis].Text = modelScale[axis].ToString(CultureInfo.InvariantCulture);
-        for (int axis = 0; axis < 3; axis++) _modelOffsetFields[axis].Text = modelOffset[axis].ToString(CultureInfo.InvariantCulture);
+        SetModelScale(modelScale);
+        SetAnchor(anchor);
         _behaviorField.Text = behavior;
         _capacityField.Text = capacity.ToString(CultureInfo.InvariantCulture);
         _paramsField.Text = paramsJson;
+        _schemaField.Text = parametersSchemaJson;
 
-        SetCollisionBoxRows(collisionBoxes);
+        SetCollisionRows(collisionGroups);
         SetPortRows(ports);
         SetNodeRows(nodes);
     }
 
-    /// <summary>Перестраивает список рядов коллизии с нуля — вызывается при загрузке блока и при Add/Remove
-    /// (сами значения полей читаются геттером <see cref="CollisionBoxes"/>, этот метод только меняет их КОЛИЧЕСТВО/
-    /// начальные значения).</summary>
-    public void SetCollisionBoxRows(IReadOnlyList<CollisionBox> boxes)
+    /// <summary>Перестраивает список рядов коллизии с нуля — вызывается при загрузке блока и при Add/Remove (сами значения
+    /// полей читаются геттером <see cref="CollisionGroups"/>, этот метод только меняет их КОЛИЧЕСТВО/начальные значения).</summary>
+    public void SetCollisionRows(IReadOnlyList<CellBox> groups)
     {
         _suppressCollisionEvents = true;
         foreach (var child in _collisionList.GetChildren()) child.QueueFree();
         _collisionRows.Clear();
 
-        for (int i = 0; i < boxes.Count; i++) AddCollisionRow(boxes[i], i);
+        for (int i = 0; i < groups.Count; i++) AddCollisionRow(groups[i], i);
 
         _suppressCollisionEvents = false;
     }
 
-    /// <summary>Каждая запись — СВОИ две строки (pos/size), не одна длинная строка на 6 полей + ярлыки — раньше не
-    /// помещалось по ширине панели (баг, найденный пользователем).</summary>
-    private void AddCollisionRow(CollisionBox box, int index)
+    private void AddCollisionRow(CellBox group, int index)
     {
         var entry = new VBoxContainer();
         entry.AddThemeConstantOverride("separation", 2);
 
         var header = new HBoxContainer();
-        header.AddChild(UiStyle.MakeLabel($"Box #{index}", 12, UiStyle.TextDim));
+        header.AddChild(UiStyle.MakeLabel($"Cells #{index}", 12, UiStyle.TextDim));
         int capturedIndex = index;
         var removeButton = UiStyle.MakeButton("Remove", new Vector2(70, 24));
-        removeButton.Pressed += () => RemoveCollisionBoxRequested?.Invoke(capturedIndex);
+        removeButton.Pressed += () => RemoveCollisionGroupRequested?.Invoke(capturedIndex);
         header.AddChild(removeButton);
         entry.AddChild(header);
 
-        var positionFields = new LineEdit[3];
+        var minFields = new LineEdit[3];
         var sizeFields = new LineEdit[3];
 
-        var posRow = new HBoxContainer();
-        posRow.AddChild(UiStyle.MakeLabel("pos", 11, UiStyle.TextDim));
+        var minRow = new HBoxContainer();
+        minRow.AddChild(UiStyle.MakeLabel("min x/y/z", 11, UiStyle.TextDim));
         for (int axis = 0; axis < 3; axis++)
         {
-            var field = new LineEdit { CustomMinimumSize = new Vector2(60, 26), Text = box.Position[axis].ToString(CultureInfo.InvariantCulture) };
+            var field = new LineEdit { CustomMinimumSize = new Vector2(60, 26), Text = group.Min[axis].ToString(CultureInfo.InvariantCulture) };
             field.TextSubmitted += _ => NotifyCollisionChanged();
             field.FocusExited += () => NotifyCollisionChanged();
             BindUndoCapture(field);
-            posRow.AddChild(field);
-            positionFields[axis] = field;
+            minRow.AddChild(field);
+            minFields[axis] = field;
         }
-        entry.AddChild(posRow);
+
+        entry.AddChild(minRow);
 
         var sizeRow = new HBoxContainer();
-        sizeRow.AddChild(UiStyle.MakeLabel("size", 11, UiStyle.TextDim));
+        sizeRow.AddChild(UiStyle.MakeLabel("size x/y/z", 11, UiStyle.TextDim));
         for (int axis = 0; axis < 3; axis++)
         {
-            var field = new LineEdit { CustomMinimumSize = new Vector2(60, 26), Text = box.Size[axis].ToString(CultureInfo.InvariantCulture) };
+            var field = new LineEdit { CustomMinimumSize = new Vector2(60, 26), Text = group.Size[axis].ToString(CultureInfo.InvariantCulture) };
             field.TextSubmitted += _ => NotifyCollisionChanged();
             field.FocusExited += () => NotifyCollisionChanged();
             BindUndoCapture(field);
             sizeRow.AddChild(field);
             sizeFields[axis] = field;
         }
+
         entry.AddChild(sizeRow);
 
         _collisionList.AddChild(entry);
         _collisionList.AddChild(new HSeparator());
-        _collisionRows.Add((positionFields, sizeFields));
+        _collisionRows.Add((minFields, sizeFields));
     }
 
     private void NotifyCollisionChanged()
     {
-        if (!_suppressCollisionEvents) CollisionBoxesChanged?.Invoke();
+        if (!_suppressCollisionEvents) CollisionChanged?.Invoke();
     }
 
-    // ------------------------------------------------------------------ ресурсные порты (тот же приём "список рядов", что и коллизия выше)
+    // ------------------------------------------------------------------ ресурсные порты
 
-    /// <summary>Перестраивает список рядов портов с нуля — тот же приём, что и <see cref="SetCollisionBoxRows"/>.</summary>
+    /// <summary>Перестраивает список рядов портов с нуля — тот же приём, что и <see cref="SetCollisionRows"/>.</summary>
     public void SetPortRows(IReadOnlyList<ResourcePort> ports)
     {
         _suppressPortEvents = true;
@@ -691,6 +723,7 @@ public sealed class BlockPrefabEditorUi
             placementRow.AddChild(field);
             faceCellFields[axis] = field;
         }
+
         entry.AddChild(placementRow);
 
         _portList.AddChild(entry);
@@ -703,7 +736,7 @@ public sealed class BlockPrefabEditorUi
         if (!_suppressPortEvents) PortsChanged?.Invoke();
     }
 
-    // ------------------------------------------------------------------ логические ноды (тот же приём "список рядов", что и порты)
+    // ------------------------------------------------------------------ логические ноды
 
     /// <summary>Перестраивает список рядов нод с нуля — тот же приём, что и <see cref="SetPortRows"/>.</summary>
     public void SetNodeRows(IReadOnlyList<LogicNode> nodes)
@@ -761,6 +794,7 @@ public sealed class BlockPrefabEditorUi
             cellRow.AddChild(field);
             cellFields[axis] = field;
         }
+
         entry.AddChild(cellRow);
 
         _nodeList.AddChild(entry);
@@ -775,17 +809,28 @@ public sealed class BlockPrefabEditorUi
 
     public void SetStatus(string message) => _status.Text = message;
 
+    /// <summary>Текущий текст строки статуса (для самотестов).</summary>
+    public string Status => _status.Text;
+
     private static bool TryParseColor(string text, out Color color)
     {
         try { color = Color.FromHtml(text); return true; }
         catch { color = Colors.White; return false; }
     }
 
-    private static int ParseIntOr(string text, int fallback) => int.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out int value) && value > 0 ? value : fallback;
+    /// <summary>Число для поля: инвариантная культура, до 6 знаков после запятой (без float-шума вроде 0.12345670163631439).</summary>
+    public static string FormatNumber(double value) => Math.Round(value, 6).ToString(CultureInfo.InvariantCulture);
 
-    /// <summary>Как <see cref="ParseIntOr"/>, но без "floor at 1" — координата клетки на грани (<see cref="ResourcePort.FaceCell"/>)
-    /// законно равна 0 (угол грани), в отличие от footprint'а/размера, у которых 0 бессмысленно.</summary>
+    private static float ParsePositiveOr(string text, float fallback) =>
+        float.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out float value) && value > 0f && float.IsFinite(value)
+            ? (float)Math.Round(value, 6)
+            : fallback;
+
+    /// <summary>Целое без ограничений (координата клетки законно 0 и отрицательная); мусор — 0.</summary>
     private static int ParseIntOrZero(string text) => int.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out int value) ? value : 0;
+
+    /// <summary>Размер группы клеток — целое не меньше 1 (иначе 1) и не больше 4096 по оси (чтобы произведение не переполняло long при подсчёте клеток).</summary>
+    private static int ParseSizeOr1(string text) => int.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out int value) && value >= 1 ? Math.Min(value, 4096) : 1;
 
     private static float ParseFloatOr(string text, float fallback) => float.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out float value) ? value : fallback;
 }

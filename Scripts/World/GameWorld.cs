@@ -105,11 +105,11 @@ public partial class GameWorld : Node3D
 		if (GetTree().CurrentScene == this && OS.GetCmdlineUserArgs().Length > 0)
 		{
 			_handingOff = true;
-			// --blockeditor - отдельный инструмент (Dev.BlockPrefabEditor), не часть обычного BuildEditor (другая
+			// --blockeditor - отдельный инструмент (Dev.BlockEditor), не часть обычного BuildEditor (другая
 			// камера/UI/цель), поэтому у него своя сцена вместо общего для всех остальных дев-аргументов перехода
 			// на BuildEditor.tscn (см. class doc).
 			bool blockEditor = Array.Exists(OS.GetCmdlineUserArgs(), a => a == "--blockeditor" || a.StartsWith("--blockeditor="));
-			if (blockEditor) Callable.From(() => GetTree().ChangeSceneToFile("res://Scenes/BlockPrefabEditor.tscn")).CallDeferred();
+			if (blockEditor) Callable.From(() => GetTree().ChangeSceneToFile("res://Scenes/BlockEditor.tscn")).CallDeferred();
 			else GoToBuildEditor();
 			return;
 		}
@@ -149,6 +149,7 @@ public partial class GameWorld : Node3D
 	private void ContinueBoot()
 	{
 		SubscribeNetworking();
+		if (NetHub.Instance.IsNetworked) NetHub.Instance.SetVehiclesVisible(true);
 
 		if (NetHub.Instance.IsNetworked) SetupNetworkedPlayers();
 		else SetupSoloPlayer();
@@ -163,10 +164,7 @@ public partial class GameWorld : Node3D
 			EditorHandoff.PendingSpawnWorkbenchName = null;
 
 			var sourceWorkbench = _workbenches.Find(w => w.Name == (workbenchName ?? "")) ?? _workbenches[0];
-			var vehicle = VehicleSpawner.Spawn(this, spawnJson,
-				sourceWorkbench.SpawnArea.GlobalPosition + new Vector3(0f, 0.1f, 0f), sourceWorkbench);
-			_vehicles.Add(vehicle);
-			ApplyDebugFlags(vehicle);
+			SpawnVehicleAt(spawnJson, sourceWorkbench);
 		}
 	}
 
@@ -387,6 +385,7 @@ public partial class GameWorld : Node3D
 		NetHub.Instance.JoinRejectedForMe += OnJoinRejectedForMe;
 		NetHub.Instance.JoinCancelled += OnJoinCancelled;
 		NetHub.Instance.ServerDisconnected += OnServerDisconnected;
+		NetHub.Instance.SitResultForMe += OnSitResult;
 	}
 
 	private void UnsubscribeNetworking()
@@ -398,6 +397,7 @@ public partial class GameWorld : Node3D
 		NetHub.Instance.JoinRejectedForMe -= OnJoinRejectedForMe;
 		NetHub.Instance.JoinCancelled -= OnJoinCancelled;
 		NetHub.Instance.ServerDisconnected -= OnServerDisconnected;
+		NetHub.Instance.SitResultForMe -= OnSitResult;
 		NetHub.Instance.PlayerSpawned -= OnPlayerSpawned;
 	}
 
@@ -490,11 +490,33 @@ public partial class GameWorld : Node3D
 		_workbenchMenu.Close();
 		Input.MouseMode = Input.MouseModeEnum.Captured;
 
-		var vehicle = VehicleSpawner.Spawn(this, json,
-			_activeWorkbench.SpawnArea.GlobalPosition + new Vector3(0f, 0.1f, 0f), _activeWorkbench);
+		SpawnVehicleAt(json, _activeWorkbench);
+	}
+
+	/// <summary>
+	/// Материализует постройку в зоне спавна верстака. Одиночная игра — тело прямо здесь; сетевая — запрос серверу, он создаёт тело (<see cref="NetHub.VehiclesRoot"/>, переживает
+	/// уход в редактор) и рассылает всем, у остальных появляются копии-наблюдатели (см. <see cref="NetHub"/>, «Vehicles»).
+	/// </summary>
+	private void SpawnVehicleAt(string json, Workbench workbench)
+	{
+		var position = workbench.SpawnArea.GlobalPosition + new Vector3(0f, 0.1f, 0f);
+		if (NetHub.Instance.IsNetworked)
+		{
+			NetHub.Instance.RequestSpawnVehicle(json, position, workbench.Name);
+			return;
+		}
+
+		var vehicle = VehicleSpawner.Spawn(this, json, position, workbench);
+		vehicle.SourceWorkbenchName = workbench.Name;
 		_vehicles.Add(vehicle);
 		ApplyDebugFlags(vehicle);
 	}
+
+	/// <summary>Все заспавненные тела: в сетевой игре — общие (<see cref="NetHub.Vehicles"/>), в одиночной — мои.</summary>
+	private IEnumerable<VehicleBody> AllVehicles => NetHub.Instance.IsNetworked ? NetHub.Instance.Vehicles : _vehicles;
+
+	/// <summary>Рантайм блоков считает сервер (или одиночная игра): отладочные переключатели питания/кнопок на клиенте ничего бы не изменили.</summary>
+	private bool OwnsRuntime => !NetHub.Instance.IsNetworked || NetHub.Instance.IsServer;
 
 	public override void _Input(InputEvent e)
 	{
@@ -502,6 +524,13 @@ public partial class GameWorld : Node3D
 		// когда-то его удалила), а этот GameWorld ещё не успел это заметить - без неё обращение к освобождённому
 		// узлу ниже кидало бы ObjectDisposedException каждый кадр (см. WORKLOG про баг с серым экраном у клиента).
 		if (_handingOff || _player == null || !IsInstanceValid(_player)) return;
+		// Сиденье/кнопки заспавненной постройки (E по прицелу, Shift - встать, отпускание E у кнопки) - см. GameWorld.Blocks.cs.
+		if (HandleBlockInteractionInput(e))
+		{
+			GetViewport().SetInputAsHandled();
+			return;
+		}
+
 		if (e is not InputEventKey { Pressed: true, Echo: false } key) return;
 
 		switch (key.PhysicalKeycode)
@@ -551,21 +580,21 @@ public partial class GameWorld : Node3D
 			// Дебаг-меню (см. задачу): solid <-> вид коллизии для всех заспавненных построек сразу.
 			case Key.F1:
 				_debugCollisionView = !_debugCollisionView;
-				foreach (var v in _vehicles) v.SetDebugCollisionView(_debugCollisionView);
+				foreach (var v in AllVehicles) v.SetDebugCollisionView(_debugCollisionView);
 				GetViewport().SetInputAsHandled();
 				break;
 
 			// Дебаг: заглушка питания функциональных блоков (нод логики ещё нет) - запитать/обесточить все постройки.
 			case Key.F2:
 				_debugPowered = !_debugPowered;
-				foreach (var v in _vehicles) v.SetDebugPowered(_debugPowered);
+				if (OwnsRuntime) foreach (var v in AllVehicles) v.SetDebugPowered(_debugPowered);
 				GetViewport().SetInputAsHandled();
 				break;
 
 			// Дебаг: нажать/отпустить все кнопки всех построек (определения "в какую целится игрок" ещё нет).
 			case Key.F3:
 				_debugButtonsPressed = !_debugButtonsPressed;
-				foreach (var v in _vehicles) v.SetDebugButtonsPressed(_debugButtonsPressed);
+				if (OwnsRuntime) foreach (var v in AllVehicles) v.SetDebugButtonsPressed(_debugButtonsPressed);
 				GetViewport().SetInputAsHandled();
 				break;
 		}
@@ -575,7 +604,8 @@ public partial class GameWorld : Node3D
 	{
 		if (_handingOff || _player == null || !IsInstanceValid(_player)) return;
 
-		_player.MovementEnabled = !MovementBlockingModalOpen;
+		_player.MovementEnabled = !MovementBlockingModalOpen && !IsSeated;
+		UpdateSeat(delta);
 		_debugLabel.Text = string.Join("\n", new[]
 		{
 			_debugCollisionView ? "Debug: collision view (F1)" : "",
@@ -589,11 +619,18 @@ public partial class GameWorld : Node3D
 			return;
 		}
 
+		string blockPrompt = BlockPrompt();
+		if (IsSeated)
+		{
+			_prompt.Text = blockPrompt;
+			return;
+		}
+
 		_prompt.Text = RaycastFromCamera(InteractDistance) switch
 		{
 			Workbench => "Press E to open the workbench",
-			VehicleBody => "Press R to recall it to its workbench",
-			_ => "",
+			VehicleBody => blockPrompt.Length > 0 ? blockPrompt + "   (R - recall to the workbench)" : "Press R to recall it to its workbench",
+			_ => blockPrompt,
 		};
 	}
 
@@ -621,9 +658,18 @@ public partial class GameWorld : Node3D
 
 	private void RecallVehicle(VehicleBody vehicle)
 	{
-		_vehicles.Remove(vehicle);
-		var workbench = vehicle.SourceWorkbench;
-		vehicle.QueueFree();
+		if (_seatVehicle == vehicle) Stand();
+		if (_pressedButtonVehicle == vehicle) ReleasePressedButton();
+		var workbench = vehicle.SourceWorkbench ?? _workbenches.Find(w => w.Name == vehicle.SourceWorkbenchName);
+		if (NetHub.Instance.IsNetworked && vehicle.NetId != 0)
+		{
+			NetHub.Instance.RequestRecallVehicle(vehicle.NetId); // сервер уберёт тело у всех
+		}
+		else
+		{
+			_vehicles.Remove(vehicle);
+			vehicle.QueueFree();
+		}
 
 		// Место у верстака хоть сколько-то произвольное (фиксированный отступ, не разворот лицом к верстаку) -
 		// самого верстака при возврате достаточно, точная поза не так важна.
@@ -648,6 +694,7 @@ public partial class GameWorld : Node3D
 		// SetupNetworkedPlayers при возврате в мир.
 		_player?.SetActive(false);
 		if (NetHub.Instance.PlayersRoot != null) NetHub.Instance.PlayersRoot.Visible = false;
+		if (NetHub.Instance.IsNetworked) NetHub.Instance.SetVehiclesVisible(false); // тела остаются на сервере, но не маячат посреди сцены редактора
 		_handingOff = true;
 		GoToBuildEditor();
 	}

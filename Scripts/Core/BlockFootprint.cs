@@ -42,12 +42,27 @@ public static class BlockFootprint
     /// в <paramref name="rootCell"/>, после поворота на <paramref name="rotationSteps"/>. Без поворота — просто
     /// (<paramref name="rootCell"/>, <paramref name="localSize"/>), как и раньше.
     /// </summary>
-    public static (Vector3I Origin, Vector3I Size) PlaceBox(Vector3I rootCell, Vector3I localSize, Vector3I rotationSteps)
+    public static (Vector3I Origin, Vector3I Size) PlaceBox(Vector3I rootCell, Vector3I localSize, Vector3I rotationSteps) =>
+        PlaceBox(rootCell, Vector3I.Zero, localSize, rotationSteps);
+
+    /// <summary>
+    /// То же для блока, чей локальный бокс начинается НЕ с корневой клетки: <paramref name="localMin"/> — минимальная клетка бокса
+    /// в рамке блока (индексы от корня, могут быть отрицательными — так бывает у функционального блока, якорь модели которого
+    /// не в её мин. углу, см. <see cref="BlockModelLayout"/>), корень (0,0,0) может лежать в любой клетке бокса и при повороте
+    /// остаётся на месте. С <c>localMin == (0,0,0)</c> это ровно прежняя перегрузка.
+    /// </summary>
+    public static (Vector3I Origin, Vector3I Size) PlaceBox(Vector3I rootCell, Vector3I localMin, Vector3I localSize, Vector3I rotationSteps)
     {
-        // Дальняя от корня клетка бокса после поворота; сам корень — (0,0,0) — остаётся на месте.
-        var far = Rotate(localSize - Vector3I.One, rotationSteps);
-        var min = new Vector3I(System.Math.Min(0, far.X), System.Math.Min(0, far.Y), System.Math.Min(0, far.Z));
-        var max = new Vector3I(System.Math.Max(0, far.X), System.Math.Max(0, far.Y), System.Math.Max(0, far.Z));
+        // Две противоположные клетки бокса после поворота; сам корень — (0,0,0) — остаётся на месте.
+        var a = Rotate(localMin, rotationSteps);
+        var b = Rotate(localMin + localSize - Vector3I.One, rotationSteps);
+        var min = new Vector3I(System.Math.Min(a.X, b.X), System.Math.Min(a.Y, b.Y), System.Math.Min(a.Z, b.Z));
+        var max = new Vector3I(System.Math.Max(a.X, b.X), System.Math.Max(a.Y, b.Y), System.Math.Max(a.Z, b.Z));
         return (rootCell + min, max - min + Vector3I.One);
     }
+
+    /// <summary>Обратное к <see cref="PlaceBox(Vector3I, Vector3I, Vector3I, Vector3I)"/>: корневая клетка уже поставленного блока по
+    /// минимальному углу его занятого бокса (<see cref="BlockInstance.Origin"/>), локальному боксу и ступеням поворота.</summary>
+    public static Vector3I RootCell(Vector3I origin, Vector3I localMin, Vector3I localSize, Vector3I rotationSteps) =>
+        origin - PlaceBox(Vector3I.Zero, localMin, localSize, rotationSteps).Origin;
 }
