@@ -106,6 +106,15 @@ public sealed class FunctionalBlockRuntime : IDisposable
 
     public bool HasState(int instanceId) => _entries.ContainsKey(instanceId);
 
+    /// <summary>Все состояния типа <typeparamref name="TState"/> (id экземпляра + состояние) — например, все колёса постройки для физики.</summary>
+    public IEnumerable<(int InstanceId, TState State)> EnumerateStates<TState>() where TState : BlockState
+    {
+        foreach (var entry in _entries.Values)
+        {
+            if (entry.State is TState typed) yield return (entry.InstanceId, typed);
+        }
+    }
+
     /// <summary>Состояние экземпляра как <typeparamref name="TState"/>; null — у экземпляра нет состояния или оно другого типа.</summary>
     public TState? GetState<TState>(int instanceId) where TState : BlockState =>
         _entries.TryGetValue(instanceId, out var entry) ? entry.State as TState : null;
@@ -341,6 +350,14 @@ public sealed class FunctionalBlockRuntime : IDisposable
             }
 
             _networkRpm[network] = best;
+        }
+
+        // Потребители вращения (колёса) узнают свою сеть; значение вступает в силу на следующем тике.
+        foreach (var entry in _entries.Values)
+        {
+            int network = _torque.NetworkOf(entry.InstanceId);
+            bool connected = network >= 0 && network < _networkRpm.Length;
+            entry.Behavior.SetTorqueNetwork(entry.State, connected, connected ? _networkRpm[network] : 0);
         }
     }
 

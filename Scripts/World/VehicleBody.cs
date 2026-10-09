@@ -63,11 +63,16 @@ public partial class VehicleBody : RigidBody3D
     /// <summary>Поза, к которой тянется копия-наблюдатель (для самотестов).</summary>
     public Transform3D PuppetTarget => _puppetTarget;
 
+    /// <summary>Физика колёс тела (лучи, пружина, трение — см. <see cref="WheelPhysics"/>); null, пока нет рантайма/постройки. Колёс может не быть вовсе — тогда шаг пустой.</summary>
+    public WheelPhysics? Wheels { get; private set; }
+
     public override void _PhysicsProcess(double delta)
     {
         if (!IsPuppet)
         {
             Runtime?.Tick(delta);
+            if (Wheels == null && Runtime != null && Construction != null) Wheels = new WheelPhysics(this, Construction);
+            Wheels?.Step(delta); // рантайм уже обновил руль/обороты - физика читает их и прикладывает силы
             return;
         }
 
@@ -91,7 +96,11 @@ public partial class VehicleBody : RigidBody3D
     public void SetDebugButtonsPressed(bool pressed) =>
         Runtime?.InteractAll<ButtonBehavior>(pressed ? BlockInteraction.Press : BlockInteraction.Release);
 
-    public override void _ExitTree() => Runtime?.Dispose();
+    public override void _ExitTree()
+    {
+        Wheels?.Dispose();
+        Runtime?.Dispose();
+    }
 
     /// <summary>Постройка (набор блоков) этого тела — null, пока не зарегистрирован визуал (<see cref="RegisterVisual"/>).</summary>
     public Core.Construction? Construction => _visual?.Construction;

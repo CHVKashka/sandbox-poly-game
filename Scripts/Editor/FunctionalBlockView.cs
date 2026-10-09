@@ -17,7 +17,7 @@ namespace SandboxPolyGame.Editor;
 /// <see cref="Sync"/> вызывается на каждое изменение постройки (<see cref="Construction.Changed"/>).
 /// <para/>
 /// <b>Анимация</b> (если задан <see cref="Runtime"/> — у заспавненной в мире постройки, см. <see cref="World.VehicleSpawner"/>): кнопки получают свой
-/// <see cref="ButtonVisual"/> (нажатие + свечение). Валы НЕ вращаются визуально: вал — аналог трубы, он только передаёт крутящий момент (сеть вращения — <see cref="TorqueNetwork"/>).
+/// <see cref="ButtonVisual"/> (нажатие + свечение), колёса — <see cref="WheelVisual"/> (вращение, руль, радиусы, пробитая шина). Валы НЕ вращаются визуально: вал — аналог трубы, он только передаёт крутящий момент (сеть вращения — <see cref="TorqueNetwork"/>).
 /// <para/>
 /// <b>Отображение в инструментах редактора:</b> <see cref="DefaultOpacity"/> делает все модели полупрозрачными, <see cref="SetInstanceTint"/> красит модель
 /// одного экземпляра сплошным цветом (подсветка в «Parameters»).
@@ -27,6 +27,7 @@ public partial class FunctionalBlockView : Node3D
     private readonly Dictionary<int, Node3D> _views = new();
     private readonly Dictionary<int, FunctionalBlockComponent> _definitions = new();
     private readonly Dictionary<int, ButtonVisual> _buttonVisuals = new();
+    private readonly Dictionary<int, WheelVisual> _wheelVisuals = new();
     private readonly Dictionary<int, Color> _tints = new();
     private readonly Dictionary<Color, StandardMaterial3D> _tintMaterials = new();
     private float _defaultOpacity = 1f;
@@ -138,6 +139,7 @@ public partial class FunctionalBlockView : Node3D
             _views.Remove(id);
             _definitions.Remove(id);
             _buttonVisuals.Remove(id);
+            _wheelVisuals.Remove(id);
             _tints.Remove(id);
         }
     }
@@ -149,6 +151,22 @@ public partial class FunctionalBlockView : Node3D
         foreach (var (id, node) in _views)
         {
             var definition = _definitions[id];
+            if (definition.Behavior == WheelBehavior.Key)
+            {
+                var wheel = Runtime.GetState<WheelState>(id);
+                if (wheel == null) continue;
+
+                // Состояние пересоздаётся при смене параметров экземпляра (радиусы) - визуал держит только узлы модели, радиусы читает из состояния каждый кадр.
+                if (!_wheelVisuals.TryGetValue(id, out var wheelVisual))
+                {
+                    wheelVisual = new WheelVisual(node, wheel.Settings);
+                    _wheelVisuals[id] = wheelVisual;
+                }
+
+                wheelVisual.Update(delta, wheel);
+                continue;
+            }
+
             if (definition.Behavior != ButtonBehavior.Key) continue;
 
             var state = Runtime.GetState<ButtonState>(id);

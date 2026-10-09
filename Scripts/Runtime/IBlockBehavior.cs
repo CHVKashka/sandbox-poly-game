@@ -70,6 +70,10 @@ public interface IBlockBehavior
 
     /// <summary>Обороты (об/мин, знак — направление), которые блок ПОДАЁТ на свой физический выход вала; 0 — блок не источник вращения.</summary>
     double GetTorqueRpm(BlockState state) => 0;
+
+    /// <summary>Рантайм сообщает блоку, в какой сети вращения он стоит (<see cref="TorqueNetwork"/>): <paramref name="connected"/> = false — ни один порт вала блока ни с кем не соединён;
+    /// <paramref name="rpm"/> — обороты сети (об/мин, со знаком). Вызывается в конце каждого тика, значение вступает в силу на следующем (потребитель вращения — колесо).</summary>
+    void SetTorqueNetwork(BlockState state, bool connected, double rpm) { }
 }
 
 /// <summary>
@@ -89,6 +93,7 @@ public abstract class BlockBehavior<TState> : IBlockBehavior where TState : Bloc
     protected virtual void DrawEnergy(TState state, string nodeId, double energy) { }
     protected virtual void ReceiveEnergy(TState state, string nodeId, double energy) { }
     protected virtual double GetTorqueRpm(TState state) => 0;
+    protected virtual void SetTorqueNetwork(TState state, bool connected, double rpm) { }
 
     protected virtual bool TryReadNode(TState state, string nodeId, out NodeValue value)
     {
@@ -107,5 +112,6 @@ public abstract class BlockBehavior<TState> : IBlockBehavior where TState : Bloc
     void IBlockBehavior.DrawEnergy(BlockState state, string nodeId, double energy) => DrawEnergy((TState)state, nodeId, energy);
     void IBlockBehavior.ReceiveEnergy(BlockState state, string nodeId, double energy) => ReceiveEnergy((TState)state, nodeId, energy);
     double IBlockBehavior.GetTorqueRpm(BlockState state) => GetTorqueRpm((TState)state);
+    void IBlockBehavior.SetTorqueNetwork(BlockState state, bool connected, double rpm) => SetTorqueNetwork((TState)state, connected, rpm);
     bool IBlockBehavior.TryReadNode(BlockState state, string nodeId, out NodeValue value) => TryReadNode((TState)state, nodeId, out value);
 }
