@@ -327,17 +327,19 @@ public partial class NetHub : Node
         WorkbenchSessionsForMe?.Invoke(workbenchName, sessionKeys, adminPeerIds);
 
     /// <summary><paramref name="constructionPath"/> — null означает Create vehicle (пустая постройка с корневым
-    /// блоком, как и в одиночной игре).</summary>
-    public void RequestOpenSession(string workbenchName, string? constructionPath)
+    /// блоком, как и в одиночной игре). <paramref name="constructionJson"/> — готовая сериализованная постройка (Continue editing / R по заспавненной
+    /// постройке: с несохранёнными правками, на диске её в таком виде нет) — берётся вместо файла.</summary>
+    public void RequestOpenSession(string workbenchName, string? constructionPath, string? constructionJson = null)
     {
         string path = constructionPath ?? "";
-        if (IsServer) ServerOpenSession(LocalPeerId, workbenchName, path);
-        else RpcId(1, nameof(RpcOpenSession), workbenchName, path);
+        string json = constructionJson ?? "";
+        if (IsServer) ServerOpenSession(LocalPeerId, workbenchName, path, json);
+        else RpcId(1, nameof(RpcOpenSession), workbenchName, path, json);
     }
 
     [Rpc(MultiplayerApi.RpcMode.AnyPeer, TransferMode = MultiplayerPeer.TransferModeEnum.Reliable)]
-    private void RpcOpenSession(string workbenchName, string constructionPath) =>
-        ServerOpenSession(Multiplayer.GetRemoteSenderId(), workbenchName, constructionPath);
+    private void RpcOpenSession(string workbenchName, string constructionPath, string constructionJson) =>
+        ServerOpenSession(Multiplayer.GetRemoteSenderId(), workbenchName, constructionPath, constructionJson);
 
     /// <summary>
     /// Раньше здесь была проверка "уже есть сессия на этом верстаке — отказать" (одна сессия на верстак
@@ -347,12 +349,16 @@ public partial class NetHub : Node
     /// делит её с чужими и не блокируется их существованием. Сколько угодно игроков может одновременно зайти в свой
     /// собственный редактор через один и тот же верстак.
     /// </summary>
-    private void ServerOpenSession(long requesterId, string workbenchName, string constructionPath)
+    private void ServerOpenSession(long requesterId, string workbenchName, string constructionPath, string constructionJson = "")
     {
         string sessionKey = $"{workbenchName}#{++_sessionCounter}";
 
         var construction = new Construction(new VoxelGrid());
-        if (!string.IsNullOrEmpty(constructionPath) && FileAccess.FileExists(constructionPath))
+        if (!string.IsNullOrEmpty(constructionJson))
+        {
+            ConstructionIO.Deserialize(construction, constructionJson, BlockCatalog.Instance);
+        }
+        else if (!string.IsNullOrEmpty(constructionPath) && FileAccess.FileExists(constructionPath))
         {
             ConstructionIO.LoadFromFile(construction, constructionPath, BlockCatalog.Instance);
         }

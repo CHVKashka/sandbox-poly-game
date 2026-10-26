@@ -19,6 +19,15 @@ namespace SandboxPolyGame.Dev;
 /// </summary>
 public sealed class BlockEditorUi
 {
+    /// <summary>Режим гизмо в 3D-виде редактора блоков: масштаб модели (стрелки), поворот модели (кольца), занимаемый объём — footprint (ручки на гранях).</summary>
+    public event Action<BlockEditorTool>? ToolChanged;
+
+    /// <summary>Переключили «Manual volume» (галочка): редактор делает точку Undo и пересчитывает превью.</summary>
+    public event Action? FootprintModeToggled;
+
+    /// <summary>«Fit to model»: взять в ручной footprint значения, которые дал бы автоматический расчёт по bbox.</summary>
+    public event Action? FitFootprintRequested;
+
     public event Action<string>? LoadRequested;
     public event Action? NewRequested;
     public event Action? SaveRequested;
@@ -34,6 +43,9 @@ public sealed class BlockEditorUi
     public event Action? AddNodeRequested;
     public event Action<int>? RemoveNodeRequested;
     public event Action? NodesChanged;
+    public event Action? AddDecorRequested;
+    public event Action<int>? RemoveDecorRequested;
+    public event Action? DecorChanged;
 
     /// <summary>
     /// Фокус вошёл в любое редактируемое поле (текст/дропдаун) — ПЕРЕД тем, как пользователь успел что-то в нём поменять
@@ -52,12 +64,19 @@ public sealed class BlockEditorUi
     private readonly LineEdit _sceneField;
     private readonly LineEdit[] _scaleFields = new LineEdit[3];
     private readonly OptionButton[] _anchorDropdowns = new OptionButton[3];
+    private readonly LineEdit[] _rotationFields = new LineEdit[3];
+    private readonly Button[] _toolButtons = new Button[3];
+    private readonly CheckBox _footprintManualBox;
+    private readonly LineEdit[] _footprintMinFields = new LineEdit[3];
+    private readonly LineEdit[] _footprintSizeFields = new LineEdit[3];
+    private readonly LineEdit[] _attachFields = new LineEdit[3];
     private readonly Label _modelInfo;
     private readonly LineEdit _behaviorField;
     private readonly LineEdit _capacityField;
     private readonly TextEdit _paramsField;
     private readonly TextEdit _schemaField;
     private readonly VBoxContainer _nodeList;
+    private readonly VBoxContainer _decorList;
     private readonly VBoxContainer _collisionList;
     private readonly VBoxContainer _portList;
     private readonly Label _status;
@@ -70,6 +89,11 @@ public sealed class BlockEditorUi
 
     private readonly List<(LineEdit Id, OptionButton Type, OptionButton Direction, LineEdit[] Cell)> _nodeRows = new();
     private bool _suppressNodeEvents;
+
+    private readonly List<(LineEdit Scene, LineEdit[] Position, LineEdit[] Rotation, LineEdit[] Scale, OptionButton Show)> _decorRows = new();
+    private bool _suppressDecorEvents;
+    private static readonly DecorShowWhen[] DecorShowValues = (DecorShowWhen[])Enum.GetValues(typeof(DecorShowWhen));
+    private bool _suppressFootprintEvents;
 
     private static readonly ResourceType[] ResourceValues = (ResourceType[])Enum.GetValues(typeof(ResourceType));
     private static readonly PortDirection[] DirectionValues = (PortDirection[])Enum.GetValues(typeof(PortDirection));
@@ -98,11 +122,28 @@ public sealed class BlockEditorUi
 
         column.AddChild(UiStyle.MakeLabel("Block Editor (--blockeditor)", 18));
         var hint = UiStyle.MakeLabel(
-            "WASD/Q/E + зажатая СКМ - камера, колесо - зум. ЛКМ по белому маркеру на фиолетовой рамке - выбрать якорь, " +
-            "ЛКМ-перетаскивание цветной стрелки - масштаб по оси (Shift - по всем осям). Ctrl+Z / Ctrl+Y - отмена/повтор. " +
-            "Числа применяются по Enter/потере фокуса.", 12, UiStyle.TextDim);
+            "WASD/Q/E + зажатая СКМ - камера, колесо - зум. ЛКМ по белому маркеру на фиолетовой рамке - выбрать якорь. Гизмо в 3D-виде (кнопки Scale/Rotate/Volume или клавиши 1/2/3): " +
+            "Scale - перетаскивание цветной стрелки (Shift - по всем осям), Rotate - перетаскивание цветного кольца вокруг оси (шаг 15°, Shift - 1°), " +
+            "Volume - перетаскивание ручки грани footprint'а (шаг - клетка). Ctrl+Z / Ctrl+Y - отмена/повтор. Числа применяются по Enter/потере фокуса.", 12, UiStyle.TextDim);
         hint.AutowrapMode = TextServer.AutowrapMode.WordSmart;
         column.AddChild(hint);
+
+        var toolRow = new HBoxContainer();
+        toolRow.AddChild(UiStyle.MakeLabel("Gizmo", 13));
+        var toolGroup = new ButtonGroup();
+        string[] toolNames = { "1 Scale", "2 Rotate", "3 Volume" };
+        for (int i = 0; i < 3; i++)
+        {
+            var tool = (BlockEditorTool)i;
+            var button = UiStyle.MakeButton(toolNames[i], new Vector2(110, 28), toggle: true);
+            button.ButtonGroup = toolGroup;
+            button.ButtonPressed = i == 0;
+            button.Pressed += () => ToolChanged?.Invoke(tool);
+            toolRow.AddChild(button);
+            _toolButtons[i] = button;
+        }
+
+        column.AddChild(toolRow);
 
         column.AddChild(Separator());
         var slugRow = new HBoxContainer();
@@ -184,6 +225,62 @@ public sealed class BlockEditorUi
         anchorHint.AutowrapMode = TextServer.AutowrapMode.WordSmart;
         column.AddChild(anchorHint);
 
+        var rotationRow = new HBoxContainer();
+        rotationRow.AddChild(UiStyle.MakeLabel("Rotation X/Y/Z °", 13));
+        for (int axis = 0; axis < 3; axis++)
+        {
+            var field = new LineEdit { CustomMinimumSize = new Vector2(80, 28), Text = "0" };
+            field.TextSubmitted += _ => FieldsChanged?.Invoke();
+            field.FocusExited += () => FieldsChanged?.Invoke();
+            rotationRow.AddChild(field);
+            _rotationFields[axis] = field;
+        }
+
+        var resetRotationButton = UiStyle.MakeButton("Reset", new Vector2(70, 28));
+        resetRotationButton.Pressed += ResetRotation;
+        rotationRow.AddChild(resetRotationButton);
+        column.AddChild(rotationRow);
+        var rotationHint = UiStyle.MakeLabel(
+            "Поворот МОДЕЛИ в градусах (углы Эйлера, порядок YXZ; гизмо Rotate пишет сюда же). Клетки блока (footprint, коллизия, порты, ноды) не поворачиваются. " +
+            "Рамка bbox и якорь считаются по повёрнутой модели (для углов не кратных 90° рамка - AABB повёрнутого bbox, чуть больше геометрии).", 11, UiStyle.TextDim);
+        rotationHint.AutowrapMode = TextServer.AutowrapMode.WordSmart;
+        column.AddChild(rotationHint);
+
+        _footprintManualBox = new CheckBox { Text = "Manual volume (footprint)", FocusMode = Control.FocusModeEnum.None };
+        _footprintManualBox.Toggled += _ =>
+        {
+            if (!_suppressFootprintEvents) FootprintModeToggled?.Invoke();
+        };
+        column.AddChild(_footprintManualBox);
+        BuildFootprintRow(column, "Volume min x/y/z", _footprintMinFields);
+        BuildFootprintRow(column, "Volume size x/y/z", _footprintSizeFields);
+        var fitButton = UiStyle.MakeButton("Fit to model", new Vector2(110, 26));
+        fitButton.Pressed += () => FitFootprintRequested?.Invoke();
+        column.AddChild(fitButton);
+        var attachRow = new HBoxContainer();
+        attachRow.AddChild(UiStyle.MakeLabel("Attach cell x/y/z", 12));
+        for (int axis = 0; axis < 3; axis++)
+        {
+            var field = new LineEdit { CustomMinimumSize = new Vector2(60, 26), Text = "0" };
+            field.TextSubmitted += _ => FieldsChanged?.Invoke();
+            field.FocusExited += () => FieldsChanged?.Invoke();
+            attachRow.AddChild(field);
+            _attachFields[axis] = field;
+        }
+
+        column.AddChild(attachRow);
+        var attachHint = UiStyle.MakeLabel(
+            "Клетка, которая при установке встаёт ПОД КУРСОР и вокруг которой блок поворачивается (по умолчанию 0,0,0 = корень). Корень при установке вычисляется. Нужна, когда корень " +
+            "(например, ступица колеса) - не то место, которым блок крепится (ось на клетку дальше). Должна лежать внутри footprint; клетка показана жёлтым каркасом. В XML пишется, только если не 0,0,0.", 11, UiStyle.TextDim);
+        attachHint.AutowrapMode = TextServer.AutowrapMode.WordSmart;
+        column.AddChild(attachHint);
+
+        var volumeHint = UiStyle.MakeLabel(
+            "Занимаемый объём блока в клетках. По умолчанию считается из bbox модели (поля только показывают). С галочкой его можно задать вручную (числами или гизмо Volume): " +
+            "части модели могут выпирать за занятые клетки - там нет ни места, ни коллизии. Корневая клетка (0,0,0) всегда остаётся внутри.", 11, UiStyle.TextDim);
+        volumeHint.AutowrapMode = TextServer.AutowrapMode.WordSmart;
+        column.AddChild(volumeHint);
+
         _modelInfo = UiStyle.MakeLabel("", 12, UiStyle.Accent);
         _modelInfo.AutowrapMode = TextServer.AutowrapMode.WordSmart;
         _modelInfo.CustomMinimumSize = new Vector2(480, 0);
@@ -250,6 +347,23 @@ public sealed class BlockEditorUi
         column.AddChild(_collisionList);
 
         column.AddChild(Separator());
+        var decorHeader = new HBoxContainer();
+        var decorLabel = UiStyle.MakeLabel(
+            "Decor (декоративные меши-указатели: куда смотрит блок, в какую сторону вращение; видны ТОЛЬКО в редакторе построек, в игре их нет, клеток и коллизии не занимают; " +
+            "position - точка рамки блока в метрах, куда встаёт начало координат модели; Ghost - только пока блок ставится, Always - и у поставленных)", 13, UiStyle.TextDim);
+        decorLabel.AutowrapMode = TextServer.AutowrapMode.WordSmart;
+        decorLabel.CustomMinimumSize = new Vector2(360, 0);
+        decorHeader.AddChild(decorLabel);
+        var addDecorButton = UiStyle.MakeButton("+ Add decor", new Vector2(100, 26));
+        addDecorButton.Pressed += () => AddDecorRequested?.Invoke();
+        decorHeader.AddChild(addDecorButton);
+        column.AddChild(decorHeader);
+
+        _decorList = new VBoxContainer();
+        _decorList.AddThemeConstantOverride("separation", 10);
+        column.AddChild(_decorList);
+
+        column.AddChild(Separator());
         var saveButton = UiStyle.MakeButton("Save to blocks/<slug>.xml", new Vector2(480, 36));
         saveButton.Pressed += () => SaveRequested?.Invoke();
         column.AddChild(saveButton);
@@ -275,6 +389,100 @@ public sealed class BlockEditorUi
         _schemaField.FocusExited += () => FieldsChanged?.Invoke();
         BindUndoCapture(_schemaField);
         foreach (var field in _scaleFields) BindUndoCapture(field);
+        foreach (var field in _rotationFields) BindUndoCapture(field);
+        foreach (var field in _footprintMinFields) BindUndoCapture(field);
+        foreach (var field in _footprintSizeFields) BindUndoCapture(field);
+        foreach (var field in _attachFields) BindUndoCapture(field);
+    }
+
+    /// <summary>Ряд из трёх целых полей footprint'а (min или размер): применяются по Enter/потере фокуса, как и остальные числа.</summary>
+    private void BuildFootprintRow(VBoxContainer column, string label, LineEdit[] fields)
+    {
+        var row = new HBoxContainer();
+        row.AddChild(UiStyle.MakeLabel(label, 12));
+        for (int axis = 0; axis < 3; axis++)
+        {
+            var field = new LineEdit { CustomMinimumSize = new Vector2(60, 26), Text = "0", Editable = false };
+            field.TextSubmitted += _ => FieldsChanged?.Invoke();
+            field.FocusExited += () => FieldsChanged?.Invoke();
+            row.AddChild(field);
+            fields[axis] = field;
+        }
+
+        column.AddChild(row);
+    }
+
+    private void ResetRotation()
+    {
+        EditSessionStarting?.Invoke();
+        SetRotation(Vector3.Zero);
+        FieldsChanged?.Invoke();
+    }
+
+    /// <summary>Клетка размещения блока (рамка блока, целые; нечисловой ввод - 0).</summary>
+    public Vector3I AttachCell => new(ParseIntOrZero(_attachFields[0].Text), ParseIntOrZero(_attachFields[1].Text), ParseIntOrZero(_attachFields[2].Text));
+
+    /// <summary>Записывает клетку размещения в поля (без событий).</summary>
+    public void SetAttachCell(Vector3I cell)
+    {
+        for (int axis = 0; axis < 3; axis++) _attachFields[axis].Text = cell[axis].ToString(CultureInfo.InvariantCulture);
+    }
+
+    /// <summary>Выбранный инструмент гизмо (кнопки Scale/Rotate/Volume).</summary>
+    public BlockEditorTool Tool
+    {
+        get
+        {
+            for (int i = 0; i < _toolButtons.Length; i++)
+            {
+                if (_toolButtons[i].ButtonPressed) return (BlockEditorTool)i;
+            }
+
+            return BlockEditorTool.Scale;
+        }
+    }
+
+    /// <summary>Для самотестов - щёлкает галочку «Manual volume» как пользователь (с событием <see cref="FootprintModeToggled"/>).</summary>
+    public void SetFootprintManualForTesting(bool manual) => _footprintManualBox.ButtonPressed = manual;
+
+    /// <summary>Выбирает инструмент без события (клавиши 1/2/3 и Undo выставляют его сами).</summary>
+    public void SetTool(BlockEditorTool tool)
+    {
+        for (int i = 0; i < _toolButtons.Length; i++) _toolButtons[i].SetPressedNoSignal(i == (int)tool);
+    }
+
+    /// <summary>Поворот модели, градусы (углы Эйлера YXZ, см. <see cref="BlockModelLayout.RotationBasis"/>); нечисловой ввод - 0.</summary>
+    public Vector3 Rotation => new(
+        ParseFloatOr(_rotationFields[0].Text, 0f), ParseFloatOr(_rotationFields[1].Text, 0f), ParseFloatOr(_rotationFields[2].Text, 0f));
+
+    /// <summary>Записывает поворот в поля (без событий) - вызывается и гизмо в 3D, и Undo.</summary>
+    public void SetRotation(Vector3 degrees)
+    {
+        for (int axis = 0; axis < 3; axis++) _rotationFields[axis].Text = FormatNumber(degrees[axis]);
+    }
+
+    /// <summary>Footprint задан вручную (галочка «Manual volume»); иначе его считает редактор из bbox модели.</summary>
+    public bool FootprintManual => _footprintManualBox.ButtonPressed;
+
+    /// <summary>Введённый вручную footprint: min (любые целые) и размер (не меньше 1) - как в полях, до исправления <see cref="BlockModelLayout.SanitizeFootprint"/>.</summary>
+    public (Vector3I Min, Vector3I Size) ManualFootprint => (
+        new Vector3I(ParseIntOrZero(_footprintMinFields[0].Text), ParseIntOrZero(_footprintMinFields[1].Text), ParseIntOrZero(_footprintMinFields[2].Text)),
+        new Vector3I(ParseSizeOr1(_footprintSizeFields[0].Text), ParseSizeOr1(_footprintSizeFields[1].Text), ParseSizeOr1(_footprintSizeFields[2].Text)));
+
+    /// <summary>Записывает режим и значения footprint'а в панель без событий. Поля редактируемы только в ручном режиме; в автоматическом они показывают рассчитанные значения.</summary>
+    public void SetFootprint(bool manual, Vector3I min, Vector3I size)
+    {
+        _suppressFootprintEvents = true;
+        _footprintManualBox.ButtonPressed = manual;
+        for (int axis = 0; axis < 3; axis++)
+        {
+            _footprintMinFields[axis].Text = min[axis].ToString(CultureInfo.InvariantCulture);
+            _footprintSizeFields[axis].Text = size[axis].ToString(CultureInfo.InvariantCulture);
+            _footprintMinFields[axis].Editable = manual;
+            _footprintSizeFields[axis].Editable = manual;
+        }
+
+        _suppressFootprintEvents = false;
     }
 
     /// <summary>Снимает Undo-снэпшот, когда фокус ВХОДИТ в это поле/дропдаун — ДО того, как пользователь успеет что-то
@@ -295,7 +503,10 @@ public sealed class BlockEditorUi
     /// проекта, используется по месту. Модель видна в превью СРАЗУ: <see cref="FunctionalBlockGeometry.GetOrLoadScene"/> читает
     /// `.glb`/`.gltf` напрямую через <see cref="GltfDocument"/>, без `--import`/перезапуска.
     /// </summary>
-    private void BrowseForModel()
+    private void BrowseForModel() => ShowModelDialog(ApplyChosenModelPath);
+
+    /// <summary>Нативный диалог выбора glTF; выбранный путь отдаётся <paramref name="apply"/> (модель блока или указатель).</summary>
+    private void ShowModelDialog(Action<string> apply)
     {
         if (!DisplayServer.HasFeature(DisplayServer.Feature.NativeDialogFile))
         {
@@ -311,16 +522,42 @@ public sealed class BlockEditorUi
             Callable.From((bool status, string[] selectedPaths, long _) =>
             {
                 if (!status || selectedPaths.Length == 0) return;
-                ApplyChosenModelPath(selectedPaths[0]);
+                apply(selectedPaths[0]);
             }));
     }
 
     /// <summary>Обрабатывает выбранный в диалоге файл (публичный — вызывается и самотестом без настоящего диалога).</summary>
     public void ApplyChosenModelPath(string nativePath)
     {
+        string? resPath = ImportModelFile(nativePath, out bool copied);
+        if (resPath == null) return;
+
+        // Порядок важен: ставим СВОЙ статус ДО перезагрузки - если сцена реально не прочитается, превью само перезапишет его
+        // настоящей ошибкой, наш "скопировано"/"установлено" не должен её скрывать. Смена модели - правка, значит точка Undo.
+        EditSessionStarting?.Invoke();
+        _sceneField.Text = resPath;
+        SetStatus(copied ? $"copied into {resPath}" : $"model set to {resPath}");
+        ReloadSceneRequested?.Invoke();
+    }
+
+    /// <summary>То же для модели-указателя ряда <paramref name="index"/> списка Decor.</summary>
+    public void ApplyChosenDecorPath(int index, string nativePath)
+    {
+        string? resPath = ImportModelFile(nativePath, out bool copied);
+        if (resPath == null || index < 0 || index >= _decorRows.Count) return;
+
+        EditSessionStarting?.Invoke();
+        _decorRows[index].Scene.Text = resPath;
+        SetStatus(copied ? $"decor model copied into {resPath}" : $"decor model set to {resPath}");
+        NotifyDecorChanged();
+    }
+
+    /// <summary>Путь <c>res://</c> для выбранного файла: внутри проекта - как есть, снаружи - копия в <c>res://meshes/</c>; null - копирование не удалось (причина в статусе).</summary>
+    private string? ImportModelFile(string nativePath, out bool copied)
+    {
+        copied = false;
         string localized = ProjectSettings.LocalizePath(nativePath);
         string resPath;
-        bool copied = false;
 
         if (localized.StartsWith("res://"))
         {
@@ -335,18 +572,13 @@ public sealed class BlockEditorUi
             if (err != Error.Ok)
             {
                 SetStatus($"failed to copy '{nativePath}' into res://meshes/: {err}");
-                return;
+                return null;
             }
 
             copied = true;
         }
 
-        // Порядок важен: ставим СВОЙ статус ДО перезагрузки - если сцена реально не прочитается, превью само перезапишет его
-        // настоящей ошибкой, наш "скопировано"/"установлено" не должен её скрывать. Смена модели - правка, значит точка Undo.
-        EditSessionStarting?.Invoke();
-        _sceneField.Text = resPath;
-        SetStatus(copied ? $"copied into {resPath}" : $"model set to {resPath}");
-        ReloadSceneRequested?.Invoke();
+        return resPath;
     }
 
     private static Control Separator() => new HSeparator { CustomMinimumSize = new Vector2(0, 4) };
@@ -562,7 +794,8 @@ public sealed class BlockEditorUi
 
     public void LoadFields(string slug, string name, Color color, float mass, float durability, float damage,
         string scenePath, Vector3 modelScale, Vector3 anchor, string behavior, float capacity,
-        IReadOnlyList<CellBox> collisionGroups, IReadOnlyList<ResourcePort> ports, IReadOnlyList<LogicNode> nodes, string paramsJson, string parametersSchemaJson = "")
+        IReadOnlyList<CellBox> collisionGroups, IReadOnlyList<ResourcePort> ports, IReadOnlyList<LogicNode> nodes, string paramsJson, string parametersSchemaJson = "",
+        Vector3 rotation = default, bool footprintManual = false, Vector3I footprintMin = default, Vector3I footprintSize = default, Vector3I attachCell = default, IReadOnlyList<DecorMesh>? decor = null)
     {
         _slugField.Text = slug;
         _nameField.Text = name;
@@ -574,6 +807,9 @@ public sealed class BlockEditorUi
         _sceneField.Text = scenePath;
         SetModelScale(modelScale);
         SetAnchor(anchor);
+        SetRotation(rotation);
+        SetAttachCell(attachCell);
+        SetFootprint(footprintManual, footprintMin, footprintSize == Vector3I.Zero ? Vector3I.One : footprintSize);
         _behaviorField.Text = behavior;
         _capacityField.Text = capacity.ToString(CultureInfo.InvariantCulture);
         _paramsField.Text = paramsJson;
@@ -582,6 +818,7 @@ public sealed class BlockEditorUi
         SetCollisionRows(collisionGroups);
         SetPortRows(ports);
         SetNodeRows(nodes);
+        SetDecorRows(decor ?? Array.Empty<DecorMesh>());
     }
 
     /// <summary>Перестраивает список рядов коллизии с нуля — вызывается при загрузке блока и при Add/Remove (сами значения
@@ -805,6 +1042,119 @@ public sealed class BlockEditorUi
     private void NotifyNodeChanged()
     {
         if (!_suppressNodeEvents) NodesChanged?.Invoke();
+    }
+
+    // ------------------------------------------------------------------ декоративные указатели
+
+    /// <summary>Для самотестов - заполняет поля УЖЕ СУЩЕСТВУЮЩЕГО ряда указателя напрямую, без события <see cref="DecorChanged"/>.</summary>
+    public void SetDecorForTesting(int index, DecorMesh decor)
+    {
+        var row = _decorRows[index];
+        row.Scene.Text = decor.Scene;
+        for (int axis = 0; axis < 3; axis++)
+        {
+            row.Position[axis].Text = FormatNumber(decor.Position[axis]);
+            row.Rotation[axis].Text = FormatNumber(decor.Rotation[axis]);
+            row.Scale[axis].Text = FormatNumber(decor.Scale[axis]);
+        }
+
+        row.Show.Selected = Array.IndexOf(DecorShowValues, decor.ShowWhen);
+    }
+
+    /// <summary>Указатели — из живых полей рядов (scale не меньше/равен нулю заменяется умолчанием, как у масштаба модели).</summary>
+    public IReadOnlyList<DecorMesh> Decor
+    {
+        get
+        {
+            var result = new List<DecorMesh>(_decorRows.Count);
+            foreach (var row in _decorRows)
+            {
+                result.Add(new DecorMesh(
+                    row.Scene.Text.Trim(),
+                    new Vector3(ParseFloatOr(row.Position[0].Text, 0f), ParseFloatOr(row.Position[1].Text, 0f), ParseFloatOr(row.Position[2].Text, 0f)),
+                    new Vector3(ParseFloatOr(row.Rotation[0].Text, 0f), ParseFloatOr(row.Rotation[1].Text, 0f), ParseFloatOr(row.Rotation[2].Text, 0f)),
+                    new Vector3(ParsePositiveOr(row.Scale[0].Text, BlockModelLayout.DefaultScale), ParsePositiveOr(row.Scale[1].Text, BlockModelLayout.DefaultScale), ParsePositiveOr(row.Scale[2].Text, BlockModelLayout.DefaultScale)),
+                    DecorShowValues[Math.Max(row.Show.Selected, 0)]));
+            }
+
+            return result;
+        }
+    }
+
+    /// <summary>Перестраивает список рядов указателей с нуля (загрузка блока, Add/Remove, Undo) - тот же приём, что и у портов.</summary>
+    public void SetDecorRows(IReadOnlyList<DecorMesh> decor)
+    {
+        _suppressDecorEvents = true;
+        foreach (var child in _decorList.GetChildren()) child.QueueFree();
+        _decorRows.Clear();
+        for (int i = 0; i < decor.Count; i++) AddDecorRow(decor[i], i);
+        _suppressDecorEvents = false;
+    }
+
+    private LineEdit[] AddVectorRow(VBoxContainer entry, string label, Vector3 value)
+    {
+        var row = new HBoxContainer();
+        row.AddChild(UiStyle.MakeLabel(label, 11, UiStyle.TextDim));
+        var fields = new LineEdit[3];
+        for (int axis = 0; axis < 3; axis++)
+        {
+            var field = new LineEdit { CustomMinimumSize = new Vector2(70, 26), Text = FormatNumber(value[axis]) };
+            field.TextSubmitted += _ => NotifyDecorChanged();
+            field.FocusExited += () => NotifyDecorChanged();
+            BindUndoCapture(field);
+            row.AddChild(field);
+            fields[axis] = field;
+        }
+
+        entry.AddChild(row);
+        return fields;
+    }
+
+    private void AddDecorRow(DecorMesh decor, int index)
+    {
+        var entry = new VBoxContainer();
+        entry.AddThemeConstantOverride("separation", 2);
+
+        var header = new HBoxContainer();
+        header.AddChild(UiStyle.MakeLabel($"Decor #{index}", 12, UiStyle.TextDim));
+        int capturedIndex = index;
+        var removeButton = UiStyle.MakeButton("Remove", new Vector2(70, 24));
+        removeButton.Pressed += () => RemoveDecorRequested?.Invoke(capturedIndex);
+        header.AddChild(removeButton);
+        entry.AddChild(header);
+
+        var sceneRow = new HBoxContainer();
+        sceneRow.AddChild(UiStyle.MakeLabel("scene", 11, UiStyle.TextDim));
+        var sceneField = new LineEdit { CustomMinimumSize = new Vector2(250, 26), Text = decor.Scene, PlaceholderText = "res://meshes/arrow.glb" };
+        sceneField.TextSubmitted += _ => NotifyDecorChanged();
+        sceneField.FocusExited += () => NotifyDecorChanged();
+        BindUndoCapture(sceneField);
+        sceneRow.AddChild(sceneField);
+        var browse = UiStyle.MakeButton("Browse...", new Vector2(80, 26));
+        browse.Pressed += () => ShowModelDialog(path => ApplyChosenDecorPath(capturedIndex, path));
+        sceneRow.AddChild(browse);
+        entry.AddChild(sceneRow);
+
+        var position = AddVectorRow(entry, "position m", decor.Position);
+        var rotation = AddVectorRow(entry, "rotation °", decor.Rotation);
+        var scale = AddVectorRow(entry, "scale", decor.Scale);
+
+        var showRow = new HBoxContainer();
+        showRow.AddChild(UiStyle.MakeLabel("show", 11, UiStyle.TextDim));
+        var show = MakeEnumDropdown(DecorShowValues.Select(v => v.ToString()), Array.IndexOf(DecorShowValues, decor.ShowWhen));
+        show.ItemSelected += _ => NotifyDecorChanged();
+        BindUndoCapture(show);
+        showRow.AddChild(show);
+        entry.AddChild(showRow);
+
+        _decorList.AddChild(entry);
+        _decorList.AddChild(new HSeparator());
+        _decorRows.Add((sceneField, position, rotation, scale, show));
+    }
+
+    private void NotifyDecorChanged()
+    {
+        if (!_suppressDecorEvents) DecorChanged?.Invoke();
     }
 
     public void SetStatus(string message) => _status.Text = message;

@@ -170,10 +170,15 @@ public sealed class PilotSeatBehavior : BlockBehavior<PilotSeatState>
 
     /// <summary>Параметры типа блока для мира: высота глаз над центром клетки ноды <c>occuped</c> (<c>"eyeHeight"</c>, м, по умолчанию 0.75) и в какую сторону
     /// смотрит сиденье (<c>"forward"</c> — имя <see cref="BlockFace"/>, по умолчанию <c>PosX</c>).</summary>
-    public static (double EyeHeight, BlockFace Forward) ReadSeatSettings(FunctionalBlockComponent definition)
+    public static (double EyeHeight, BlockFace Forward) ReadSeatSettings(FunctionalBlockComponent definition) => ReadSeatSettings(definition, ParameterSet.Empty);
+
+    /// <summary>То же, но параметры экземпляра (<c>eyeHeight</c>, <c>forward</c> в схеме Parameters блока, инструмент «Parameters») важнее констант типа блока из <c>"params"</c>.</summary>
+    public static (double EyeHeight, BlockFace Forward) ReadSeatSettings(FunctionalBlockComponent definition, ParameterSet parameters)
     {
-        double eyeHeight = double.TryParse(definition.GetParam("eyeHeight", "0.75"), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out double h) ? h : 0.75;
-        var forward = Enum.TryParse<BlockFace>(definition.GetParam("forward", "PosX"), ignoreCase: true, out var f) ? f : BlockFace.PosX;
+        string heightText = parameters.Has("eyeHeight") ? parameters.GetString("eyeHeight") : definition.GetParam("eyeHeight", "0.75");
+        string forwardText = parameters.Has("forward") ? parameters.GetString("forward") : definition.GetParam("forward", "PosX");
+        double eyeHeight = double.TryParse(heightText, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out double h) ? h : 0.75;
+        var forward = Enum.TryParse<BlockFace>(forwardText, ignoreCase: true, out var f) ? f : BlockFace.PosX;
         return (eyeHeight, forward);
     }
 }

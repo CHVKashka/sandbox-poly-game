@@ -312,6 +312,19 @@ public partial class BuildEditor
         OpenParametersPanel(instance);
     }
 
+    /// <summary>
+    /// Быстрый доступ к свойствам (ПКМ по блоку при выключенных инструментах, как в Stormworks): блок с настройками под курсором — включается инструмент «Parameters» и открывается его панель.
+    /// Вернуться — Esc закрывает панель, <c>P</c>/кнопка выключают инструмент. Нет настраиваемого блока под курсором — ничего.
+    /// </summary>
+    public void QuickProperties()
+    {
+        var instance = ConfigurableUnderCursor();
+        if (instance == null) return;
+
+        _state.Tool = ToolMode.Parameters;
+        OpenParametersPanel(instance);
+    }
+
     /// <summary>То же, что клик, но с явной позицией курсора (для самотестов без настоящей мыши).</summary>
     public void ParametersToolClickAt(Vector2 mouse)
     {

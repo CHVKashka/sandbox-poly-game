@@ -1,8 +1,10 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using Godot;
 using SandboxPolyGame.Blocks;
 using SandboxPolyGame.Core;
+using SandboxPolyGame.Editor.Ui;
 using SandboxPolyGame.Runtime;
 
 namespace SandboxPolyGame.World;
@@ -29,6 +31,32 @@ public partial class GameWorld
 
     /// <summary>Игрок (для самотестов).</summary>
     public Player PlayerForTesting => _player;
+
+    /// <summary>Подсказка со значениями нод блока под прицелом (для самотестов).</summary>
+    public BlockTooltipUi NodeTooltipForTesting => _nodeTooltip;
+
+    /// <summary>
+    /// Подсказка при наведении прицела на функциональный блок заспавненной постройки: название блока и ТОЛЬКО значения его нод (<see cref="FunctionalBlockRuntime.ReadNodes"/>) — выходы,
+    /// значения на входах, питание. Параметры блока в мире не показываются (их настраивают и смотрят в редакторе). Прячется, пока открыто меню, и у блока без нод/без рантайма
+    /// (на клиенте значения приходят по сети, см. <see cref="FunctionalBlockRuntime.ReadNodes"/>). Рядом с прицелом (справа снизу от центра экрана).
+    /// </summary>
+    private void UpdateNodeTooltip()
+    {
+        if (BlockUnderCrosshair() is { } target && target.Vehicle.Runtime is { } runtime && BlockCatalog.Instance.TryGetBySlug(target.Instance.BlockSlug, out var definition))
+        {
+            var readings = runtime.ReadNodes(target.Instance.InstanceId);
+            if (readings.Count > 0)
+            {
+                var viewport = _uiRoot.GetViewportRect().Size;
+                var anchor = viewport * 0.5f + new Vector2(28, 14);
+                _nodeTooltip.ShowLines($"world:{target.Vehicle.NetId}:{target.Instance.InstanceId}", definition.Name,
+                    readings.Select(r => (r.Label, r.Text)).ToList(), anchor, anchor - new Vector2(28, 14), viewport);
+                return;
+            }
+        }
+
+        _nodeTooltip.Hide();
+    }
 
     /// <summary>Луч из центра экрана с подробностями попадания (позиция, нормаль, коллайдер); пустой словарь — ничего не попало.</summary>
     private Godot.Collections.Dictionary RaycastDetailed(float maxDistance)

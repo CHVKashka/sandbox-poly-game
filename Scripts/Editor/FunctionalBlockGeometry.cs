@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using Godot;
 using SandboxPolyGame.Blocks;
 using SandboxPolyGame.Core;
+using SandboxPolyGame.Runtime;
 
 namespace SandboxPolyGame.Editor;
 
@@ -202,6 +203,34 @@ public static class FunctionalBlockGeometry
     {
         var pivot = new Vector3(0.5f, 0.5f, 0.5f) * BuildSpace.CellSize; // центр корневой клетки в локальных метрах
         return new Transform3D(rotation, BuildSpace.CellCenter(rootCell) - rotation * pivot);
+    }
+
+    /// <summary>
+    /// Отражение указателей (<see cref="DecorMesh"/>) блока, чьё поведение поддерживает отражение (<see cref="IBlockBehavior.SupportsMirror"/>, колесо): по осям X и Z рамки блока вокруг
+    /// центра корневой клетки, <c>M = Translate(c) · Scale(sx, 1, sz) · Translate(−c)</c>, c — центр клетки (0,0,0) (CellSize/2 по всем осям), sx/sz = −1 при отражении по этой оси. Ось Y игнорируется
+    /// (колесо перевёрнутым смысла не имеет). Итоговая рамка указателя: <c>frame · M · decor.LocalTransform</c> (frame — InstanceFrame/PivotFrame). Блок без поддержки отражения — единичное
+    /// преобразование (указатели стоят как раньше). Базис отражения имеет отрицательный определитель: движок сам разворачивает порядок обхода граней.
+    /// </summary>
+    public static Transform3D DecorMirror(FunctionalBlockComponent block, Vector3I mirror)
+    {
+        if (!BlockBehaviorRegistry.TryGet(block.Behavior, out var behavior) || !behavior.SupportsMirror) return Transform3D.Identity;
+
+        float half = BuildSpace.CellSize * 0.5f;
+        var center = new Vector3(half, half, half);
+        var scale = new Vector3(mirror.X != 0 ? -1 : 1, 1, mirror.Z != 0 ? -1 : 1);
+        return new Transform3D(Basis.FromScale(scale), center - scale * center);
+    }
+
+    /// <summary>
+    /// Рамка блока, у которого клетка <paramref name="attachCell"/> (рамка блока) стоит на клетке <paramref name="placeCell"/>, а сам блок жёстко повёрнут <paramref name="rotation"/>
+    /// вокруг центра этой клетки: <c>frame(p) = CellCenter(placeCell) + R · (p − (attachCell + 0.5)·CellSize)</c>. Для призрака с произвольным (анимируемым) базисом: при повороте J/K/L
+    /// блок вращается вокруг attachCell, а не прыгает. При attachCell = (0,0,0) это <see cref="RootFrame"/>; для поворотов, кратных 90°, совпадает с <see cref="InstanceFrame"/>
+    /// поставленного экземпляра (корень которого вычислен <see cref="BlockFootprint.RootForPlaceCell"/>) — проверяется самотестом на всех 64 комбинациях.
+    /// </summary>
+    public static Transform3D PivotFrame(Vector3I placeCell, Vector3I attachCell, Basis rotation)
+    {
+        var pivot = (new Vector3(attachCell.X, attachCell.Y, attachCell.Z) + new Vector3(0.5f, 0.5f, 0.5f)) * BuildSpace.CellSize;
+        return new Transform3D(rotation, BuildSpace.CellCenter(placeCell) - rotation * pivot);
     }
 
     /// <summary>

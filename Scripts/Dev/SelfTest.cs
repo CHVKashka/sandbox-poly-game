@@ -46,6 +46,16 @@ public sealed partial class SelfTest
         var test = new SelfTest();
         GD.Print("=== sandbox-poly-game self-test ===");
 
+        // Разработка: SELFTEST_ONLY=wheeldrive прогоняет только физические тесты колеса (минуты вместо всего набора). Полный прогон (test.bat) переменную не ставит.
+        if (OS.GetEnvironment("SELFTEST_ONLY") == "wheeldrive")
+        {
+            editor.GetTree().Root.Size = new Vector2I(1600, 900);
+            await test.RunWheelDrivingTests(editor);
+            GD.Print($"=== self-test finished (wheeldrive only): {test._passed} passed, {test._failed} failed ===");
+            editor.GetTree().Quit(test._failed == 0 ? 0 : 1);
+            return;
+        }
+
         test.RunMesherTests();
         test.RunIncrementalTests();
         test.RunRaycastTests();
@@ -56,7 +66,15 @@ public sealed partial class SelfTest
         test.RunResizeMeshingTests();
         test.RunRotationStateTests();
         test.RunBlockModelLayoutTests();
+        test.RunModelRotationAndVolumeLayoutTests();
+        test.RunWheelBlockContractTests();
+        test.RunAttachCellGeometryTests();
         test.RunParametersTests();
+        test.RunParameterWidgetRuleTests();
+        test.RunMathExpressionTests();
+        test.RunDecorFormatTests();
+        test.RunWheelMirrorBehaviorTests();
+        test.RunWheelMirrorRuntimeTests();
         test.RunNodeWireTests();
         test.RunPowerAndMotionTests();
         test.RunTorqueNetworkTests();
@@ -78,8 +96,23 @@ public sealed partial class SelfTest
         await test.RunEditorTests(editor);
         await test.RunEditorToolTests(editor);
         await test.RunPlacementConflictTests(editor);
+        await test.RunAttachCellPlacementTests(editor);
         await test.RunBlockEditorTests(editor);
         await test.RunBlockEditorSchemaTests(editor);
+        await test.RunBlockEditorGizmoTests(editor);
+        await test.RunBlockEditorAttachCellTests(editor);
+        await test.RunParameterPanelWidgetTests(editor);
+        await test.RunFunctionBlockTests(editor);
+        await test.RunDecorEditorTests(editor);
+        await test.RunDecorMirrorTests(editor);
+        await test.RunParametersToolRealInputTests(editor);
+        await test.RunRemotePlayerReplicaTests(editor);
+        await test.RunEditorTooltipToolTests(editor);
+        await test.RunSaveDialogAndDraftTests(editor);
+        await test.RunRecallToEditorTests(editor);
+        await test.RunWorldNodeTooltipTests(editor);
+        await test.RunWheelRestTests(editor);
+        await test.RunWheelDrivingTests(editor);
         test.RunVehicleSpawnerCollisionTests(editor);
         test.RunFunctionalRuntimeSpawnTest(editor);
         test.RunButtonVisualTests(editor);
@@ -1768,6 +1801,19 @@ public sealed partial class SelfTest
             $"count={world.WorkbenchMenu.JoinableSessionCount}");
         world.WorkbenchMenu.Close();
 
+        // Continue editing / R по постройке: сессия открывается из готового JSON (правки, которых нет на диске), а не из файла или пустой.
+        var draftSource = new Construction(new VoxelGrid());
+        draftSource.PlaceBlock(Vector3I.Zero, new Vector3I(3, 1, 1), BlockCatalog.Instance.Get("block"), Colors.White);
+        var fromJson = new List<(string Key, string Json)>();
+        void CaptureJsonSession(string key, string wb, string json) => fromJson.Add((key, json));
+        NetHub.Instance.SessionReadyForMe += CaptureJsonSession;
+        NetHub.Instance.RequestOpenSession(benchName, null, ConstructionIO.Serialize(draftSource));
+        await Frames(host, 1);
+        NetHub.Instance.SessionReadyForMe -= CaptureJsonSession;
+        Check(fromJson.Count == 1 && BlocksInJson(fromJson[0].Json) == 3, "a session opened from a JSON (Continue editing / R on a construction) starts with exactly that construction, not an empty one", $"sessions={fromJson.Count}");
+        if (fromJson.Count == 1) NetHub.Instance.RequestCloseSession(fromJson[0].Key);
+        await Frames(host, 1);
+
         // Регрессия на баг, найденный пользователем: раньше игроки жили ПОД GameWorld - когда хост (сервер, значит
         // авторитативен над самим существованием этих узлов) входил в свой редактор, его собственная пересборка
         // сцены попутно уничтожала ВСЕХ реплицированных игроков у ВСЕХ клиентов разом (серый экран,
@@ -2871,22 +2917,22 @@ public sealed partial class SelfTest
             .OfType<LineEdit>().First(f => f.IsVisibleInTree() && f.PlaceholderText == "My Boat");
         var descriptionField = editor.GetTree().Root.FindChildren("*", "TextEdit", true, false)
             .OfType<TextEdit>().First(f => f.IsVisibleInTree());
-        var doneButton = FindButtons(editor).Find(b => b.Text == "Done");
-        Check(doneButton != null, "save dialog: Done button exists");
+        var doneButton = FindButtons(editor).Find(b => b.Text == "Save");
+        Check(doneButton != null, "save dialog: the Save (as new) button exists");
 
         const string testVehicleName = "__selftest_vehicle__";
         nameField.Text = "";
         await Click(editor, CenterOf(doneButton!), MouseButton.Left);
-        Check(editor.Ui.SaveDialogOpen, "Done with an empty name does not close the dialog (a name is required)");
+        Check(editor.Ui.SaveDialogOpen, "Save with an empty name does not close the dialog (a name is required)");
 
         nameField.Text = testVehicleName;
         descriptionField.Text = "a self-test vehicle";
         await Click(editor, CenterOf(doneButton!), MouseButton.Left);
-        Check(!editor.Ui.SaveDialogOpen, "Done with a name closes the dialog");
+        Check(!editor.Ui.SaveDialogOpen, "Save with a name closes the dialog");
 
         var savedEntry = ConstructionStorage.List().FirstOrDefault(c => c.Name == testVehicleName);
         Check(savedEntry.Path != null && FileAccess.FileExists(savedEntry.Path) && savedEntry.Description == "a self-test vehicle",
-            "Done writes a named save file with the entered name/description, discoverable via ConstructionStorage.List",
+            "Save writes a named save file with the entered name/description, discoverable via ConstructionStorage.List",
             $"{savedEntry}");
         if (savedEntry.Path != null) DirAccess.RemoveAbsolute(savedEntry.Path);
 
@@ -3360,12 +3406,12 @@ public sealed partial class SelfTest
             source.ListDirEnd();
         }
 
-        foreach (var (slug, json, parametersJson) in functional)
+        foreach (var (slug, json, parametersJson, noBase) in functional)
         {
             using var write = FileAccess.Open($"{dir}/{slug}.xml", FileAccess.ModeFlags.Write);
             write.StoreString(
                 $"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Block id=\"{slug}\" name=\"{slug}\"><Color>#8899aa</Color>" +
-                $"<Component type=\"BaseComponent\">{{ \"mass\": 5 }}</Component>" +
+                (noBase ? "" : $"<Component type=\"BaseComponent\">{{ \"mass\": 5 }}</Component>") +
                 (parametersJson != null ? $"<Component type=\"Parameters\">{parametersJson}</Component>" : "") +
                 $"<Component type=\"FunctionalBlock\">{json}</Component></Block>");
             written.Add($"{slug}.xml");

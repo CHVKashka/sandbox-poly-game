@@ -96,6 +96,23 @@ public sealed class EditorState
         Changed?.Invoke();
     }
 
+    private bool _tooltipEnabled = true;
+
+    /// <summary>
+    /// Подсказка с параметрами функционального блока под курсором (кнопка «Tooltip» на тулбаре, клавиша <c>T</c>). Включается и выключается независимо от инструментов
+    /// (<see cref="Tool"/> взаимоисключающие, а подсказка работает с любым из них); по умолчанию включена.
+    /// </summary>
+    public bool TooltipEnabled
+    {
+        get => _tooltipEnabled;
+        set
+        {
+            if (value == _tooltipEnabled) return;
+            _tooltipEnabled = value;
+            Changed?.Invoke();
+        }
+    }
+
     public ToolMode Tool
     {
         get => _tool;

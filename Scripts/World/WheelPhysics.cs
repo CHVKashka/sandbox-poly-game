@@ -34,6 +34,8 @@ public readonly record struct WheelContact(int InstanceId, bool Grounded, double
 /// <item><b>Продольная</b> — привод/качение: <c>μN·sat((ω·R − v_f)/vref)</c>; плюс торможение <c>−тормоз·μN·sat(v_f/vref)</c> и малое сопротивление качению.</item>
 /// <item><b>Боковая</b> — против бокового скольжения: <c>−μN·sat(v_s/vref)</c>.</item>
 /// </list>
+/// <item><b>Трение покоя</b> (колесо под тормозом и почти стоит): вместо вязкого трения — пружина к точке, где колесо «прилипло» к земле (см. <see cref="Rig.Anchor"/>). Вязкая сила пропорциональна скорости,
+/// поэтому на склоне машина с зажатым тормозом ползла бы со скоростью, при которой вязкая сила уравновешивает скатывающую (≈5 см/с на 10°); пружина даёт силу от СМЕЩЕНИЯ, и машина стоит.</item>
 /// Продольная и боковая делят один круг трения (суммарный вектор не длиннее <c>μN</c>): юз при резком руле или торможении получается сам. Каждая составляющая дополнительно
 /// ограничена так, чтобы за один тик не перепрыгнуть скорость, к которой стремится (<c>0.5·m/(n·dt)·|ошибка|</c>) — явная схема остаётся устойчивой. Свободное колесо
 /// (не ведомое) подстраивает обороты под скорость земли (<see cref="FreeSpinTime"/>); в воздухе крутится по инерции с малым затуханием. Реакция прикладывается и к чужому
@@ -41,7 +43,7 @@ public readonly record struct WheelContact(int InstanceId, bool Grounded, double
 /// </summary>
 public sealed class WheelPhysics : IDisposable
 {
-    public const int RayCount = 9;
+    public const int RayCount = 25;
     public const double FanHalfAngleDegrees = 80;
 
     /// <summary>Ход контакта (вдавливание шины) при равной нагрузке на колёса, м.</summary>
@@ -72,18 +74,39 @@ public sealed class WheelPhysics : IDisposable
     /// <summary>Глубина вдавливания не берётся больше этой доли радиуса (защита от гигантских сил при почти-пробое).</summary>
     public const double MaxDepthFraction = 0.6;
 
+    /// <summary>В нормаль контакта входят лучи, чьё вдавливание больше этой доли глубочайшего (см. <see cref="Step"/>).</summary>
+    public const double BlendDepthFraction = 0.6;
+
+    /// <summary>Сила торможения (Variable brake) от этого значения и полный тормоз «держат» колесо: на почти стоящем колесе включается трение покоя.</summary>
+    public const double HoldBrakeThreshold = 0.99;
+
+    /// <summary>Скорость точки контакта по земле, м/с, ниже которой колесо под тормозом «прилипает».</summary>
+    public const double StickEngageSpeed = 0.05;
+
+    /// <summary>Скорость, м/с, выше которой прилипшее колесо отпускается (его тянут/толкают сильнее, чем держит трение).</summary>
+    public const double StickReleaseSpeed = 0.3;
+
+    /// <summary>Жёсткость пружины прилипания в долях <c>m/dt²</c> (масса на колесо): 0.1 - явная схема остаётся устойчивой с большим запасом.</summary>
+    public const double StickStiffnessFactor = 0.1;
+
     private sealed class Rig
     {
         public required int InstanceId { get; init; }
         public required WheelState State { get; init; }
         public required Vector3 HubLocal { get; init; }
         public required Basis FrameBasis { get; init; }
+
+        /// <summary>Точка «прилипания» колеса к земле (трение покоя): в мировых координатах или, если колесо стоит на чужом теле, в его локальных. null - колесо скользит/катится.</summary>
+        public Vector3? Anchor { get; set; }
+        public GodotObject? AnchorCollider { get; set; }
     }
 
     private readonly VehicleBody _body;
     private readonly Construction _construction;
     private readonly List<Rig> _rigs = new();
     private readonly List<WheelContact> _contacts = new();
+    private readonly double[] _rayDepth = new double[RayCount];
+    private readonly Vector3[] _rayNormal = new Vector3[RayCount];
     private readonly PhysicsRayQueryParameters3D _query = PhysicsRayQueryParameters3D.Create(Vector3.Zero, Vector3.Zero);
     private bool _dirty = true;
 
@@ -177,6 +200,7 @@ public sealed class WheelPhysics : IDisposable
             double bestDepth = 0;
             Vector3 bestPoint = Vector3.Zero, bestNormal = Vector3.Up;
             GodotObject? bestCollider = null;
+            Array.Clear(_rayDepth);
             for (int i = 0; i < RayCount; i++)
             {
                 double angle = (-FanHalfAngleDegrees + 2 * FanHalfAngleDegrees * i / (RayCount - 1)) * Math.PI / 180;
@@ -185,7 +209,9 @@ public sealed class WheelPhysics : IDisposable
 
                 double cosine = -direction.Dot(normal);
                 if (cosine < 0.05) continue; // скользящее попадание: нормаль почти вдоль луча - глубина не определена
-                double depth = radius - (point - hub).Length() * cosine;
+                double depth = radius - (point - hub).Length(); // вдавливание ВДОЛЬ луча: плоскость верха ступеньки не «подпирает» колесо раньше, чем ребро реально под ним
+                _rayDepth[i] = depth;
+                _rayNormal[i] = normal;
                 if (depth > bestDepth)
                 {
                     bestDepth = depth;
@@ -193,6 +219,15 @@ public sealed class WheelPhysics : IDisposable
                     bestNormal = normal;
                     bestCollider = collider;
                 }
+            }
+
+            if (bestDepth > 1e-6)
+            {
+                // Нормаль контакта - среднее нормалей лучей, почти такой же глубины (у ребра ступеньки грань и верх дают диагональ, как у настоящего колеса на углу);
+                // на ровной земле соседние лучи заметно мельче и в среднее не входят.
+                var blended = Vector3.Zero;
+                for (int i = 0; i < RayCount; i++) blended += _rayNormal[i] * Math.Max(0, _rayDepth[i] - BlendDepthFraction * bestDepth);
+                if (blended.LengthSquared() > 1e-12) bestNormal = blended.Normalized();
             }
 
             if (bestDepth <= 1e-6)
@@ -205,6 +240,10 @@ public sealed class WheelPhysics : IDisposable
             }
 
             double compression = Math.Min(bestDepth, MaxDepthFraction * radius);
+
+            // Точка контакта - проекция центра колеса на плоскость попадания, а не точка попадания выбранного луча: на ровной земле глубину дают несколько лучей веера с одинаковой
+            // (до шума) глубиной, выбор между ними прыгал бы от тика к тику, а с ним - точка приложения силы на ±12 см вдоль колеса (момент тангажа, машина дрожит).
+            bestPoint = hub - bestNormal * (radius - bestDepth);
             var other = bestCollider as RigidBody3D;
             if (other == _body) other = null;
 
@@ -234,9 +273,47 @@ public sealed class WheelPhysics : IDisposable
                 double speedSide = relative.Dot(lateral);
 
                 // Свободное колесо подстраивается под скорость земли; ведомое держит обороты сети (их ставит рантайм), заблокированное стоит.
-                if (!state.FullBrake && !state.Driven) state.Omega += (speedForward / radius - state.Omega) * (1 - Math.Exp(-delta / FreeSpinTime));
+                if (!state.FullBrake && !state.Driven) state.Omega = speedForward / radius; // свободное колесо катится без проскальзывания: тормозит его только сопротивление качению
 
-                double limit = (state.TireBroken ? RimFriction : TireFriction) * (state.FullBrake ? SlideFactor : 1.0) * normalForce;
+                double staticLimit = (state.TireBroken ? RimFriction : TireFriction) * normalForce;
+                double limit = staticLimit * (state.FullBrake ? SlideFactor : 1.0);
+
+                // ---- трение покоя: колесо под тормозом, почти стоящее - пружина к точке прилипания
+                bool held = state.FullBrake || state.BrakeInput >= HoldBrakeThreshold;
+                double tangentSpeed = Math.Sqrt(speedForward * speedForward + speedSide * speedSide);
+                if (!held || tangentSpeed > StickReleaseSpeed || (rig.Anchor != null && !ReferenceEquals(rig.AnchorCollider, bestCollider))) rig.Anchor = null;
+                else if (rig.Anchor == null && tangentSpeed < StickEngageSpeed)
+                {
+                    rig.Anchor = other != null ? other.ToLocal(bestPoint) : bestPoint;
+                    rig.AnchorCollider = bestCollider;
+                }
+
+                if (rig.Anchor is { } anchorStored)
+                {
+                    var anchorWorld = other != null ? other.ToGlobal(anchorStored) : anchorStored;
+                    var offset = bestPoint - anchorWorld;
+                    offset -= bestNormal * offset.Dot(bestNormal);
+
+                    double stiffnessStick = StickStiffnessFactor * wheelMass / (delta * delta);
+                    double dampingStick = 2 * 0.7 * Math.Sqrt(stiffnessStick * wheelMass);
+                    if (offset.Length() * stiffnessStick > staticLimit && staticLimit > 1e-9)
+                    {
+                        // Тянут сильнее, чем держит трение: точка прилипания тащится за колесом (колесо проскальзывает, но не дальше предела).
+                        offset *= staticLimit / (offset.Length() * stiffnessStick);
+                        anchorWorld = bestPoint - offset;
+                        rig.Anchor = other != null ? other.ToLocal(anchorWorld) : anchorWorld;
+                    }
+
+                    var tangentVelocity = relative - bestNormal * relative.Dot(bestNormal);
+                    var stick = -offset * stiffnessStick - tangentVelocity * dampingStick;
+                    if (stick.Length() > staticLimit && staticLimit > 1e-9) stick *= staticLimit / stick.Length();
+                    force += stick;
+                    _body.ApplyForce(force, bestPoint - _body.GlobalPosition);
+                    other?.ApplyForce(-force, bestPoint - other.GlobalPosition);
+                    _contacts.Add(new WheelContact(rig.InstanceId, true, compression, normalForce, bestPoint, bestNormal));
+                    continue;
+                }
+
                 double slip = state.Omega * radius - speedForward;
                 double ceiling = 0.5 * wheelMass / delta;
 

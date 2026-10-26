@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using Godot;
 using SandboxPolyGame.Blocks;
 using SandboxPolyGame.Core;
 
@@ -32,6 +33,16 @@ public sealed class FunctionalBlockRuntime : IDisposable
     private sealed record Entry(int InstanceId, FunctionalBlockComponent Block, IBlockBehavior Behavior, BlockState State, string ParametersKey);
 
     private readonly record struct NodeKey(int Instance, string Node);
+
+    /// <summary>Что показать про ноду блока в подсказке (<see cref="ReadNodes"/>): id, тип, направление и текст значения.</summary>
+    public sealed record NodeReading(string Id, NodeType Type, PortDirection Direction, string Text)
+    {
+        /// <summary>Подпись строки: <c>id (Number in)</c>.</summary>
+        public string Label => $"{Id} ({Type} {(Direction == PortDirection.In ? "in" : "out")})";
+    }
+
+    // Итог последнего решения электросети по входам электричества (для подсказки). У наблюдателя (клиент) не считается - там пусто.
+    private readonly Dictionary<NodeKey, PowerReport> _powerReports = new();
 
     private sealed class ElectricNet
     {
@@ -137,7 +148,9 @@ public sealed class FunctionalBlockRuntime : IDisposable
             if (!_entries.TryGetValue(instance.InstanceId, out var existing) || existing.ParametersKey != parametersKey)
             {
                 var parameters = new ParameterSet(Construction.ParametersOf(definition), instance.Parameters);
-                _entries[instance.InstanceId] = new Entry(instance.InstanceId, functional, behavior, behavior.CreateState(functional, parameters), parametersKey);
+                var state = behavior.CreateState(functional, parameters);
+                if (behavior.SupportsMirror) behavior.SetMirror(state, instance.Mirror); // колесо: отражение по Z меняет направление качения, по X - сторону руля
+                _entries[instance.InstanceId] = new Entry(instance.InstanceId, functional, behavior, state, parametersKey);
             }
         }
 
@@ -147,8 +160,10 @@ public sealed class FunctionalBlockRuntime : IDisposable
         }
     }
 
+    // Состояние пересоздаётся, когда меняются настройки экземпляра ИЛИ его отражение (после установки оно не меняется, но Undo и загрузка пересоздают экземпляры).
     private static string ParametersKeyOf(BlockInstance instance) =>
-        instance.Parameters is { Count: > 0 } ? string.Join(";", instance.Parameters.OrderBy(p => p.Key, StringComparer.Ordinal).Select(p => p.Key + "=" + p.Value)) : "";
+        (instance.Parameters is { Count: > 0 } ? string.Join(";", instance.Parameters.OrderBy(p => p.Key, StringComparer.Ordinal).Select(p => p.Key + "=" + p.Value)) : "")
+        + (instance.Mirror != Vector3I.Zero ? $"|mirror={instance.Mirror.X}{instance.Mirror.Y}{instance.Mirror.Z}" : "");
 
     /// <summary>Передаёт действие поведению экземпляра; false — у экземпляра нет состояния (нет такого блока или у него нет поведения).</summary>
     public bool Interact(int instanceId, BlockInteraction interaction)
@@ -179,6 +194,54 @@ public sealed class FunctionalBlockRuntime : IDisposable
         if (_entries.TryGetValue(instanceId, out var entry)) return entry.Behavior.TryReadNode(entry.State, nodeId, out value);
         value = NodeValue.Off;
         return false;
+    }
+
+    /// <summary>
+    /// Текущие значения всех нод экземпляра для подсказки в игровом мире: выходы Number/Boolean — значение, входы — значение с провода (нет провода — 0 и пометка), вход электричества —
+    /// «powered N%»/«no power», выход электричества — запас («stored X»/«empty»). Boolean показывается как ON/OFF. Пусто — у экземпляра нет состояния. На клиенте (зеркало) значения выходов приходят
+    /// по сети, входы Number/Boolean выводятся из них по проводам, а питание не считается (показывается «–»).
+    /// </summary>
+    public IReadOnlyList<NodeReading> ReadNodes(int instanceId)
+    {
+        if (!_entries.TryGetValue(instanceId, out var entry)) return Array.Empty<NodeReading>();
+        RebuildTopologyIfNeeded();
+
+        string Format(NodeType type, NodeValue value) => type == NodeType.Boolean ? (value.IsOn ? "ON" : "OFF") : value.Number.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture);
+
+        var result = new List<NodeReading>();
+        foreach (var node in entry.Block.Nodes)
+        {
+            string text;
+            var key = new NodeKey(instanceId, node.Id);
+            if (node.Type == NodeType.Electricity)
+            {
+                if (node.Direction == PortDirection.In)
+                {
+                    text = _powerReports.TryGetValue(key, out var report) ? (report.Energized ? $"powered {report.Ratio:P0}" : "no power") : "–";
+                }
+                else
+                {
+                    double stored = entry.Behavior.GetStoredEnergy(entry.State, node.Id);
+                    text = stored > 0 ? $"stored {stored.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture)}" : "empty";
+                }
+            }
+            else if (node.Direction == PortDirection.Out)
+            {
+                text = entry.Behavior.TryReadNode(entry.State, node.Id, out var output) ? Format(node.Type, output) : "–";
+            }
+            else if (_signalSource.TryGetValue(key, out var source) && _entries.TryGetValue(source.Instance, out var sourceEntry) && sourceEntry.Behavior.TryReadNode(sourceEntry.State, source.Node, out var input))
+            {
+                text = Format(node.Type, input);
+            }
+            else
+            {
+                text = Format(node.Type, NodeValue.Off) + " (no wire)";
+            }
+
+            result.Add(new NodeReading(node.Id, node.Type, node.Direction, text));
+        }
+
+        return result;
     }
 
     /// <summary>Обороты сети вращения, в которой стоит экземпляр (об/мин, со знаком); 0 — экземпляр не в сети или сеть стоит.</summary>
@@ -304,7 +367,9 @@ public sealed class FunctionalBlockRuntime : IDisposable
             foreach (var (key, power) in demands)
             {
                 var entry = _entries[key.Instance];
-                entry.Behavior.SetPower(entry.State, key.Node, new PowerReport(energized, energized ? ratio : 0));
+                var report = new PowerReport(energized, energized ? ratio : 0);
+                _powerReports[key] = report;
+                entry.Behavior.SetPower(entry.State, key.Node, report);
                 if (!DebugForcePowered && power > 0) entry.Behavior.ReceiveEnergy(entry.State, key.Node, power * delta * ratio);
                 reported.Add(key);
                 if (energized) energizedInstances.Add(key.Instance);
@@ -329,7 +394,9 @@ public sealed class FunctionalBlockRuntime : IDisposable
                 var key = new NodeKey(entry.InstanceId, node.Id);
                 if (reported.Contains(key)) continue;
 
-                entry.Behavior.SetPower(entry.State, node.Id, DebugForcePowered ? new PowerReport(true, 1) : PowerReport.None);
+                var noWire = DebugForcePowered ? new PowerReport(true, 1) : PowerReport.None;
+                _powerReports[key] = noWire;
+                entry.Behavior.SetPower(entry.State, node.Id, noWire);
                 if (DebugForcePowered) energizedInstances.Add(entry.InstanceId);
             }
 

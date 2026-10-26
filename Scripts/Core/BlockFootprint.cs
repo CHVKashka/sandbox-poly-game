@@ -61,6 +61,13 @@ public static class BlockFootprint
         return (rootCell + min, max - min + Vector3I.One);
     }
 
+    /// <summary>
+    /// Корневая клетка блока, у которого под курсор (<paramref name="placeCell"/>) встаёт клетка <paramref name="attachCell"/> (рамка блока, см.
+    /// <see cref="Blocks.FunctionalBlockComponent.AttachCell"/>): <c>root = placeCell − R · attachCell</c>. При <paramref name="attachCell"/> = (0,0,0) корень и есть <paramref name="placeCell"/>.
+    /// Дальше — обычный <see cref="PlaceBox(Vector3I, Vector3I, Vector3I, Vector3I)"/> от этого корня: данные постройки (origin/size/rotation) от attachCell не зависят.
+    /// </summary>
+    public static Vector3I RootForPlaceCell(Vector3I placeCell, Vector3I attachCell, Vector3I rotationSteps) => placeCell - Rotate(attachCell, rotationSteps);
+
     /// <summary>Обратное к <see cref="PlaceBox(Vector3I, Vector3I, Vector3I, Vector3I)"/>: корневая клетка уже поставленного блока по
     /// минимальному углу его занятого бокса (<see cref="BlockInstance.Origin"/>), локальному боксу и ступеням поворота.</summary>
     public static Vector3I RootCell(Vector3I origin, Vector3I localMin, Vector3I localSize, Vector3I rotationSteps) =>

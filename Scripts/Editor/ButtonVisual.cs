@@ -41,6 +41,20 @@ public sealed class ButtonVisual
     private double _lastSeek = -1;
     private double _lastGlow = -1;
 
+    /// <summary>Цвет свечения; можно менять на лету (параметр экземпляра правят инструментом «Parameters»).</summary>
+    public Color GlowColor
+    {
+        get => _glowColor;
+        set
+        {
+            if (value == _glowColor) return;
+            _glowColor = value;
+            foreach (var material in _glowMaterials) material.Emission = value;
+        }
+    }
+
+    private Color _glowColor;
+
     public double PressProgress { get; private set; }
     public double GlowBrightness { get; private set; }
     public bool HasAnimation => _clip != null;
@@ -51,6 +65,7 @@ public sealed class ButtonVisual
 
     public ButtonVisual(Node modelRoot, ButtonSettings settings)
     {
+        _glowColor = settings.GlowColor;
         _player = FindPlayer(modelRoot);
         if (_player != null)
         {

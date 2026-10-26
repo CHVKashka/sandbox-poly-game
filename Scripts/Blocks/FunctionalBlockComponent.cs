@@ -30,6 +30,8 @@ namespace SandboxPolyGame.Blocks;
 /// <remarks>
 /// JSON-параметры:
 /// <c>{ "scene": "res://meshes/x.glb", "scale": [0.125,0.125,0.125], "anchor": [0,0,0], "footprint": [2,1,1], "footprintMin": [0,0,0],
+///   "rotation": [0, 90, 0], "footprintManual": true, "attachCell": [1, 0, 0],
+///   "decor": [ { "scene": "res://meshes/arrow.glb", "position": [0.125, 0.125, 0.125], "show": "Ghost" } ],
 ///   "behavior": "Button", "params": { "mode": "toggle" }, "capacity": 100,
 ///   "collision": [[0,0,0],[1,0,0]],
 ///   "ports": [ { "id": "shaft_out", "resource": "Torque", "direction": "Out", "face": "PosY", "position": [0,0] } ],
@@ -48,6 +50,14 @@ public sealed class FunctionalBlockComponent : BlockComponent
 
     /// <summary>Минимальная клетка footprint'а в рамке блока (корневая клетка — (0,0,0); может быть отрицательной).</summary>
     public Vector3I FootprintMin { get; private set; } = Vector3I.Zero;
+
+    /// <summary>
+    /// «Якорь размещения» (<c>"attachCell"</c>, рамка блока, умолчание (0,0,0) = корень): клетка блока, которая при установке встаёт ПОД КУРСОР (в <c>PlaceCell</c>) и вокруг которой блок
+    /// поворачивается при установке; корневая клетка (0,0,0) вычисляется (<see cref="BlockFootprint.RootForPlaceCell"/>). Нужна блокам, у которых корень — не то место, которым блок
+    /// крепится (колесо: корень = ступица, а к раме крепится ось на клетку дальше). Влияет ТОЛЬКО на то, куда ставится блок: данные постройки (origin/size/rotation), сохранение, сеть,
+    /// порты и физика от неё не зависят. Клетка обязана лежать внутри footprint-а, иначе блок не загружается.
+    /// </summary>
+    public Vector3I AttachCell { get; private set; } = Vector3I.Zero;
 
     /// <summary>Строковый ключ поведения блока (например, "Button", "ElectricMotor") — по нему рантайм находит
     /// реализацию (<see cref="Runtime.BlockBehaviorRegistry"/>). Ключ без зарегистрированной реализации (пока все,
@@ -68,6 +78,21 @@ public sealed class FunctionalBlockComponent : BlockComponent
     /// <summary>Якорь модели (<c>"anchor"</c>) — доли bbox (каждая из 0 / 0.5 / 1), точка которых встаёт в клетку (0,0,0),
     /// см. <see cref="BlockModelLayout"/>. (0,0,0) по умолчанию — нижний задний левый угол bbox в точке (0,0,0).</summary>
     public Vector3 Anchor { get; private set; } = Vector3.Zero;
+
+    /// <summary>Поворот модели в блоке (<c>"rotation"</c>): углы Эйлера в градусах, порядок YXZ (см. <see cref="BlockModelLayout.RotationBasis"/>); (0,0,0) — как экспортирована.
+    /// Поворачивается только МОДЕЛЬ (рамка bbox, якорь и модель в игре), клетки блока — footprint, коллизия, порты, ноды — остаются как заданы.</summary>
+    public Vector3 ModelRotation { get; private set; } = Vector3.Zero;
+
+    /// <summary>Поворот модели матрицей (см. <see cref="ModelRotation"/>).</summary>
+    public Basis ModelRotationBasis => BlockModelLayout.RotationBasis(ModelRotation);
+
+    /// <summary>Footprint задан вручную (<c>"footprintManual": true</c>, гизмо «Volume» в редакторе блоков), а не считается из bbox модели: части модели могут
+    /// выпирать за занятые клетки (там нет ни места, ни коллизии). Игре всё равно — она читает <see cref="Footprint"/>/<see cref="FootprintMin"/>; флаг нужен
+    /// редактору блоков, чтобы при загрузке не пересчитать footprint заново.</summary>
+    public bool FootprintManual { get; private set; }
+
+    /// <summary>Декоративные меши-указатели (<c>"decor"</c>, см. <see cref="DecorMesh"/>): видны только в редакторе построек, в игре их нет.</summary>
+    public IReadOnlyList<DecorMesh> Decor { get; private set; } = Array.Empty<DecorMesh>();
 
     /// <summary>Физические порты — ТОЛЬКО вал и труба (<see cref="ResourceType"/>); электричество и логика — в <see cref="Nodes"/>.</summary>
     public IReadOnlyList<ResourcePort> Ports { get; private set; } = Array.Empty<ResourcePort>();
@@ -115,6 +140,24 @@ public sealed class FunctionalBlockComponent : BlockComponent
         }
 
         if (json.TryGetProperty("footprintMin", out var footprintMin)) FootprintMin = ReadVector(footprintMin, FootprintMin);
+        if (json.TryGetProperty("attachCell", out var attachCell))
+        {
+            if (attachCell.ValueKind != JsonValueKind.Array || attachCell.GetArrayLength() != 3)
+            {
+                throw new InvalidOperationException("\"attachCell\" must be [x, y, z] - a cell of the block frame");
+            }
+
+            AttachCell = ReadVector(attachCell, AttachCell);
+            var last = FootprintMin + Footprint - Vector3I.One;
+            for (int axis = 0; axis < 3; axis++)
+            {
+                if (AttachCell[axis] < FootprintMin[axis] || AttachCell[axis] > last[axis])
+                {
+                    throw new InvalidOperationException($"\"attachCell\" {AttachCell} lies outside the footprint {FootprintMin}..{last} - the attach cell must be one of the block's own cells");
+                }
+            }
+        }
+
         if (json.TryGetProperty("behavior", out var behavior)) Behavior = behavior.GetString() ?? "";
         if (json.TryGetProperty("capacity", out var capacity)) Capacity = capacity.GetSingle();
         if (json.TryGetProperty("scene", out var scene)) ScenePath = scene.GetString();
@@ -133,6 +176,11 @@ public sealed class FunctionalBlockComponent : BlockComponent
             var raw = ReadVector3(anchor, Anchor);
             Anchor = new Vector3(Math.Clamp(raw.X, 0, 1), Math.Clamp(raw.Y, 0, 1), Math.Clamp(raw.Z, 0, 1));
         }
+
+        if (json.TryGetProperty("rotation", out var rotation)) ModelRotation = ReadVector3(rotation, ModelRotation);
+        if (json.TryGetProperty("footprintManual", out var footprintManual)) FootprintManual = footprintManual.ValueKind == JsonValueKind.True;
+
+        if (json.TryGetProperty("decor", out var decor) && decor.ValueKind == JsonValueKind.Array) Decor = ParseDecor(decor);
 
         if (json.TryGetProperty("ports", out var ports) && ports.ValueKind == JsonValueKind.Array)
         {
@@ -175,6 +223,34 @@ public sealed class FunctionalBlockComponent : BlockComponent
         }
 
         return cells;
+    }
+
+    /// <summary>Разбирает <c>"decor"</c> (см. <see cref="DecorMesh"/>): <c>scene</c> обязателен, <c>show</c> — Ghost/Always. Публичный - тем же разбором пользуется редактор блоков.</summary>
+    public static IReadOnlyList<DecorMesh> ParseDecor(JsonElement array)
+    {
+        var result = new List<DecorMesh>();
+        foreach (var item in array.EnumerateArray())
+        {
+            string scene = item.TryGetProperty("scene", out var sceneJson) ? sceneJson.GetString() ?? "" : "";
+            if (scene.Length == 0) throw new InvalidOperationException("a \"decor\" entry needs a \"scene\" (res://meshes/....glb)");
+
+            var scale = item.TryGetProperty("scale", out var scaleJson) ? ReadVector3(scaleJson, BlockModelLayout.DefaultScaleVector) : BlockModelLayout.DefaultScaleVector;
+            if (scale.X <= 0 || scale.Y <= 0 || scale.Z <= 0) throw new InvalidOperationException($"decor \"scale\" must be positive in every axis, got {scale}");
+
+            var show = DecorShowWhen.Ghost;
+            if (item.TryGetProperty("show", out var showJson) && !Enum.TryParse(showJson.GetString(), ignoreCase: true, out show))
+            {
+                throw new InvalidOperationException($"decor \"show\" must be Ghost or Always, got '{showJson.GetString()}'");
+            }
+
+            result.Add(new DecorMesh(
+                scene,
+                item.TryGetProperty("position", out var positionJson) ? ReadVector3(positionJson, DecorMesh.DefaultPosition) : DecorMesh.DefaultPosition,
+                item.TryGetProperty("rotation", out var rotationJson) ? ReadVector3(rotationJson, Vector3.Zero) : Vector3.Zero,
+                scale, show));
+        }
+
+        return result;
     }
 
     /// <summary>Разбирает JSON-массив <c>"nodes"</c> (<c>{ "id", "type": "Electricity"|"Boolean"|"Number", "direction":

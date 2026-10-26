@@ -17,6 +17,7 @@ public static class BlockBehaviorRegistry
         [BatteryBehavior.Key] = new BatteryBehavior(),
         [PilotSeatBehavior.Key] = new PilotSeatBehavior(),
         [WheelBehavior.Key] = new WheelBehavior(),
+        [FunctionBehavior.Key] = new FunctionBehavior(),
     };
 
     public static bool TryGet(string key, out IBlockBehavior behavior) => Behaviors.TryGetValue(key, out behavior!);

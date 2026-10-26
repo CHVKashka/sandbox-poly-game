@@ -16,7 +16,7 @@ namespace SandboxPolyGame.Dev;
 public sealed partial class SelfTest
 {
     /// <summary>Блок-фикстура: слаг, JSON компонента FunctionalBlock и (необязательно) JSON компонента Parameters.</summary>
-    private readonly record struct FixtureBlock(string Slug, string FunctionalJson, string? ParametersJson = null)
+    private readonly record struct FixtureBlock(string Slug, string FunctionalJson, string? ParametersJson = null, bool NoBase = false)
     {
         public static implicit operator FixtureBlock((string Slug, string Json) pair) => new(pair.Slug, pair.Json);
     }
@@ -80,7 +80,8 @@ public sealed partial class SelfTest
 
     private static string SeatParameters()
     {
-        var items = new List<string>();
+        // eyeHeight - число без пределов (числовое поле), как у настоящего сиденья; оси - ползунки (заданы оба предела).
+        var items = new List<string> { "{ \"id\": \"eyeHeight\", \"label\": \"Eye height\", \"type\": \"Float\", \"default\": 0.5 }" };
         foreach (string axis in PilotSeatBehavior.AxisNames)
         {
             items.Add($"{{ \"id\": \"{axis}_mode\", \"label\": \"Mode\", \"type\": \"Enum\", \"options\": [\"reset\", \"sticky\"], \"default\": \"reset\" }}");
@@ -94,7 +95,7 @@ public sealed partial class SelfTest
     private static IDisposable UseLogicFixtures() => UseCatalogWith(
         new FixtureBlock("zz_bat", BatteryJson, BatteryParameters),
         new FixtureBlock("zz_motor", MotorJson, MotorParameters),
-        new FixtureBlock("zz_shaft", ShaftJson),
+        new FixtureBlock("zz_shaft", ShaftJson, NoBase: true), // без BaseComponent - блок вообще без настроек (со свойствами блока настраивался бы любой)
         new FixtureBlock("zz_button", ButtonJson, ButtonParameters),
         new FixtureBlock("zz_seat", SeatJson(), SeatParameters()));
 
@@ -153,7 +154,7 @@ public sealed partial class SelfTest
         Check(mode.TryNormalize("RESET", out var reset) && reset == "reset" && !mode.TryNormalize("turbo", out _), "an Enum matches an option case-insensitively and rejects unknown ones");
 
         Check(Error("{ \"parameters\": [ { \"id\": \"a\", \"type\": \"Float\" }, { \"id\": \"a\", \"type\": \"Int\" } ] }").Contains("twice"), "a repeated parameter id is a data error");
-        Check(Error("{ \"parameters\": [ { \"id\": \"a\", \"type\": \"Color\" } ] }").Contains("unknown type"), "an unknown parameter type is a data error");
+        Check(Error("{ \"parameters\": [ { \"id\": \"a\", \"type\": \"Vector\" } ] }").Contains("unknown type"), "an unknown parameter type is a data error");
         Check(Error("{ \"parameters\": [ { \"id\": \"a\", \"type\": \"Enum\" } ] }").Contains("options"), "an Enum without options is a data error");
         Check(Error("{ \"parameters\": [ { \"id\": \"a\", \"type\": \"Enum\", \"options\": [\"x\"], \"default\": \"y\" } ] }").Contains("default"), "a default that is not an option is a data error");
         Check(Error("{ \"parameters\": [ { \"id\": \"a\", \"type\": \"Float\", \"min\": 5, \"max\": 1 } ] }").Contains("min"), "min greater than max is a data error");
@@ -174,7 +175,9 @@ public sealed partial class SelfTest
         Check(Error("{ \"parameters\": [ { \"id\": \"ad_mode\", \"type\": \"Bool\" } ], \"include\": [\"ControlAxes\"] }").Contains("declared twice"), "a clash between an own parameter and the preset is a data error");
         if (BlockCatalog.Instance.TryGetBySlug("pilot_seat", out var realSeat) && Construction.ParametersOf(realSeat) is { } realSchema)
         {
-            Check(realSchema.Parameters.Select(p => p.Id + "=" + p.Default).SequenceEqual(axes.Parameters.Select(p => p.Id + "=" + p.Default)), "the real pilot_seat gets its axis settings from the shared preset");
+            // Сиденье может иметь и собственные параметры (высота глаз, направление) - главное, что все параметры общего набора у него есть с теми же умолчаниями.
+            var realIds = realSchema.Parameters.Select(p => p.Id + "=" + p.Default).ToHashSet();
+            Check(axes.Parameters.All(p => realIds.Contains(p.Id + "=" + p.Default)), "the real pilot_seat gets its axis settings from the shared preset (it may add its own parameters next to them)");
         }
 
         // ParameterSet: умолчание, изменённое значение, битое сохранённое значение, параметр вне схемы.

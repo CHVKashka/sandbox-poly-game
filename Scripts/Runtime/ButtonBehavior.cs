@@ -36,7 +36,8 @@ public sealed record ButtonSettings(ButtonMode Mode, string GlowNode, Color Glow
         if (glowNode.Length == 0) glowNode = DefaultGlowNode;
 
         var glowColor = DefaultGlowColor;
-        string colorText = definition.GetParam("glowColor", "").Trim();
+        // Настраиваемый параметр экземпляра (инструмент «Parameters»), если он объявлен в схеме блока; иначе - константа типа блока из "params".
+        string colorText = parameters.Has("glowColor") ? parameters.GetString("glowColor").Trim() : definition.GetParam("glowColor", "").Trim();
         if (colorText.Length > 0)
         {
             if (Color.HtmlIsValid(colorText)) glowColor = Color.FromHtml(colorText);
@@ -65,6 +66,9 @@ public sealed record ButtonSettings(ButtonMode Mode, string GlowNode, Color Glow
 public sealed class ButtonState : BlockState
 {
     public ButtonMode Mode { get; init; }
+
+    /// <summary>Цвет свечения крышки (параметр <c>glowColor</c> экземпляра или константа типа блока).</summary>
+    public Color GlowColor { get; init; } = ButtonSettings.DefaultGlowColor;
 
     /// <summary>Id выходной ноды, значение которой отдаёт кнопка; null — в блоке не объявлена
     /// выходная Boolean-нода (тогда кнопка работает, но ничего наружу не отдаёт).</summary>
@@ -109,7 +113,8 @@ public sealed class ButtonBehavior : BlockBehavior<ButtonState>
         var output = definition.Nodes.FirstOrDefault(p => p.Direction == PortDirection.Out && p.Type == NodeType.Boolean);
         if (output == null) GD.PushWarning("[button] block declares no Out/Boolean node - the button will output nothing");
 
-        return new ButtonState { Mode = ButtonSettings.From(definition, parameters).Mode, OutputNodeId = output?.Id };
+        var settings = ButtonSettings.From(definition, parameters);
+        return new ButtonState { Mode = settings.Mode, GlowColor = settings.GlowColor, OutputNodeId = output?.Id };
     }
 
     protected override void Interact(ButtonState state, BlockInteraction interaction)

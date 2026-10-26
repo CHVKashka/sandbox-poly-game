@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Block id="super_weight_block" name="Super weight block">
+  <Color>#ffffff</Color>
+  <Component type="BaseComponent">{ "mass": 100, "durability": 500, "damageResistance": 5 }</Component>
+  <Component type="FunctionalBlock">{
+    "scene": "res://meshes/super_weight_block.glb",
+    "scale": [0.125, 0.125, 0.125],
+    "anchor": [0, 0, 0],
+    "footprint": [1, 1, 1],
+    "footprintMin": [0, 0, 0],
+    "collision": [
+      [0, 0, 0]
+    ],
+    "ports": []
+  }</Component>
+</Block>

@@ -25,6 +25,10 @@ public partial class VehicleBody : RigidBody3D
     /// <summary>Номер тела в сетевой игре (одинаковый у сервера и всех клиентов, см. <see cref="Core.NetHub"/>); 0 — одиночная игра.</summary>
     public int NetId { get; set; }
 
+    /// <summary>Сериализованная постройка, из которой собрано тело (со всеми правками на момент спавна, в том числе несохранёнными, и с метаданными -
+   /// имя/описание/время создания файла). По <c>R</c> редактор открывается именно с ней (см. <see cref="Core.EditorDraft.FromSpawnJson"/>). Есть и у копий-наблюдателей.</summary>
+    public string SourceJson { get; set; } = "";
+
     /// <summary>Имя верстака, с которого заспавнили (строкой: в сетевой игре у каждого пира свой <see cref="GameWorld"/> и свои узлы верстаков).</summary>
     public string SourceWorkbenchName { get; set; } = "";
 
@@ -131,7 +135,7 @@ public partial class VehicleBody : RigidBody3D
         var block = definition.GetComponent<Blocks.FunctionalBlockComponent>();
         if (block == null || block.Behavior != PilotSeatBehavior.Key) return null;
 
-        var (eyeHeight, forwardFace) = PilotSeatBehavior.ReadSeatSettings(block);
+        var (eyeHeight, forwardFace) = PilotSeatBehavior.ReadSeatSettings(block, new ParameterSet(Core.Construction.ParametersOf(definition), instance.Parameters));
         var seatNode = block.Nodes.FirstOrDefault(n => n.Id == PilotSeatBehavior.OccupiedNodeId);
         var cellCenter = seatNode != null
             ? Editor.FunctionalBlockGeometry.ComputeNodeAnchor(seatNode.Cell, block.FootprintMin, block.Footprint, Core.BuildSpace.CellSize)

@@ -29,7 +29,7 @@ public static class VehicleSpawner
     /// верстак, с которого спавнили (см. <see cref="VehicleBody.SourceWorkbench"/>, нужен для возврата по `R`).</summary>
     public static VehicleBody Spawn(Node3D parent, string constructionJson, Vector3 spawnPosition, Workbench? sourceWorkbench = null)
     {
-        var body = new VehicleBody { Name = "Vehicle", SourceWorkbench = sourceWorkbench };
+        var body = new VehicleBody { Name = "Vehicle", SourceWorkbench = sourceWorkbench, SourceJson = constructionJson };
         parent.AddChild(body);
 
         var voxelWorld = new VoxelWorld();

@@ -99,6 +99,24 @@ public static class ConstructionStorage
         return Error.Ok;
     }
 
+    /// <summary>Подпись под названием в списках построек: «created … modified …» (локальное время).</summary>
+    public static string DescribeDates(SavedConstruction entry) =>
+        $"created {FormatUtc(entry.CreatedUtc)}   modified {FormatUtc(entry.ModifiedUtc)}";
+
+    private static string FormatUtc(string iso) =>
+        DateTime.TryParse(iso, null, System.Globalization.DateTimeStyles.RoundtripKind, out var parsed)
+            ? parsed.ToLocalTime().ToString("yyyy-MM-dd HH:mm")
+            : "unknown";
+
+    /// <summary>Картинка-превью записи списка (PNG рядом с файлом, <see cref="PreviewPathFor"/>); null — превью нет или оно не читается.</summary>
+    public static Texture2D? LoadPreview(SavedConstruction entry)
+    {
+        if (entry.PreviewPath == null) return null;
+
+        var image = new Image();
+        return image.Load(entry.PreviewPath) == Error.Ok ? ImageTexture.CreateFromImage(image) : null;
+    }
+
     /// <summary>
     /// Список всех сохранённых построек в каталоге, отсортированный по дате изменения (сначала новые) — только
     /// метаданные (см. <see cref="ConstructionIO.ReadMetadata"/>), без разбора/размещения блоков: дёшево для окна

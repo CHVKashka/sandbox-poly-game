@@ -80,6 +80,10 @@ public partial class Player : CharacterBody3D
     /// <summary>Сколько физических тиков после <see cref="Stand"/> капсула остаётся выключенной (см. там же).</summary>
     public const int StandSettleTicks = 2;
 
+    /// <summary>Слой физики мира (земля, постройки, свой игрок) и слой реплик чужих игроков (см. <see cref="_EnterTree"/>).</summary>
+    public const uint WorldCollisionLayer = 1;
+    public const uint ReplicaCollisionLayer = 2;
+
     private int _standSettle;
 
     private const float ProbeRadius = 0.37f;
@@ -288,6 +292,21 @@ public partial class Player : CharacterBody3D
         // (IsMultiplayerAuthority). В одиночной игре узел без явного SetMultiplayerAuthority по умолчанию имеет
         // авторитет 1, и локальный peer id тоже 1 - проверка всегда проходит, поведение не меняется.
         body.Visible = !IsMultiplayerAuthority();
+
+        // Реплика ЧУЖОГО игрока (позицию ей телепортом ставит синхронизатор): реальное тело этого игрока считается на ЕГО машине, и столкновения решаются там. Капсула реплики в физике этой
+        // машины только вредила: клиент садится на сиденье (реплика оказывается внутри динамической постройки сервера) или встаёт и идёт вплотную - физика выбрасывала постройку с огромной скоростью
+        // (у хоста от этого защищала отключаемая капсула своего игрока, до реплик клиентов это не доходило). Поэтому реплика на отдельном слое и ничего не сканирует; а свой игрок, как и раньше,
+        // сталкивается с миром (слой 1) и ещё с репликами других игроков (слой 2), чтобы не ходить сквозь них.
+        if (IsMultiplayerAuthority())
+        {
+            CollisionMask = WorldCollisionLayer | ReplicaCollisionLayer;
+        }
+        else
+        {
+            CollisionLayer = ReplicaCollisionLayer;
+            CollisionMask = 0;
+        }
+
         if (!IsMultiplayerAuthority()) return;
 
         _camera.Current = true;

@@ -1,4 +1,5 @@
 using System;
+using Godot;
 using SandboxPolyGame.Blocks;
 using SandboxPolyGame.Core;
 
@@ -13,7 +14,7 @@ namespace SandboxPolyGame.Runtime;
 /// Диск не может подойти к шине ближе <see cref="MinRimGapCells"/> клетки (шина всегда остаётся видимой и имеет «толщину»): <c>rimRadius</c> зажимается до
 /// <c>tireRadius − 0.25</c>.</item>
 /// <item><b>Константы типа блока</b> (<c>"params"</c> в FunctionalBlock): имена узлов модели <c>steerNode</c> / <c>spinNode</c> / <c>rimNode</c> / <c>tireNode</c> (умолчание Steer / Spin /
-/// Rim / Tire), id входных нод <c>steerSignal</c> / <c>brakeSignal</c> / <c>fullBrakeSignal</c> (умолчание steer / brake / full_brake), <c>maxSteerDegrees</c> (60),
+/// Rim / Tire), id входных нод <c>steerSignal</c> / <c>brakeSignal</c> / <c>fullBrakeSignal</c> (умолчание Steering / Variable brake / Brake — как в blocks/wheel_3x3.xml), <c>maxSteerDegrees</c> (60),
 /// <c>steerRateDegrees</c> — скорость поворота колеса, °/с (180), радиусы, при которых модель нарисована без растяжения: <c>modelTireRadius</c> (1.5) и <c>modelRimRadius</c> (1.0).</item>
 /// </list>
 /// </summary>
@@ -29,6 +30,11 @@ public sealed record WheelSettings(
     /// <summary>Минимальный зазор между краем диска и шиной, клеток: <c>rimRadius ≤ tireRadius − MinRimGapCells</c>.</summary>
     public const double MinRimGapCells = 0.25;
 
+    /// <summary>Id входных нод по умолчанию (как в blocks/wheel_3x3.xml): руль (Number), тормоз 0..1 (Number), полный тормоз (Boolean).</summary>
+    public const string DefaultSteerSignal = "Steering";
+    public const string DefaultBrakeSignal = "Variable brake";
+    public const string DefaultFullBrakeSignal = "Brake";
+
     public const double DefaultMaxSteerDegrees = 60;
     public const double DefaultSteerRateDegrees = 180;
 
@@ -41,9 +47,9 @@ public sealed record WheelSettings(
 
         return new WheelSettings(
             tire, rim, parameters.GetBool("reverse"),
-            Math.Max(0, ReadNumber(definition, "maxSteerDegrees", DefaultMaxSteerDegrees)) * Math.PI / 180,
-            Math.Max(1, ReadNumber(definition, "steerRateDegrees", DefaultSteerRateDegrees)) * Math.PI / 180,
-            Name(definition, "steerSignal", "steer"), Name(definition, "brakeSignal", "brake"), Name(definition, "fullBrakeSignal", "full_brake"),
+            Math.Max(0, ReadNumber(definition, parameters, "maxSteerDegrees", DefaultMaxSteerDegrees)) * Math.PI / 180,
+            Math.Max(1, ReadNumber(definition, parameters, "steerRateDegrees", DefaultSteerRateDegrees)) * Math.PI / 180,
+            Name(definition, "steerSignal", DefaultSteerSignal), Name(definition, "brakeSignal", DefaultBrakeSignal), Name(definition, "fullBrakeSignal", DefaultFullBrakeSignal),
             Name(definition, "steerNode", "Steer"), Name(definition, "spinNode", "Spin"), Name(definition, "rimNode", "Rim"), Name(definition, "tireNode", "Tire"),
             Math.Max(0.1, ReadNumber(definition, "modelTireRadius", DefaultTireRadiusCells)), Math.Max(0.05, ReadNumber(definition, "modelRimRadius", DefaultRimRadiusCells)));
     }
@@ -53,6 +59,10 @@ public sealed record WheelSettings(
         string value = definition.GetParam(key, fallback).Trim();
         return value.Length == 0 ? fallback : value;
     }
+
+    /// <summary>Число: параметр экземпляра (инструмент «Parameters»), если он объявлен в схеме блока; иначе константа типа блока из <c>"params"</c>; иначе умолчание.</summary>
+    private static double ReadNumber(FunctionalBlockComponent definition, ParameterSet parameters, string key, double fallback) =>
+        parameters.Has(key) ? parameters.GetFloat(key, fallback) : ReadNumber(definition, key, fallback);
 
     private static double ReadNumber(FunctionalBlockComponent definition, string key, double fallback) =>
         double.TryParse(definition.GetParam(key, ""), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out double value) && double.IsFinite(value) ? value : fallback;
@@ -84,6 +94,12 @@ public sealed class WheelState : BlockState
     public double ContactRadius => TireBroken ? RimRadius : TireRadius;
 
     // ---- входы с проводов
+    /// <summary>Отражение по Z (клавиша O при установке): направление качения обращено — знак оборотов сети меняется (вместе с параметром <c>reverse</c> исключающее ИЛИ). Константа экземпляра, не реплицируется.</summary>
+    public bool MirrorForward { get; set; }
+
+    /// <summary>Отражение по X (клавиша U при установке): сторона руля обращена — сигнал руля меняет знак. Константа экземпляра, не реплицируется. Отражение по Y колесо игнорирует (лучи идут вдоль локальной −Y).</summary>
+    public bool MirrorSteer { get; set; }
+
     /// <summary>Сигнал руля, -1..1 (знак — сторона).</summary>
     public double SteerInput { get; set; }
 
@@ -146,15 +162,23 @@ public sealed class WheelBehavior : BlockBehavior<WheelState>
 
     protected override void SetInput(WheelState state, string nodeId, NodeValue value)
     {
-        if (nodeId == state.Settings.SteerSignal) state.SteerInput = Math.Clamp(value.Number, -1.0, 1.0);
+        if (nodeId == state.Settings.SteerSignal) state.SteerInput = Math.Clamp(value.Number, -1.0, 1.0) * (state.MirrorSteer ? -1 : 1);
         else if (nodeId == state.Settings.BrakeSignal) state.BrakeInput = Math.Clamp(value.Number, 0.0, 1.0);
         else if (nodeId == state.Settings.FullBrakeSignal) state.FullBrake = value.IsOn;
+    }
+
+    protected override bool SupportsMirror => true;
+
+    protected override void SetMirror(WheelState state, Vector3I mirror)
+    {
+        state.MirrorForward = mirror.Z != 0;
+        state.MirrorSteer = mirror.X != 0;
     }
 
     protected override void SetTorqueNetwork(WheelState state, bool connected, double rpm)
     {
         state.InNetwork = connected;
-        state.NetworkOmega = connected ? rpm * (2 * Math.PI / 60) * (state.Settings.Reverse ? -1 : 1) : 0;
+        state.NetworkOmega = connected ? rpm * (2 * Math.PI / 60) * (state.Settings.Reverse ^ state.MirrorForward ? -1 : 1) : 0;
     }
 
     protected override void Tick(WheelState state, double delta)

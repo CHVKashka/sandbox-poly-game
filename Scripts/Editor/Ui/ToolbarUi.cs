@@ -14,7 +14,7 @@ namespace SandboxPolyGame.Editor.Ui;
 /// <see cref="EditorState.PendingSize"/> — а не уже поставленные блоки). У каждой кнопки-переключателя есть
 /// кружок-индикатор в углу, показывающий, что она включена.
 /// </summary>
-internal sealed class ToolbarUi
+public sealed class ToolbarUi
 {
     private const string CustomPalettePath = "user://custom_palette.cfg";
     private static readonly string[] AxisNames = { "X", "Y", "Z" };
@@ -41,6 +41,8 @@ internal sealed class ToolbarUi
     private readonly Button _layerLogic;
     private readonly Panel _wireDot;
     private readonly Panel _parametersDot;
+    private readonly Button _tooltip;
+    private readonly Panel _tooltipDot;
     private readonly Panel _resizeDot;
     private readonly Panel _wireframeDot;
     private readonly Panel _bordersDot;
@@ -163,6 +165,12 @@ internal sealed class ToolbarUi
         _parametersDot = UiStyle.AddActiveIndicator(_parameters);
         _parameters.Toggled += on => _state.Tool = on ? ToolMode.Parameters : ToolMode.None;
         column.AddChild(_parameters);
+
+        _tooltip = UiStyle.MakeButton("Tooltip", new Vector2(168, 38), toggle: true);
+        _tooltip.TooltipText = "T: show a tooltip with the settings of the functional block under the cursor (works with any tool)";
+        _tooltipDot = UiStyle.AddActiveIndicator(_tooltip);
+        _tooltip.Toggled += on => _state.TooltipEnabled = on;
+        column.AddChild(_tooltip);
 
         _resizePanel = BuildResizePanel(out _resizeFields[0], out _resizeFields[1], out _resizeFields[2]);
         _resizePanel.Visible = false;
@@ -403,6 +411,9 @@ internal sealed class ToolbarUi
     /// <summary>Кнопка-вкладка слоя логики (для самотестов).</summary>
     public Button WireLayerTab(WireLayer layer) => layer == WireLayer.Electricity ? _layerElectricity : _layerLogic;
 
+    /// <summary>Кнопка «Tooltip» (для самотестов).</summary>
+    public Button TooltipButton => _tooltip;
+
     public void Refresh()
     {
         _paint.SetPressedNoSignal(_state.Tool == ToolMode.Paint);
@@ -421,6 +432,8 @@ internal sealed class ToolbarUi
         _layerElectricity.SetPressedNoSignal(_state.WireLayer == WireLayer.Electricity);
         _layerLogic.SetPressedNoSignal(_state.WireLayer == WireLayer.Logic);
         _parametersDot.Visible = _state.Tool == ToolMode.Parameters;
+        _tooltip.SetPressedNoSignal(_state.TooltipEnabled);
+        _tooltipDot.Visible = _state.TooltipEnabled;
         _resizeDot.Visible = _state.ResizePanelOpen;
 
         if (_colorPicker.Color != _state.PaintColor) _colorPicker.Color = _state.PaintColor;

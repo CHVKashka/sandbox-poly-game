@@ -4,6 +4,7 @@
   <Component type="BaseComponent">{ "mass": 10, "durability": 100, "damageResistance": 0.1 }</Component>
   <Component type="Parameters">{
     "parameters": [
+      { "id": "capacity", "label": "Capacity", "type": "Float", "min": 0, "default": 1000, "hint": "charge units the battery holds" },
       { "id": "levelOutput", "label": "Level output", "type": "Enum", "options": ["absolute", "fraction"], "default": "absolute", "hint": "absolute: charge in units (0..capacity); fraction: 0..1" },
       { "id": "initialCharge", "label": "Initial charge", "type": "Float", "min": 0, "max": 1, "step": 0.05, "default": 1, "hint": "share of the capacity when the vehicle spawns" },
       { "id": "chargeRate", "label": "Charge rate", "type": "Float", "min": 0, "max": 1000, "step": 1, "default": 20, "hint": "max units per second accepted on the electricity input" }

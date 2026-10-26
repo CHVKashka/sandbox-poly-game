@@ -28,9 +28,22 @@ public partial class FunctionalBlockView : Node3D
     private readonly Dictionary<int, FunctionalBlockComponent> _definitions = new();
     private readonly Dictionary<int, ButtonVisual> _buttonVisuals = new();
     private readonly Dictionary<int, WheelVisual> _wheelVisuals = new();
+    private readonly Dictionary<int, List<Node3D>> _decor = new();
     private readonly Dictionary<int, Color> _tints = new();
     private readonly Dictionary<Color, StandardMaterial3D> _tintMaterials = new();
     private float _defaultOpacity = 1f;
+
+    /// <summary>
+    /// Показывать декоративные меши-указатели блоков (<see cref="DecorMesh"/>, режим <see cref="DecorShowWhen.Always"/>) — только в редакторе построек. В игре (заспавненная постройка)
+    /// выключено, и указателей там нет вовсе.
+    /// </summary>
+    public bool ShowDecor { get; set; }
+
+    /// <summary>Сколько узлов-указателей сейчас у экземпляра (для самотестов).</summary>
+    /// <summary>Положение указателя экземпляра (для самотестов).</summary>
+    public Transform3D DecorTransform(int instanceId, int index) => _decor[instanceId][index].Transform;
+
+    public int DecorCount(int instanceId) => _decor.TryGetValue(instanceId, out var nodes) ? nodes.Count : 0;
 
     /// <summary>Рантайм функциональных блоков этой постройки; null — анимации нет (редактор, иконки).</summary>
     public FunctionalBlockRuntime? Runtime { get; set; }
@@ -108,7 +121,9 @@ public partial class FunctionalBlockView : Node3D
         {
             if (!BlockCatalog.Instance.TryGetBySlug(instance.BlockSlug, out var definition)) continue;
             var functional = definition.GetComponent<FunctionalBlockComponent>();
-            if (functional == null || string.IsNullOrEmpty(functional.ScenePath)) continue;
+            if (functional == null) continue;
+            SyncDecor(instance, functional, alive);
+            if (string.IsNullOrEmpty(functional.ScenePath)) continue;
 
             var (scene, aabb) = FunctionalBlockGeometry.GetOrLoadScene(functional.ScenePath);
             if (scene == null) continue;
@@ -127,9 +142,16 @@ public partial class FunctionalBlockView : Node3D
             // Модель стоит в рамке блока по явному масштабу и якорю (BlockModelLayout), а поворот и положение даёт рамка
             // корневой клетки - блок крутится вокруг неё (см. BlockFootprint), а не вокруг центра своего хитбокса.
             var frame = FunctionalBlockGeometry.InstanceFrame(instance.Origin, functional.FootprintMin, functional.Footprint, instance.RotationSteps);
-            var model = BlockModelLayout.ModelTransform(aabb, functional.ModelScale, functional.Anchor);
+            var model = BlockModelLayout.ModelTransform(aabb, functional.ModelScale, functional.Anchor, functional.ModelRotationBasis);
             node.Transform = frame * model;
             if (created) ApplyDisplay(instance.InstanceId);
+        }
+
+        foreach (var id in new List<int>(_decor.Keys))
+        {
+            if (construction.GetInstance(id) != null) continue;
+            foreach (var node in _decor[id]) node.QueueFree();
+            _decor.Remove(id);
         }
 
         foreach (var id in new List<int>(_views.Keys))
@@ -141,6 +163,40 @@ public partial class FunctionalBlockView : Node3D
             _buttonVisuals.Remove(id);
             _wheelVisuals.Remove(id);
             _tints.Remove(id);
+        }
+    }
+
+    /// <summary>Указатели экземпляра пересоздаются при каждой синхронизации (их единицы на блок): рамка экземпляра · положение указателя в рамке блока.</summary>
+    private void SyncDecor(BlockInstance instance, FunctionalBlockComponent functional, HashSet<int> alive)
+    {
+        if (_decor.TryGetValue(instance.InstanceId, out var old))
+        {
+            foreach (var node in old) node.QueueFree();
+            _decor.Remove(instance.InstanceId);
+        }
+
+        if (!ShowDecor) return;
+        var decorAlive = false;
+        var frame = FunctionalBlockGeometry.InstanceFrame(instance.Origin, functional.FootprintMin, functional.Footprint, instance.RotationSteps);
+        var mirror = FunctionalBlockGeometry.DecorMirror(functional, instance.Mirror);
+        var nodes = new List<Node3D>();
+        foreach (var decor in functional.Decor)
+        {
+            if (decor.ShowWhen != DecorShowWhen.Always) continue;
+            var (scene, _) = FunctionalBlockGeometry.GetOrLoadScene(decor.Scene);
+            if (scene == null) continue;
+
+            var node = scene.Instantiate<Node3D>();
+            AddChild(node);
+            node.Transform = frame * mirror * decor.LocalTransform;
+            nodes.Add(node);
+            decorAlive = true;
+        }
+
+        if (decorAlive)
+        {
+            _decor[instance.InstanceId] = nodes;
+            alive.Add(instance.InstanceId);
         }
     }
 
@@ -174,9 +230,11 @@ public partial class FunctionalBlockView : Node3D
 
             if (!_buttonVisuals.TryGetValue(id, out var visual))
             {
-                visual = new ButtonVisual(node, ButtonSettings.From(definition));
+                visual = new ButtonVisual(node, ButtonSettings.From(definition) with { Mode = state.Mode, GlowColor = state.GlowColor });
                 _buttonVisuals[id] = visual;
             }
+
+            visual.GlowColor = state.GlowColor; // состояние пересоздаётся при смене параметров экземпляра - цвет мог поменяться
 
             visual.Update(delta, state.Active, state.Powered);
         }

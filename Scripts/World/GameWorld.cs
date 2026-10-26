@@ -52,6 +52,7 @@ public partial class GameWorld : Node3D
 	private JoinWaitingUi _joinWaitingUi = null!;
 	private PauseMenuUi _pauseMenu = null!;
 	private Label _prompt = null!;
+	private BlockTooltipUi _nodeTooltip = null!;
 	private Label _debugLabel = null!;
 
 	// Какой верстак открыл текущее меню - нужен при Create/Open/Join, чтобы знать, в чью зону спавна вернётся
@@ -286,8 +287,11 @@ public partial class GameWorld : Node3D
 		_debugLabel.HorizontalAlignment = HorizontalAlignment.Right;
 		_uiRoot.AddChild(_debugLabel);
 
+		_nodeTooltip = new BlockTooltipUi(_uiRoot); // значения нод блока под прицелом (только в игровом мире, параметры показывает редактор)
+
 		_workbenchMenu = new WorkbenchMenuUi(_uiRoot);
 		_workbenchMenu.CreateVehicleRequested += () => RequestEnterWorkbench(null);
+		_workbenchMenu.ContinueEditingRequested += () => RequestEnterWorkbench(null, resumeDraft: true);
 		_workbenchMenu.OpenConstructionRequested += path => RequestEnterWorkbench(path);
 		_workbenchMenu.SpawnConstructionRequested += SpawnFromWorkbenchMenu;
 		_workbenchMenu.JoinRequested += RequestJoinActiveWorkbench;
@@ -338,15 +342,27 @@ public partial class GameWorld : Node3D
 	/// просит сервер открыть сессию (<see cref="NetHub.RequestOpenSession"/>) и ждёт
 	/// <see cref="NetHub.SessionReadyForMe"/> (см. <see cref="OnSessionReadyForMe"/>) — переход в редактор случится
 	/// уже оттуда.</summary>
-	private void RequestEnterWorkbench(string? constructionPath)
+	private void RequestEnterWorkbench(string? constructionPath, bool resumeDraft = false)
 	{
 		if (_activeWorkbench == null) return;
 
+		_workbenchMenu.Close();
+		EnterEditorAt(_activeWorkbench.Name, constructionPath, resumeDraft);
+	}
+
+	/// <summary>
+	/// Общий вход в редактор через верстак <paramref name="workbenchName"/>: пустая постройка (оба параметра по умолчанию), файл (<paramref name="constructionPath"/>)
+	/// или черновик (<paramref name="resumeDraft"/> - <see cref="EditorHandoff.Draft"/>: Continue editing и R по постройке). Сетевая игра сначала просит сервер
+	/// открыть сессию (с JSON черновика - на диске его правок нет) и входит в редактор по ответу, одиночная - сразу.
+	/// </summary>
+	private void EnterEditorAt(string workbenchName, string? constructionPath, bool resumeDraft)
+	{
+		EditorHandoff.ResumeDraft = resumeDraft && EditorHandoff.Draft != null;
+
 		if (NetHub.Instance.IsNetworked)
 		{
-			_pendingSessionWorkbenchName = _activeWorkbench.Name;
-			NetHub.Instance.RequestOpenSession(_activeWorkbench.Name, constructionPath);
-			_workbenchMenu.Close();
+			_pendingSessionWorkbenchName = workbenchName;
+			NetHub.Instance.RequestOpenSession(workbenchName, constructionPath, EditorHandoff.ResumeDraft ? EditorHandoff.Draft!.Json : null);
 			Input.MouseMode = Input.MouseModeEnum.Captured;
 		}
 		else
@@ -354,7 +370,7 @@ public partial class GameWorld : Node3D
 			EditorHandoff.PendingConstructionPath = constructionPath;
 			EditorHandoff.NetworkedWorkbenchName = null;
 			EditorHandoff.IsSessionAdmin = false;
-			EnterEditorFromWorkbench();
+			EnterEditorFromWorkbench(workbenchName);
 		}
 	}
 
@@ -439,6 +455,7 @@ public partial class GameWorld : Node3D
 
 		_joinWaitingUi.Hide();
 		EditorHandoff.PendingConstructionPath = null;
+		EditorHandoff.ResumeDraft = false; // чужая постройка: свой черновик к ней не относится
 		EditorHandoff.NetworkedWorkbenchName = sessionKey;
 		EditorHandoff.PendingNetworkedConstructionJson = constructionJson;
 		EditorHandoff.IsSessionAdmin = false;
@@ -571,9 +588,10 @@ public partial class GameWorld : Node3D
 				GetViewport().SetInputAsHandled();
 				break;
 
-			// Вернуть постройку (и себя) к верстаку, с которого её заспавнили — по наведению на саму постройку.
+			// Вернуть постройку в редактор — по наведению на саму постройку: тело убирается, редактор открывается с ней (со всеми
+			// правками, сделанными до спавна, в том числе несохранёнными).
 			case Key.R when !AnyModalOpen && RaycastFromCamera(InteractDistance) is VehicleBody vehicle:
-				RecallVehicle(vehicle);
+				EditVehicleInEditor(vehicle);
 				GetViewport().SetInputAsHandled();
 				break;
 
@@ -616,8 +634,11 @@ public partial class GameWorld : Node3D
 		if (AnyModalOpen)
 		{
 			_prompt.Text = "";
+			_nodeTooltip.Hide();
 			return;
 		}
+
+		UpdateNodeTooltip();
 
 		string blockPrompt = BlockPrompt();
 		if (IsSeated)
@@ -629,7 +650,7 @@ public partial class GameWorld : Node3D
 		_prompt.Text = RaycastFromCamera(InteractDistance) switch
 		{
 			Workbench => "Press E to open the workbench",
-			VehicleBody => blockPrompt.Length > 0 ? blockPrompt + "   (R - recall to the workbench)" : "Press R to recall it to its workbench",
+			VehicleBody => blockPrompt.Length > 0 ? blockPrompt + "   (R - edit in the workbench)" : "Press R to return it to the editor",
 			_ => blockPrompt,
 		};
 	}
@@ -656,11 +677,20 @@ public partial class GameWorld : Node3D
 		vehicle.SetDebugButtonsPressed(_debugButtonsPressed);
 	}
 
-	private void RecallVehicle(VehicleBody vehicle)
+	/// <summary>
+	/// <c>R</c> по заспавненной постройке: убирает тело (у всех, если игра сетевая) и открывает редактор с этой постройкой. В редактор уходит тот самый JSON,
+	/// из которого тело собрано (<see cref="VehicleBody.SourceJson"/>), - то есть со всеми правками, сделанными до спавна и не сохранёнными на диск; файл
+	/// сохранения (для Overwrite) находится по времени создания из метаданных JSON. Игрок возвращается в мир у того верстака, с которого постройку заспавнили, а
+	/// повторный Spawn ставит её в зону именно этого верстака.
+	/// </summary>
+	private void EditVehicleInEditor(VehicleBody vehicle)
 	{
+		var workbench = vehicle.SourceWorkbench ?? _workbenches.Find(w => w.Name == vehicle.SourceWorkbenchName) ?? _workbenches[0];
+
 		if (_seatVehicle == vehicle) Stand();
 		if (_pressedButtonVehicle == vehicle) ReleasePressedButton();
-		var workbench = vehicle.SourceWorkbench ?? _workbenches.Find(w => w.Name == vehicle.SourceWorkbenchName);
+		EditorHandoff.Draft = EditorDraft.FromSpawnJson(vehicle.SourceJson);
+
 		if (NetHub.Instance.IsNetworked && vehicle.NetId != 0)
 		{
 			NetHub.Instance.RequestRecallVehicle(vehicle.NetId); // сервер уберёт тело у всех
@@ -671,18 +701,29 @@ public partial class GameWorld : Node3D
 			vehicle.QueueFree();
 		}
 
-		// Место у верстака хоть сколько-то произвольное (фиксированный отступ, не разворот лицом к верстаку) -
-		// самого верстака при возврате достаточно, точная поза не так важна.
-		if (workbench != null) _player.SetPose(workbench.GlobalPosition + new Vector3(0f, 1f, 2f), _player.Yaw);
+		// Место у верстака хоть сколько-то произвольное (фиксированный отступ, не разворот лицом к верстаку) - при возврате из редактора
+		// игрок окажется здесь.
+		_player.SetPose(workbench.GlobalPosition + new Vector3(0f, 1f, 2f), _player.Yaw);
+		EnterEditorAt(workbench.Name, null, resumeDraft: true);
 	}
 
-	private void EnterEditorFromWorkbench()
+	private void EnterEditorFromWorkbench(string workbenchName)
 	{
-		EditorHandoff.PendingSpawnWorkbenchName = _activeWorkbench?.Name;
+		EditorHandoff.PendingSpawnWorkbenchName = workbenchName;
 		EditorHandoff.PendingPlayerPosition = _player.GlobalPosition;
 		EditorHandoff.PendingPlayerYaw = _player.Yaw;
 		EnterEditor();
 	}
+
+	/// <summary>Для самотестов: открыть меню верстака так же, как E по нему (запоминает верстак, через который потом войдём в редактор).</summary>
+	public void OpenWorkbenchMenuForTesting(Workbench workbench)
+	{
+		_activeWorkbench = workbench;
+		_workbenchMenu.Open(workbench.Name);
+	}
+
+	/// <summary>Для самотестов: сколько раз мир собирался уйти в редактор. Тестовый экземпляр мира (не текущая сцена) сцену не меняет - смена сцены убила бы сам тест.</summary>
+	public int EditorEntryCount { get; private set; }
 
 	private void EnterEditor()
 	{
@@ -707,6 +748,11 @@ public partial class GameWorld : Node3D
 	/// заканчивает входить в дерево (ровно наш случай — вызывается прямо из <see cref="_Ready"/> для дев-харнесса) —
 	/// откладываем через <see cref="Callable"/> на конец кадра, когда дерево уже точно не занято.
 	/// </summary>
-	private void GoToBuildEditor() =>
+	private void GoToBuildEditor()
+	{
+		EditorEntryCount++;
+		if (GetTree().CurrentScene != this) return; // тестовый экземпляр внутри другой сцены - см. EditorEntryCount
+
 		Callable.From(() => GetTree().ChangeSceneToFile("res://Scenes/BuildEditor.tscn")).CallDeferred();
+	}
 }

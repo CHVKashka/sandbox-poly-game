@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
 using System.Text.Json;
+using Godot;
 
 namespace SandboxPolyGame.Blocks;
 
@@ -20,6 +21,28 @@ public enum ParameterType
 
     /// <summary>Один вариант из <see cref="ParameterDefinition.Options"/>.</summary>
     Enum,
+
+    /// <summary>Цвет (<c>#rrggbb</c>, без прозрачности).</summary>
+    Color,
+
+    /// <summary>Математическое выражение (текст до <see cref="ParameterDefinition.MaxExpressionLength"/> знаков; разбор — <c>Runtime.MathExpression</c>): поле ввода и справочник под ним.</summary>
+    Expression,
+}
+
+/// <summary>
+/// Какой виджет рисует панель «Parameters» для параметра (<see cref="ParameterDefinition.Widget"/>) — одно правило для всех блоков:
+/// число (Float/Int) с ЯВНО заданными обоими пределами — ползунок; число без пределов (или только с одним) — числовое поле; флаг и перечисление
+/// (несколько определённых вариантов) — выпадающий список; цвет — выбор цвета.
+/// </summary>
+public enum ParameterWidget
+{
+    Slider,
+    NumberBox,
+    Dropdown,
+    ColorPicker,
+
+    /// <summary>Поле ввода выражения + вложенные списки справки (operators / constants / trigonometry / addon / conversions) и строка ошибки.</summary>
+    ExpressionBox,
 }
 
 /// <summary>
@@ -43,6 +66,18 @@ public sealed class ParameterDefinition
 
     /// <summary>Подсказка под полем в панели (необязательна).</summary>
     public string Hint { get; init; } = "";
+
+    /// <summary>Виджет панели «Parameters»: см. <see cref="ParameterWidget"/>. Ползунок - только когда заданы ОБА предела и диапазон не вырожден.</summary>
+    public ParameterWidget Widget => Type switch
+    {
+        ParameterType.Bool or ParameterType.Enum => ParameterWidget.Dropdown,
+        ParameterType.Color => ParameterWidget.ColorPicker,
+        ParameterType.Expression => ParameterWidget.ExpressionBox,
+        _ => double.IsFinite(Min) && double.IsFinite(Max) && Max > Min ? ParameterWidget.Slider : ParameterWidget.NumberBox,
+    };
+
+    /// <summary>Наибольшая длина текста параметра типа Expression.</summary>
+    public const int MaxExpressionLength = 200;
 
     public double Min { get; init; } = double.NegativeInfinity;
     public double Max { get; init; } = double.PositiveInfinity;
@@ -86,6 +121,21 @@ public sealed class ParameterDefinition
                     case "false": case "0": case "no": case "off": normalized = "false"; return true;
                     default: return false;
                 }
+            }
+
+            case ParameterType.Color:
+            {
+                if (!Godot.Color.HtmlIsValid(text)) return false;
+                normalized = "#" + Godot.Color.FromHtml(text).ToHtml(false).ToLowerInvariant();
+                return true;
+            }
+
+            case ParameterType.Expression:
+            {
+                // Любой текст разумной длины: неверное выражение не отвергается при вводе (его набирают по частям), ошибку показывает панель, блок при ошибке отдаёт 0.
+                if (text.Length == 0 || text.Length > MaxExpressionLength) return false;
+                normalized = text;
+                return true;
             }
 
             case ParameterType.Enum:
@@ -171,7 +221,7 @@ public sealed class ParametersComponent : BlockComponent
         string typeName = json.TryGetProperty("type", out var typeJson) ? typeJson.GetString() ?? "" : "";
         if (!Enum.TryParse<ParameterType>(typeName, ignoreCase: true, out var type))
         {
-            throw new InvalidOperationException($"parameter '{id}': unknown type '{typeName}' (expected Float/Int/Bool/Enum)");
+            throw new InvalidOperationException($"parameter '{id}': unknown type '{typeName}' (expected Float/Int/Bool/Enum/Color/Expression)");
         }
 
         var options = json.TryGetProperty("options", out var optionsJson) && optionsJson.ValueKind == JsonValueKind.Array
@@ -188,7 +238,7 @@ public sealed class ParametersComponent : BlockComponent
         // Умолчание нормализуется той же логикой, что и вводимое значение (границы, формат), поэтому оно заведомо допустимо.
         var draft = new ParameterDefinition
         {
-            Id = id, Label = label, Type = type, Default = type switch { ParameterType.Enum => options[0], ParameterType.Bool => "false", _ => "0" },
+            Id = id, Label = label, Type = type, Default = type switch { ParameterType.Enum => options[0], ParameterType.Bool => "false", ParameterType.Color => "#ffffff", ParameterType.Expression => "x", _ => "0" },
             Min = min, Max = max, Options = options,
         };
         string defaultText = json.TryGetProperty("default", out var defaultJson)

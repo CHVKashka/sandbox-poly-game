@@ -4,6 +4,7 @@
   <Component type="BaseComponent">{ "mass": 10, "durability": 100, "damageResistance": 0.1 }</Component>
   <Component type="Parameters">{
     "parameters": [
+      { "id": "glowColor", "label": "Glow color", "type": "Color", "default": "#33ff55", "hint": "colour of the lid glow while the button is on and powered" },
       { "id": "mode", "label": "Mode", "type": "Enum", "options": ["momentary", "toggle"], "default": "momentary", "hint": "momentary: on while held; toggle: each press flips it" }
     ]
   }</Component>

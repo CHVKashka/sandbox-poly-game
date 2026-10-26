@@ -45,7 +45,7 @@ public sealed class BatteryBehavior : BlockBehavior<BatteryState>
 
     protected override BatteryState CreateState(FunctionalBlockComponent definition, ParameterSet parameters)
     {
-        double capacity = Math.Max(0, definition.Capacity);
+        double capacity = Math.Max(0, parameters.Has("capacity") ? parameters.GetFloat("capacity", definition.Capacity) : definition.Capacity);
         return new BatteryState
         {
             Capacity = capacity,

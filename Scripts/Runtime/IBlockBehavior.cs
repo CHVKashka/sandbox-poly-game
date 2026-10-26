@@ -1,3 +1,4 @@
+using Godot;
 using SandboxPolyGame.Blocks;
 
 namespace SandboxPolyGame.Runtime;
@@ -74,6 +75,17 @@ public interface IBlockBehavior
     /// <summary>Рантайм сообщает блоку, в какой сети вращения он стоит (<see cref="TorqueNetwork"/>): <paramref name="connected"/> = false — ни один порт вала блока ни с кем не соединён;
     /// <paramref name="rpm"/> — обороты сети (об/мин, со знаком). Вызывается в конце каждого тика, значение вступает в силу на следующем (потребитель вращения — колесо).</summary>
     void SetTorqueNetwork(BlockState state, bool connected, double rpm) { }
+
+    /// <summary>
+    /// Поддерживает ли блок отражение при установке (клавиши U/I/O, <see cref="Core.BlockInstance.Mirror"/>). По умолчанию НЕТ — у функционального блока отражение игнорируется
+    /// (модель, физика, указатели). Поведение, которое его поддерживает (колесо), само решает, что значит каждая ось (<see cref="SetMirror"/>), а указатели блока (<see cref="DecorMesh"/>)
+    /// отражаются по X и Z (<c>FunctionalBlockGeometry.DecorMirror</c>).
+    /// </summary>
+    bool SupportsMirror => false;
+
+    /// <summary>Рантайм передаёт состоянию флаги отражения экземпляра (0/1 по осям) сразу после <see cref="CreateState(FunctionalBlockComponent, ParameterSet)"/>. Это константа экземпляра, в сеть не идёт
+    /// (постройка и её Mirror реплицируются отдельно); у блоков без <see cref="SupportsMirror"/> не вызывается.</summary>
+    void SetMirror(BlockState state, Vector3I mirror) { }
 }
 
 /// <summary>
@@ -94,6 +106,8 @@ public abstract class BlockBehavior<TState> : IBlockBehavior where TState : Bloc
     protected virtual void ReceiveEnergy(TState state, string nodeId, double energy) { }
     protected virtual double GetTorqueRpm(TState state) => 0;
     protected virtual void SetTorqueNetwork(TState state, bool connected, double rpm) { }
+    protected virtual bool SupportsMirror => false;
+    protected virtual void SetMirror(TState state, Vector3I mirror) { }
 
     protected virtual bool TryReadNode(TState state, string nodeId, out NodeValue value)
     {
@@ -113,5 +127,7 @@ public abstract class BlockBehavior<TState> : IBlockBehavior where TState : Bloc
     void IBlockBehavior.ReceiveEnergy(BlockState state, string nodeId, double energy) => ReceiveEnergy((TState)state, nodeId, energy);
     double IBlockBehavior.GetTorqueRpm(BlockState state) => GetTorqueRpm((TState)state);
     void IBlockBehavior.SetTorqueNetwork(BlockState state, bool connected, double rpm) => SetTorqueNetwork((TState)state, connected, rpm);
+    bool IBlockBehavior.SupportsMirror => SupportsMirror;
+    void IBlockBehavior.SetMirror(BlockState state, Vector3I mirror) => SetMirror((TState)state, mirror);
     bool IBlockBehavior.TryReadNode(BlockState state, string nodeId, out NodeValue value) => TryReadNode((TState)state, nodeId, out value);
 }

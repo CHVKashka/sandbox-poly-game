@@ -29,11 +29,11 @@ public sealed partial class SelfTest
         using var scope = UseCatalogWith(
             new FixtureBlock("zz_bat", BatteryJson, BatteryParameters),
             new FixtureBlock("zz_motor", MotorJson, MotorParameters),
-            new FixtureBlock("zz_shaft", ShaftJson),
+            new FixtureBlock("zz_shaft", ShaftJson, NoBase: true),
             new FixtureBlock("zz_button", ButtonJson, ButtonParameters),
             new FixtureBlock("zz_seat", SeatJson(), SeatParameters()),
             new FixtureBlock("zz_confmodel", modelJson, MotorParameters),
-            new FixtureBlock("zz_plainmodel", plainModelJson));
+            new FixtureBlock("zz_plainmodel", plainModelJson, NoBase: true));
 
         var state = editor.State;
         var construction = editor.World.Construction;
@@ -305,8 +305,9 @@ public sealed partial class SelfTest
         // Набор виджетов по типу параметра.
         editor.ParametersToolClickAt(camera.UnprojectPosition(BuildSpace.CellCenter(seat.Origin)));
         var seatNow = construction.Instances.First(i => i.BlockSlug == "zz_seat");
-        Check(panel.IsOpen && panel.InstanceId == seatNow.InstanceId && panel.ParameterIds.Count == 8, "the seat panel lists its 8 axis parameters", $"{panel.ParameterIds.Count}");
-        Check(panel.ControlKind("ad_mode") == nameof(OptionButton) && panel.ControlKind("ad_sensitivity") == nameof(LineEdit), "an Enum is a dropdown, a Float is a text field");
+        Check(panel.IsOpen && panel.InstanceId == seatNow.InstanceId && panel.ParameterIds.Count == 9, "the seat panel lists eyeHeight + its 8 axis parameters", $"{panel.ParameterIds.Count}");
+        Check(panel.ControlKind("ad_mode") == nameof(OptionButton) && panel.ControlKind("ad_sensitivity") == nameof(HSlider) && panel.ControlKind("eyeHeight") == nameof(SpinBox),
+            "an Enum is a dropdown, a Float with both limits is a slider, a Float without limits is a number box");
         panel.EditForTesting("ws_mode", "sticky");
         panel.EditForTesting("ws_sensitivity", "7.5");
         seatNow = construction.Instances.First(i => i.BlockSlug == "zz_seat");

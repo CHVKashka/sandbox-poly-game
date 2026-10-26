@@ -42,5 +42,8 @@ public sealed class ParameterSet
 
     public int GetInt(string id, int fallback = 0) => (int)System.Math.Round(GetFloat(id, fallback));
 
+    /// <summary>Цвет параметра типа Color; <paramref name="fallback"/> - параметра нет в схеме или значение не читается.</summary>
+    public Godot.Color GetColor(string id, Godot.Color fallback) => Has(id) && Godot.Color.HtmlIsValid(GetString(id)) ? Godot.Color.FromHtml(GetString(id)) : fallback;
+
     public bool GetBool(string id, bool fallback = false) => Has(id) ? GetString(id) == "true" : fallback;
 }
