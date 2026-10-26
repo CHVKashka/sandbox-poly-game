@@ -11,6 +11,7 @@ namespace SandboxPolyGame.Dev;
 /// Инструменты разработчика, включаются аргументами после <c>--</c> в командной строке (для игроков ничего не меняют):
 /// <code>
 /// godot --path . -- --selftest                       самотесты (можно с --headless), код выхода 0 = успех
+/// godot --headless --path . -- --nettest=host|client [--port=N]   дымовой тест сетевой репликации, два процесса (см. NetSmokeTest)
 /// godot --path . --resolution 1600x900 -- --demo=house|stress|shapes --screenshot=out.png [--cam=px,py,pz,tx,ty,tz]
 ///                                        [--wireframe=0|1] [--borders=0|1] [--tool=paint|delete] [--resize] [--slot=N]
 ///                                        [--size=x,y,z] [--mirror=x,y,z] [--picker] [--hover=x,y] [--frames=N]
@@ -47,6 +48,12 @@ public static class DevHarness
             if (args.ContainsKey("selftest"))
             {
                 await SelfTest.RunAsync(editor);
+                return;
+            }
+
+            if (args.TryGetValue("nettest", out var role))
+            {
+                await NetSmokeTest.RunAsync(editor, role, args.TryGetValue("port", out var portText) ? int.Parse(portText, CultureInfo.InvariantCulture) : 37998);
                 return;
             }
 

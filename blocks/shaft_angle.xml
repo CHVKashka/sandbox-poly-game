@@ -1,20 +1,21 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <Block id="shaft_angle" name="Shaft angle">
   <Color>#ffffff</Color>
-  <Component type="BaseComponent">{ "mass": 10, "durability": 100, "damageResistance": 0.10000000149011612 }</Component>
+  <Component type="BaseComponent">{ "mass": 10, "durability": 100, "damageResistance": 0.1 }</Component>
   <Component type="FunctionalBlock">{
-    "footprint": [1, 1, 1],
     "scene": "res://meshes/shaft_angle.glb",
-    "modelScale": [1.2999999523162842, 1.2999999523162842, 1.2999999523162842],
-    "modelOffset": [-0.019999999552965164, 0.029999999329447746, -0.004999999888241291],
+    "scale": [0.125, 0.125, 0.125],
+    "anchor": [0, 1, 0.5],
+    "footprint": [1, 1, 1],
+    "footprintMin": [0, 0, 0],
     "collision": [
-      { "position": [0, 0, 0], "size": [0.25, 0.25, 0.25] }
+      [0, 0, 0]
     ],
     "ports": [
-      { "id": "port_1", "resource": "Torque", "direction": "In", "face": "NegX", "position": [0, 0] },
-      { "id": "port_2", "resource": "Torque", "direction": "Out", "face": "NegX", "position": [0, 0] },
-      { "id": "port_3", "resource": "Torque", "direction": "In", "face": "PosY", "position": [0, 0] },
-      { "id": "port_4", "resource": "Torque", "direction": "Out", "face": "PosY", "position": [0, 0] }
+      { "id": "port_1", "resource": "Torque", "direction": "In", "face": "PosY", "position": [0, 0] },
+      { "id": "port_2", "resource": "Torque", "direction": "Out", "face": "PosY", "position": [0, 0] },
+      { "id": "port_3", "resource": "Torque", "direction": "In", "face": "NegX", "position": [0, 0] },
+      { "id": "port_4", "resource": "Torque", "direction": "Out", "face": "NegX", "position": [0, 0] }
     ]
   }</Component>
 </Block>

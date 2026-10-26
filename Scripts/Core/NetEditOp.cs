@@ -31,6 +31,19 @@ public enum NetEditKind : byte
     /// <summary>Клетка никому не принадлежит (залита в обход <see cref="Construction"/>, см. <c>Dev.DemoBuilds</c>) —
     /// красится голая клетка решётки (<see cref="VoxelGrid.TryPaint"/>).</summary>
     PaintCell = 5,
+
+    /// <summary>Соединить две ноды проводом (<see cref="Construction.TryConnect"/>). Кодирование без новых полей протокола: <c>cell</c> — любая клетка
+    /// ПЕРВОГО блока, <c>size</c> — любая клетка ВТОРОГО блока (поле переиспользовано как вторая клетка), <c>blockSlug</c> — <c>"узел1|узел2"</c>
+    /// (<see cref="NetEditOps.EncodeNodes"/>). Какая нода выход, а какая вход, определяется на принимающей стороне.</summary>
+    Connect = 6,
+
+    /// <summary>Убрать провод между двумя нодами (то же кодирование, что у <see cref="Connect"/>) либо — если второй узел пуст
+    /// (<c>"узел1|"</c>) — ВСЕ провода первой ноды.</summary>
+    Disconnect = 7,
+
+    /// <summary>Задать параметр блока (<see cref="Construction.TrySetParameter"/>): <c>cell</c> — любая клетка блока, <c>blockSlug</c> — <c>"id=значение"</c>
+    /// (<see cref="NetEditOps.EncodeParameter"/>).</summary>
+    SetParameter = 8,
 }
 
 /// <summary>
@@ -43,6 +56,24 @@ public enum NetEditKind : byte
 /// </summary>
 public static class NetEditOps
 {
+
+    /// <summary>Кодирует пару нод для <see cref="NetEditKind.Connect"/>/<see cref="NetEditKind.Disconnect"/>: <c>"узел1|узел2"</c> (второй может быть пуст).</summary>
+    public static string EncodeNodes(string nodeA, string nodeB) => nodeA + "|" + nodeB;
+
+    private static (string A, string B) DecodeNodes(string text)
+    {
+        int bar = text.IndexOf('|');
+        return bar < 0 ? (text, "") : (text[..bar], text[(bar + 1)..]);
+    }
+
+    /// <summary>Кодирует параметр для <see cref="NetEditKind.SetParameter"/>: <c>"id=значение"</c> (id параметра не содержит '=').</summary>
+    public static string EncodeParameter(string parameterId, string value) => parameterId + "=" + value;
+
+    private static (string Id, string Value) DecodeParameter(string text)
+    {
+        int eq = text.IndexOf('=');
+        return eq < 0 ? (text, "") : (text[..eq], text[(eq + 1)..]);
+    }
     /// <summary><paramref name="cell"/> — origin для <see cref="NetEditKind.Place"/>, целевая клетка для остальных.
     /// <paramref name="extraInt"/>/<paramref name="extraBool"/> — смысл зависит от <paramref name="kind"/>, см.
     /// <see cref="NetEditKind"/> doc на каждом значении. false — правка отклонена (нарушено правило соседства,
@@ -75,6 +106,40 @@ public static class NetEditOps
 
             case NetEditKind.PaintCell:
                 return construction.Grid.TryPaint(cell, CellColor.Pack(color));
+
+            case NetEditKind.Connect:
+            {
+                var (nodeA, nodeB) = DecodeNodes(blockSlug);
+                var first = construction.GetOwner(cell);
+                var second = construction.GetOwner(size);
+                return first != null && second != null && construction.TryConnect(first.InstanceId, nodeA, second.InstanceId, nodeB, out _);
+            }
+
+            case NetEditKind.Disconnect:
+            {
+                var (nodeA, nodeB) = DecodeNodes(blockSlug);
+                var first = construction.GetOwner(cell);
+                if (first == null) return false;
+                if (nodeB.Length == 0) return construction.DisconnectNode(first.InstanceId, nodeA) > 0;
+
+                var second = construction.GetOwner(size);
+                if (second == null) return false;
+                foreach (var wire in construction.Wires)
+                {
+                    bool forward = wire.FromInstance == first.InstanceId && wire.FromNode == nodeA && wire.ToInstance == second.InstanceId && wire.ToNode == nodeB;
+                    bool backward = wire.FromInstance == second.InstanceId && wire.FromNode == nodeB && wire.ToInstance == first.InstanceId && wire.ToNode == nodeA;
+                    if (forward || backward) return construction.Disconnect(wire);
+                }
+
+                return false;
+            }
+
+            case NetEditKind.SetParameter:
+            {
+                var (parameterId, value) = DecodeParameter(blockSlug);
+                var target = construction.GetOwner(cell);
+                return target != null && construction.TrySetParameter(target, parameterId, value);
+            }
 
             default:
                 return false;

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using Godot;
 using SandboxPolyGame.Blocks;
 
@@ -130,6 +131,7 @@ public sealed class Construction
     public bool Remove(BlockInstance instance)
     {
         if (!_instances.Remove(instance.InstanceId)) return false;
+        _wires.RemoveAll(w => w.FromInstance == instance.InstanceId || w.ToInstance == instance.InstanceId);
 
         foreach (var cell in CellsOf(instance))
         {
@@ -238,6 +240,141 @@ public sealed class Construction
         return true;
     }
 
+
+    // ------------------------------------------------------------------ провода между нодами и параметры блоков
+
+    private readonly List<NodeWire> _wires = new();
+
+    /// <summary>Провода между нодами блоков постройки (см. <see cref="NodeWire"/>) — в порядке создания.</summary>
+    public IReadOnlyList<NodeWire> Wires => _wires;
+
+    /// <summary>Ищет ноду <paramref name="nodeId"/> у экземпляра; null — нет экземпляра, его блок не функциональный или такой ноды нет.</summary>
+    public LogicNode? FindNode(int instanceId, string nodeId, BlockCatalog? catalog = null)
+    {
+        if (!_instances.TryGetValue(instanceId, out var instance)) return null;
+        if (!(catalog ?? BlockCatalog.Instance).TryGetBySlug(instance.BlockSlug, out var definition)) return null;
+        return definition.GetComponent<FunctionalBlockComponent>()?.Nodes.FirstOrDefault(n => n.Id == nodeId);
+    }
+
+    /// <summary>
+    /// Можно ли соединить две ноды и каким проводом: null в <paramref name="error"/> — можно, <paramref name="wire"/> уже приведён к виду
+    /// «от выхода ко входу» (порядок аргументов не важен — игрок тянет провод с любого конца). Правила: нужны ровно один выход и один вход;
+    /// ноды РАЗНЫХ блоков (провод блока сам на себя не нужен и создавал бы петли); типы совместимы — Electricity только с Electricity,
+    /// Boolean и Number между собой свободно (булево — это число 0/1, см. <see cref="Runtime.NodeValue"/>). Такой провод уже есть — тоже ошибка.
+    /// </summary>
+    public bool CheckWire(int instanceA, string nodeA, int instanceB, string nodeB, out NodeWire wire, out string error, BlockCatalog? catalog = null)
+    {
+        wire = default;
+        var a = FindNode(instanceA, nodeA, catalog);
+        var b = FindNode(instanceB, nodeB, catalog);
+        if (a == null || b == null) { error = "no such node"; return false; }
+        if (instanceA == instanceB) { error = "a block cannot be wired to itself"; return false; }
+        if (a.Direction == b.Direction) { error = a.Direction == PortDirection.Out ? "connect an output to an input, not two outputs" : "connect an input to an output, not two inputs"; return false; }
+        if ((a.Type == NodeType.Electricity) != (b.Type == NodeType.Electricity)) { error = "electricity connects only to electricity"; return false; }
+
+        wire = a.Direction == PortDirection.Out ? new NodeWire(instanceA, nodeA, instanceB, nodeB) : new NodeWire(instanceB, nodeB, instanceA, nodeA);
+        if (_wires.Contains(wire)) { error = "already connected"; return false; }
+
+        error = "";
+        return true;
+    }
+
+    /// <summary>
+    /// Соединяет две ноды (см. <see cref="CheckWire"/>). Вход Boolean/Number принимает ОДИН источник: новый провод ЗАМЕНЯЕТ прежний (иначе пришлось бы
+    /// сначала отдельно его убирать); вход Electricity принимает сколько угодно источников (несколько батарей на один потребитель), выход
+    /// раздаётся на сколько угодно входов. false — соединять нельзя (причина — в <paramref name="error"/>), постройка не меняется.
+    /// </summary>
+    public bool TryConnect(int instanceA, string nodeA, int instanceB, string nodeB, out string error, BlockCatalog? catalog = null)
+    {
+        if (!CheckWire(instanceA, nodeA, instanceB, nodeB, out var wire, out error, catalog)) return false;
+
+        var target = FindNode(wire.ToInstance, wire.ToNode, catalog)!;
+        if (target.Type != NodeType.Electricity) _wires.RemoveAll(w => w.ToInstance == wire.ToInstance && w.ToNode == wire.ToNode);
+        _wires.Add(wire);
+        Changed?.Invoke();
+        return true;
+    }
+
+    /// <summary>Провод между двумя нодами в ЛЮБОМ направлении (порядок аргументов не важен); null — они не соединены напрямую.</summary>
+    public NodeWire? FindWireBetween(int instanceA, string nodeA, int instanceB, string nodeB)
+    {
+        foreach (var wire in _wires)
+        {
+            bool forward = wire.FromInstance == instanceA && wire.FromNode == nodeA && wire.ToInstance == instanceB && wire.ToNode == nodeB;
+            bool backward = wire.FromInstance == instanceB && wire.FromNode == nodeB && wire.ToInstance == instanceA && wire.ToNode == nodeA;
+            if (forward || backward) return wire;
+        }
+
+        return null;
+    }
+
+    /// <summary>Убирает конкретный провод; false — такого нет.</summary>
+    public bool Disconnect(NodeWire wire)
+    {
+        if (!_wires.Remove(wire)) return false;
+        Changed?.Invoke();
+        return true;
+    }
+
+    /// <summary>Провода, подключённые к ноде (как выходу или как входу).</summary>
+    public IEnumerable<NodeWire> WiresOf(int instanceId, string nodeId) =>
+        _wires.Where(w => (w.FromInstance == instanceId && w.FromNode == nodeId) || (w.ToInstance == instanceId && w.ToNode == nodeId));
+
+    /// <summary>Убирает ВСЕ провода ноды; возвращает, сколько убрано.</summary>
+    public int DisconnectNode(int instanceId, string nodeId)
+    {
+        int removed = _wires.RemoveAll(w => (w.FromInstance == instanceId && w.FromNode == nodeId) || (w.ToInstance == instanceId && w.ToNode == nodeId));
+        if (removed > 0) Changed?.Invoke();
+        return removed;
+    }
+
+    /// <summary>Добавляет провод напрямую, без проверок типа/дубля — только для загрузки из файла (<see cref="ConstructionIO"/>), где уже проверен узел
+    /// существования; провод к несуществующему блоку отбрасывается.</summary>
+    internal bool AddWireUnchecked(NodeWire wire)
+    {
+        if (!_instances.ContainsKey(wire.FromInstance) || !_instances.ContainsKey(wire.ToInstance) || _wires.Contains(wire)) return false;
+        _wires.Add(wire);
+        return true;
+    }
+
+    /// <summary>Схема параметров блока экземпляра (<see cref="ParametersComponent"/>); null — блок ничего не настраивается.</summary>
+    public static ParametersComponent? ParametersOf(BlockDefinition definition)
+    {
+        var component = definition.GetComponent<ParametersComponent>();
+        return component is { Parameters.Count: > 0 } ? component : null;
+    }
+
+    /// <summary>
+    /// Задаёт параметр экземпляра: текст приводится к допустимому значению (<see cref="ParameterDefinition.TryNormalize"/> — границы, формат),
+    /// значение, равное умолчанию, не хранится (экземпляр остаётся «по умолчанию»). false — у блока нет такого параметра, текст не разбирается, или
+    /// значение не изменилось.
+    /// </summary>
+    public bool TrySetParameter(BlockInstance instance, string parameterId, string text, BlockCatalog? catalog = null)
+    {
+        if (!(catalog ?? BlockCatalog.Instance).TryGetBySlug(instance.BlockSlug, out var definition)) return false;
+        var schema = ParametersOf(definition);
+        if (schema == null || !schema.TryGet(parameterId, out var parameter) || !parameter.TryNormalize(text, out string normalized)) return false;
+
+        string current = instance.Parameters != null && instance.Parameters.TryGetValue(parameterId, out var stored) ? stored : parameter.Default;
+        if (current == normalized) return false;
+
+        if (normalized == parameter.Default)
+        {
+            instance.Parameters?.Remove(parameterId);
+            if (instance.Parameters is { Count: 0 }) instance.Parameters = null;
+        }
+        else
+        {
+            instance.Parameters ??= new Dictionary<string, string>();
+            instance.Parameters[parameterId] = normalized;
+        }
+
+        Changed?.Invoke();
+        return true;
+    }
+
+    /// <summary>Экземпляр по идентификатору; null — нет такого.</summary>
+    public BlockInstance? GetInstance(int instanceId) => _instances.TryGetValue(instanceId, out var instance) ? instance : null;
     public void Clear()
     {
         foreach (var instance in new List<BlockInstance>(_instances.Values)) Remove(instance);

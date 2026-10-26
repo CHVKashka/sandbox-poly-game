@@ -34,6 +34,7 @@ public sealed class WorkbenchMenuUi
     private readonly Button _openButton;
     private readonly Button _spawnButton;
     private readonly Button _createButton;
+    private readonly Button _continueButton;
     private readonly Button _joinButton;
     private readonly OptionButton _joinPicker;
     private readonly Label _emptyHint;
@@ -48,6 +49,9 @@ public sealed class WorkbenchMenuUi
 
     /// <summary>Нажата Create vehicle — открыть редактор пустым.</summary>
     public event Action? CreateVehicleRequested;
+
+    /// <summary>Нажата Continue editing — открыть редактор с последней редактируемой постройкой (<see cref="EditorHandoff.Draft"/>), вместе с несохранёнными правками.</summary>
+    public event Action? ContinueEditingRequested;
 
     /// <summary>Нажата Open для выбранной постройки — открыть редактор с ней (путь к файлу).</summary>
     public event Action<string>? OpenConstructionRequested;
@@ -88,6 +92,13 @@ public sealed class WorkbenchMenuUi
         row.AddChild(left);
 
         left.AddChild(UiStyle.MakeLabel("Workbench", 22));
+
+        // Видна, только если в редакторе уже есть что продолжать (см. Open): последняя редактируемая постройка со всеми несохранёнными правками.
+        _continueButton = UiStyle.MakeButton("Continue editing", new Vector2(0, 36));
+        _continueButton.SizeFlagsHorizontal = Control.SizeFlags.ExpandFill;
+        _continueButton.Visible = false;
+        _continueButton.Pressed += () => ContinueEditingRequested?.Invoke();
+        left.AddChild(_continueButton);
 
         _createButton = UiStyle.MakeButton("Create vehicle", new Vector2(0, 36));
         _createButton.SizeFlagsHorizontal = Control.SizeFlags.ExpandFill;
@@ -186,6 +197,11 @@ public sealed class WorkbenchMenuUi
 
     public bool IsJoinButtonDisabled => _joinButton.Disabled;
 
+    /// <summary>Для самотестов: кнопка «Continue editing» (видна только при непустом <see cref="EditorHandoff.Draft"/>).</summary>
+    public bool IsContinueButtonVisible => _continueButton.Visible;
+
+    public string ContinueButtonText => _continueButton.Text;
+
     /// <summary>Для самотестов — сколько сессий сейчас предлагает выпадающий список Join (0 = кнопка выключена,
     /// 1 = список скрыт/Join адресует её напрямую, 2+ = список виден).</summary>
     public int JoinableSessionCount => _joinSessionKeys.Length;
@@ -197,6 +213,7 @@ public sealed class WorkbenchMenuUi
     {
         _workbenchName = workbenchName;
         Refresh();
+        RefreshContinueButton();
         UpdateOfflineState();
         _overlay.Visible = true;
     }
@@ -204,6 +221,19 @@ public sealed class WorkbenchMenuUi
     public string WorkbenchName => _workbenchName;
 
     public void Close() => _overlay.Visible = false;
+
+    /// <summary>«Continue editing» есть, только пока в редакторе осталась недосохранённая/недоделанная постройка; на кнопке — её имя
+    /// (или «unsaved vehicle», если она ещё ни разу не сохранялась).</summary>
+    private void RefreshContinueButton()
+    {
+        var draft = EditorHandoff.Draft;
+        _continueButton.Visible = draft != null;
+        if (draft == null) return;
+
+        string title = string.IsNullOrWhiteSpace(draft.Name) ? "unsaved vehicle" : draft.Name;
+        _continueButton.Text = $"Continue editing: {title}";
+        _continueButton.TooltipText = "Return to the editor with the construction you left there, including unsaved changes.";
+    }
 
     /// <summary>Перечитывает список сохранённых построек с диска — вызывается при каждом открытии меню, чтобы
     /// постройка, сохранённая только что в редакторе, сразу появилась в списке.</summary>
@@ -226,7 +256,7 @@ public sealed class WorkbenchMenuUi
             var button = UiStyle.MakeButton("", new Vector2(0, 44), toggle: true);
             button.Alignment = HorizontalAlignment.Left;
             button.SizeFlagsHorizontal = Control.SizeFlags.ExpandFill;
-            button.Text = $"{entry.Name}\n{FormatDates(entry)}";
+            button.Text = $"{entry.Name}\n{ConstructionStorage.DescribeDates(entry)}";
             button.Pressed += () => Select(entry, button);
             _listColumn.AddChild(button);
         }
@@ -301,20 +331,6 @@ public sealed class WorkbenchMenuUi
         _previewName.Text = selection.Name;
         _previewDescription.Text = string.IsNullOrEmpty(selection.Description) ? "(no description)" : selection.Description!;
 
-        if (selection.PreviewPath != null)
-        {
-            var image = new Image();
-            if (image.Load(selection.PreviewPath) == Error.Ok) _previewImage.Texture = ImageTexture.CreateFromImage(image);
-        }
-    }
-
-    private static string FormatDates(ConstructionStorage.SavedConstruction entry) =>
-        $"created {TryFormatUtc(entry.CreatedUtc)}   modified {TryFormatUtc(entry.ModifiedUtc)}";
-
-    private static string TryFormatUtc(string iso)
-    {
-        return DateTime.TryParse(iso, null, System.Globalization.DateTimeStyles.RoundtripKind, out var parsed)
-            ? parsed.ToLocalTime().ToString("yyyy-MM-dd HH:mm")
-            : "unknown";
+        _previewImage.Texture = ConstructionStorage.LoadPreview(selection);
     }
 }

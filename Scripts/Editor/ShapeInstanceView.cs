@@ -28,6 +28,27 @@ public partial class ShapeInstanceView : Node3D
     private bool _wireframe;
     private bool _borders = true;
 
+    private float _opacity = 1f;
+
+    /// <summary>Непрозрачность сплошных граней форм (1 — как обычно): инструменты «Nodes»/«Parameters» делают постройку полупрозрачной, чтобы были видны ноды внутри.
+    /// Каркас и границы блоков не затрагиваются.</summary>
+    public float Opacity
+    {
+        get => _opacity;
+        set
+        {
+            _opacity = value;
+            ApplyOpacity();
+        }
+    }
+
+    private void ApplyOpacity()
+    {
+        if (_solidMaterial == null) return;
+        _solidMaterial.Transparency = _opacity < 1f ? BaseMaterial3D.TransparencyEnum.Alpha : BaseMaterial3D.TransparencyEnum.Disabled;
+        _solidMaterial.AlbedoColor = new Color(1f, 1f, 1f, _opacity);
+    }
+
     /// <summary>Инструмент Wireframe: только полигоны и их диагонали, без сплошных граней.</summary>
     public bool Wireframe
     {
@@ -72,6 +93,7 @@ public partial class ShapeInstanceView : Node3D
             AlbedoColor = Colors.Black,
             RenderPriority = 1,
         };
+        ApplyOpacity();
         ApplyVisibility();
     }
 
